@@ -14,7 +14,7 @@ pub fn open_in_memory() -> SqliteResult<Connection> {
 }
 
 fn init_schema(conn: &Connection) -> SqliteResult<()> {
-    conn.execute_batch(include_str!("storage/migrations/0001_init.sql"))
+    conn.execute_batch(include_str!("migrations/0001_init.sql"))
 }
 
 pub fn record_scan(conn: &Connection, result: &ScanResult) -> SqliteResult<()> {

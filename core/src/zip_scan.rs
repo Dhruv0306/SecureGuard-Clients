@@ -1,4 +1,3 @@
-use std::io::Read;
 use zip::ZipArchive;
 
 /// Ported from SecurityServiceImpl: contribution per suspicious entry found
