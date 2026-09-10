@@ -77,7 +77,7 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut buf);
             let mut writer = zip::ZipWriter::new(cursor);
-            let options = FileOptions::default();
+            let options = FileOptions::<()>::default();
             for (name, content) in entries {
                 writer.start_file(*name, options).unwrap();
                 writer.write_all(content).unwrap();
