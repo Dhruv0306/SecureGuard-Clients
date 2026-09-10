@@ -58,6 +58,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows Defender (and most real-time AV) blocks writing the raw \
+                   EICAR string to disk, this is expected OS behavior, not a bug. \
+                   The in-memory equivalent is covered by \
+                   scoring::tests::eicar_is_malicious_and_labeled_distinctly. Run \
+                   this one manually with an AV exclusion on the temp dir if you \
+                   need to exercise the disk-read path specifically."
+    )]
     fn scans_an_eicar_file_on_disk() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(hash_match::EICAR_TEST_STRING.as_bytes())
