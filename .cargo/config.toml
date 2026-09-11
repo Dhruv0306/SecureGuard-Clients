@@ -1,0 +1,8 @@
+# LNK4098 here is benign: different native C dependencies in the tree (SQLite via
+# libsqlite3-sys's bundled build, zip's native compression backends, etc.) each
+# reference a default CRT, and MSVC warns when those references don't all match.
+# It's a link-time advisory, not a correctness issue, silencing the specific
+# warning code rather than forcing a uniform CRT (e.g. +crt-static) avoids
+# introducing a bigger, riskier change to satisfy a cosmetic warning.
+[target.'cfg(target_env = "msvc")']
+rustflags = ["-C", "link-arg=/IGNORE:4098"]
