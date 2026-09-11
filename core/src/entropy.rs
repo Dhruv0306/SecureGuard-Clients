@@ -7,11 +7,11 @@
 /// there, they are one spec.
 pub const THRESHOLD_HIGH_ENTROPY: f64 = 7.2;
 
-/// Bytes sampled per calculation. Ported from the Java engine's sampling
-/// approach: entropy is computed over a bounded prefix of the file rather
-/// than the whole thing, both for performance on large files and because
-/// packed/encrypted sections are typically front-loaded.
-pub const ENTROPY_SAMPLE_BYTES: usize = 8192;
+/// Bytes sampled per calculation. Ported from SecurityServiceImpl:
+/// `ENTROPY_SAMPLE_BYTES = (int) MAX_PATTERN_SCAN_BYTES` (10 MB), not a
+/// small fixed prefix, an earlier version of this file guessed 8192 here
+/// without checking source, this is the corrected, verified value.
+pub const ENTROPY_SAMPLE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Shannon entropy in bits/byte over the given buffer. Returns 0.0 for an
 /// empty buffer (no information, not "suspiciously high").
@@ -34,12 +34,22 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
         .sum()
 }
 
-/// Computes entropy over a bounded sample of `data` and reports whether it
-/// crosses THRESHOLD_HIGH_ENTROPY.
-pub fn is_high_entropy(data: &[u8]) -> (f64, bool) {
-    let sample = &data[..data.len().min(ENTROPY_SAMPLE_BYTES)];
+/// Computes entropy over a buffer already bounded to at most `sample_bound`
+/// bytes by the caller, and reports whether it crosses
+/// THRESHOLD_HIGH_ENTROPY. Split out from `is_high_entropy` purely so the
+/// bounding behavior itself can be unit-tested at a small, fast bound
+/// without allocating a buffer anywhere near the real 10 MB production
+/// value.
+fn is_high_entropy_bounded(data: &[u8], sample_bound: usize) -> (f64, bool) {
+    let sample = &data[..data.len().min(sample_bound)];
     let entropy = shannon_entropy(sample);
     (entropy, entropy >= THRESHOLD_HIGH_ENTROPY)
+}
+
+/// Computes entropy over a bounded sample of `data` (ENTROPY_SAMPLE_BYTES)
+/// and reports whether it crosses THRESHOLD_HIGH_ENTROPY.
+pub fn is_high_entropy(data: &[u8]) -> (f64, bool) {
+    is_high_entropy_bounded(data, ENTROPY_SAMPLE_BYTES)
 }
 
 #[cfg(test)]
@@ -96,21 +106,35 @@ mod tests {
     }
 
     #[test]
-    fn sampling_is_bounded_to_entropy_sample_bytes() {
-        // A buffer larger than the sample size where only the sampled prefix
-        // is high-entropy; confirms we don't read past ENTROPY_SAMPLE_BYTES.
+    fn production_constant_matches_the_verified_java_value() {
+        // Locks in the corrected value (10 MB = MAX_PATTERN_SCAN_BYTES) so a
+        // future edit can't silently reintroduce the earlier unverified
+        // 8192-byte guess.
+        assert_eq!(ENTROPY_SAMPLE_BYTES, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn sampling_is_bounded_and_does_not_read_past_the_bound() {
+        // Uses a small local bound (not the real 10 MB production value) so
+        // this test stays fast and light while still proving the actual
+        // truncation behavior is correct: high-entropy content inside the
+        // bound is seen, a huge low-entropy tail past the bound is not.
+        const TEST_BOUND: usize = 8192;
+
         let mut data = Vec::new();
-        for _ in 0..(ENTROPY_SAMPLE_BYTES / 256) {
+        for _ in 0..(TEST_BOUND / 256) {
             for b in 0u8..=255 {
                 data.push(b);
             }
         }
-        data.resize(ENTROPY_SAMPLE_BYTES, 0); // pad the tail of the sample window
-        data.extend(std::iter::repeat(0u8).take(1_000_000)); // huge low-entropy tail
-        let (_, flagged) = is_high_entropy(&data);
-        // The high-entropy content sits early enough in the sample window
-        // that this should still flag despite the low-entropy tail beyond
-        // the sample boundary.
-        assert!(flagged);
+        data.resize(TEST_BOUND, 0);
+        data.extend(std::iter::repeat(0u8).take(1_000_000)); // tail past the bound
+
+        let (_, flagged) = is_high_entropy_bounded(&data, TEST_BOUND);
+        assert!(
+            flagged,
+            "high-entropy content within the bound should still flag despite \
+             the low-entropy tail beyond it"
+        );
     }
 }
