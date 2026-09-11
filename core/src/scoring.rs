@@ -4,6 +4,12 @@ use crate::types::{ScanResult, ScoreContribution, Verdict};
 use crate::yara_scan::RuleSet;
 use crate::zip_scan::{scan_zip, ZipCheck};
 
+/// Ported from SecurityServiceImpl. An exact known-malware hash match or
+/// EICAR scores 100 outright, not merely enough to cross
+/// THRESHOLD_MALICIOUS, the two are numerically different even though both
+/// currently land on the same verdict tier.
+pub const SCORE_KNOWN_HASH: i32 = 100;
+
 /// Ported from SecurityServiceImpl. A file crossing this total is convicted
 /// outright.
 pub const THRESHOLD_MALICIOUS: i32 = 60;
@@ -34,11 +40,11 @@ pub fn score_file(
                 file_name: file_name.to_string(),
                 sha256,
                 verdict: Verdict::Malicious,
-                score: THRESHOLD_MALICIOUS,
+                score: SCORE_KNOWN_HASH,
                 threat_type: Some("EICAR_TEST_FILE".to_string()),
                 contributions: vec![ScoreContribution {
                     reason: "EICAR standard antivirus test file detected".to_string(),
-                    points: THRESHOLD_MALICIOUS,
+                    points: SCORE_KNOWN_HASH,
                 }],
             };
         }
@@ -47,11 +53,11 @@ pub fn score_file(
                 file_name: file_name.to_string(),
                 sha256,
                 verdict: Verdict::Malicious,
-                score: THRESHOLD_MALICIOUS,
+                score: SCORE_KNOWN_HASH,
                 threat_type: Some("VIRUS".to_string()),
                 contributions: vec![ScoreContribution {
                     reason: "Known malware signature detected".to_string(),
-                    points: THRESHOLD_MALICIOUS,
+                    points: SCORE_KNOWN_HASH,
                 }],
             };
         }
@@ -175,6 +181,11 @@ mod tests {
         let result = score_file("bad.bin", content, &signatures, &empty_rules());
         assert_eq!(result.verdict, Verdict::Malicious);
         assert_eq!(result.threat_type.as_deref(), Some("VIRUS"));
+        assert_eq!(
+            result.score, SCORE_KNOWN_HASH,
+            "known-hash matches score SCORE_KNOWN_HASH (100), not merely enough to cross \
+             THRESHOLD_MALICIOUS, these are numerically different in the Java source"
+        );
     }
 
     #[test]
@@ -183,6 +194,7 @@ mod tests {
         let result = score_file("eicar.com", content, &SignatureSet::new(), &empty_rules());
         assert_eq!(result.verdict, Verdict::Malicious);
         assert_eq!(result.threat_type.as_deref(), Some("EICAR_TEST_FILE"));
+        assert_eq!(result.score, SCORE_KNOWN_HASH);
     }
 
     #[test]
