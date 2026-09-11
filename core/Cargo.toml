@@ -27,4 +27,4 @@ regex = "1"
 
 [dev-dependencies]
 tempfile = "3"
-ureq = "2.10"
+ureq = "3.4"
