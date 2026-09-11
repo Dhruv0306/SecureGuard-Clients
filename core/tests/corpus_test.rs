@@ -79,14 +79,19 @@ fn fetch_known_good_sample(path: &str) -> Vec<u8> {
     let url = format!(
         "https://raw.githubusercontent.com/Dhruv0306/Antivirus/{PINNED_MAIN_REPO_COMMIT}/src/test/resources/known-good-samples/{path}"
     );
+
     let response = ureq::get(&url)
         .call()
         .unwrap_or_else(|e| panic!("failed to fetch corpus file {path} from {url}: {e}"));
+
     let mut bytes = Vec::new();
+
     response
+        .into_body()
         .into_reader()
         .read_to_end(&mut bytes)
         .unwrap_or_else(|e| panic!("failed to read corpus file {path}: {e}"));
+
     bytes
 }
 
@@ -105,6 +110,7 @@ fn known_malware_iocs_are_recognized_by_the_lookup_mechanism() {
         .iter()
         .map(|(_, hash)| hash.to_string())
         .collect();
+
     let signatures = SignatureSet::from_hashes(hashes);
 
     for (family, hash) in KNOWN_MALWARE_IOCS {
@@ -124,6 +130,7 @@ fn known_good_archives_are_never_flagged_as_malicious() {
         let bytes = fetch_known_good_sample(sample.path);
 
         let actual_hash = sha256_hex(&bytes);
+
         assert_eq!(
             actual_hash, sample.expected_sha256,
             "integrity check failed for {}: fetched content doesn't match the pinned SHA-256 \
@@ -131,7 +138,13 @@ fn known_good_archives_are_never_flagged_as_malicious() {
             sample.path
         );
 
-        let result = score_file(sample.path, &bytes, &SignatureSet::new(), &rules, None);
+        let result = score_file(
+            sample.path,
+            &bytes,
+            &SignatureSet::new(),
+            &rules,
+            None,
+        );
 
         // Matches the Java test's actual guarantee, not a stronger one: a
         // gzip archive is inherently high-entropy, SUSPICIOUS from entropy
@@ -152,9 +165,16 @@ fn known_good_archives_are_never_flagged_as_malicious() {
 #[test]
 fn eicar_is_detected_matching_the_java_engines_verdict() {
     let rules = RuleSet::compile(DEFAULT_RULES).expect("default rule set should compile");
+
     let eicar = secureguard_core::hash_match::EICAR_TEST_STRING.as_bytes();
 
-    let result = score_file("eicar.com", eicar, &SignatureSet::new(), &rules, None);
+    let result = score_file(
+        "eicar.com",
+        eicar,
+        &SignatureSet::new(),
+        &rules,
+        None,
+    );
 
     assert_eq!(
         result.verdict,
