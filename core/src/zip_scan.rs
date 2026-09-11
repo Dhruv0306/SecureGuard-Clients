@@ -12,10 +12,6 @@ pub const SCORE_ZIP_SUSPICIOUS_ENTRY: i32 = 15;
 const MAX_COMPRESSION_RATIO: u64 = 100;
 const MAX_UNCOMPRESSED_BYTES: u64 = 500 * 1024 * 1024; // 500 MB
 
-pub const SUSPICIOUS_EXTENSIONS: &[&str] = &[
-    "exe", "dll", "scr", "bat", "cmd", "com", "vbs", "js", "jar", "ps1",
-];
-
 #[derive(Debug)]
 pub enum ZipCheck {
     /// Compression ratio or total size indicates a zip bomb; caller should
@@ -62,8 +58,8 @@ pub fn scan_zip(data: &[u8]) -> ZipCheck {
 }
 
 fn entry_is_suspicious(name: &str) -> bool {
-    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-    SUSPICIOUS_EXTENSIONS.contains(&ext.as_str())
+    let ext = crate::extension::get_file_extension(name);
+    crate::extension::SUSPICIOUS_EXTENSIONS.contains(&ext.as_str())
 }
 
 #[cfg(test)]

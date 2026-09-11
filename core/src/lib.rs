@@ -1,7 +1,11 @@
+pub mod dir_behavior;
 pub mod entropy;
+pub mod extension;
 pub mod hash_match;
+pub mod rootkit;
 pub mod scoring;
 pub mod storage;
+pub mod text_patterns;
 pub mod types;
 pub mod yara_scan;
 pub mod zip_scan;
@@ -27,7 +31,10 @@ rule eicar_marker_present {
 
 /// Scans a file on disk and returns a ScanResult. This is the primary
 /// public entry point both the CLI harness and (later) the desktop/Android
-/// UIs call.
+/// UIs call. Passes the real path through to scoring so the
+/// path-dependent signals (rootkit driver-location gate, ransomware
+/// directory behavior) can apply, unlike scoring::score_file called
+/// directly on in-memory content with no path.
 pub fn scan_file(
     path: &Path,
     signatures: &SignatureSet,
@@ -38,7 +45,13 @@ pub fn scan_file(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
-    Ok(scoring::score_file(&file_name, &content, signatures, rules))
+    Ok(scoring::score_file(
+        &file_name,
+        &content,
+        signatures,
+        rules,
+        Some(path),
+    ))
 }
 
 #[cfg(test)]

@@ -16,11 +16,14 @@
 //!    Java side's `seedSignature`/`isKnownMalicious` test works.
 //! 2. Known-good real-world archives (jq, ripgrep, shellcheck source tarballs):
 //!    fetched and integrity-checked against their published SHA-256, then
-//!    scored. Asserts verdict != Malicious, not verdict == Clean, matching
-//!    the Java test's actual guarantee
-//!    (`knownGoodOpenSourceArchivesAreNeverFlaggedAsMalicious`): a gzip
-//!    archive is inherently high-entropy, and SUSPICIOUS from entropy alone
-//!    is expected, tolerated behavior in both engines, not a bug.
+//!    scored. Asserts verdict != Malicious, not verdict == Clean: entropy
+//!    scoring is gated to files that already look executable (by extension
+//!    or MZ/ELF header bytes, see extension::is_executable_like_for_entropy),
+//!    and .tar.gz qualifies for neither, so these archives are expected to
+//!    come back fully CLEAN under this engine. The weaker assertion is kept
+//!    anyway to match the Java test's actual documented guarantee
+//!    (`knownGoodOpenSourceArchivesAreNeverFlaggedAsMalicious`) rather than a
+//!    stronger claim this crate's own corpus test happens to also satisfy.
 //! 3. EICAR: the standard test string, in-memory only (not written to disk
 //!    in this test, avoiding the same Windows-Defender interaction the
 //!    disk-based unit test in lib.rs already documents).
@@ -128,7 +131,7 @@ fn known_good_archives_are_never_flagged_as_malicious() {
             sample.path
         );
 
-        let result = score_file(sample.path, &bytes, &SignatureSet::new(), &rules);
+        let result = score_file(sample.path, &bytes, &SignatureSet::new(), &rules, None);
 
         // Matches the Java test's actual guarantee, not a stronger one: a
         // gzip archive is inherently high-entropy, SUSPICIOUS from entropy
@@ -151,7 +154,7 @@ fn eicar_is_detected_matching_the_java_engines_verdict() {
     let rules = RuleSet::compile(DEFAULT_RULES).expect("default rule set should compile");
     let eicar = secureguard_core::hash_match::EICAR_TEST_STRING.as_bytes();
 
-    let result = score_file("eicar.com", eicar, &SignatureSet::new(), &rules);
+    let result = score_file("eicar.com", eicar, &SignatureSet::new(), &rules, None);
 
     assert_eq!(
         result.verdict,
