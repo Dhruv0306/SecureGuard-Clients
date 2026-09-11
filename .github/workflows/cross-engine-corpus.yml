@@ -1,0 +1,76 @@
+name: Cross-engine corpus validation
+
+# Runs the Rust core's corpus test and the Java backend's equivalent pressure
+# tests in the same workflow run, against the same pinned commit of
+# Dhruv0306/Antivirus, so a drift between the two engines on a known-labeled
+# case shows up as one job failing while the other passes, not two
+# independently green checkmarks that were never actually compared.
+#
+# Scope note: this is a shared pass/fail contract on the same labeled inputs
+# (WannaCry/NotPetya IOC hashes, the three known-good archives, EICAR), not a
+# per-file numeric score diff. A true score-level diff would need the Java
+# side to also emit machine-readable per-file output, ScanAccuracyIT
+# currently asserts internally rather than exporting a JSON artifact. That's
+# a real gap, tracked as a follow-up, not solved here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Keep in sync with PINNED_MAIN_REPO_COMMIT in core/tests/corpus_test.rs.
+  # Deliberately updated together, a stale pin should fail loudly, not drift
+  # silently.
+  PINNED_MAIN_REPO_COMMIT: e8239283fea0a3988bba66e89899ec22bbcc81c2
+
+jobs:
+  rust-corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run corpus test against the pinned commit
+        run: cargo test --package secureguard-core --test corpus_test -- --nocapture
+
+  java-corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main repo at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: Dhruv0306/Antivirus
+          ref: ${{ env.PINNED_MAIN_REPO_COMMIT }}
+          path: antivirus-main
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Run the Java engine's own corpus/accuracy tests
+        working-directory: antivirus-main
+        run: mvn -B test -Dtest=ScanAccuracyIT,ScanEvasionIT
+
+  both-engines-agree:
+    needs: [rust-corpus, java-corpus]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Both engines passed against the same pinned corpus
+        run: echo "Rust core and Java backend both validated cleanly against ${{ env.PINNED_MAIN_REPO_COMMIT }}"
