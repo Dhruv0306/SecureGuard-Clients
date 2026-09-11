@@ -16,7 +16,7 @@ path = "src/bin/scg_scan.rs"
 
 [dependencies]
 yara-x = { version = "1.20.0", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
