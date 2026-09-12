@@ -116,8 +116,11 @@ pub fn sync_signatures(feed_urls: &[&str], conn: &Connection) -> rusqlite::Resul
         }
     }
 
-    result.total_signatures =
-        conn.query_row("SELECT COUNT(*) FROM signature_cache", [], |row| row.get(0))?;
+    result.total_signatures = conn.query_row(
+        "SELECT COUNT(*) FROM signature_cache",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? as usize;
 
     Ok(result)
 }
