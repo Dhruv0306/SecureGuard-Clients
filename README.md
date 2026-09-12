@@ -8,16 +8,16 @@ No backend dependency at runtime: detection logic runs natively in a shared Rust
 ```
 core/       Rust crate: YARA-X pattern matching + weighted scoring + entropy-based
             packer detection + local SQLite storage. See core/README.md.
-desktop/    (Phase 3+) Tauri shell around core/
+desktop/    Tauri shell around core/, in-process, no backend. See desktop/README.md.
 android/    (Phase 6+) Kotlin app using UniFFI-generated bindings to core/
 docs/       Architecture and phase-by-phase plans
 ```
 
 ## Status
 
-Phase 1 (detection core) in progress. See `docs/standalone-native-clients-plan.md`
-for the full phase breakdown and `docs/phase1-detection-core-plan.md` for this
-phase's detail.
+Phase 1 (detection core) and Phase 2 (threat-intel sync) complete. Phase 3 (desktop
+shell) in progress. See `docs/standalone-native-clients-plan.md` for the full phase
+breakdown and `docs/phase3-desktop-shell-plan.md` for this phase's detail.
 
 ## Distribution
 
