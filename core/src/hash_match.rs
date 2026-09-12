@@ -32,6 +32,27 @@ impl SignatureSet {
         }
     }
 
+    /// Loads the persisted signature_cache table into memory, plus the
+    /// EICAR SHA-256 seeded unconditionally, matching
+    /// ThreatIntelSignatureService.init() on the Java side exactly: this
+    /// hash is present whether or not a sync has ever run, it's a distinct
+    /// mechanism from hash_match::content_is_eicar's substring check, both
+    /// exist, both catch EICAR, via different paths.
+    pub fn load_from_cache(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
+        let mut stmt = conn.prepare("SELECT sha256 FROM signature_cache")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+        let mut hashes: HashSet<String> = rows
+            .collect::<rusqlite::Result<Vec<String>>>()?
+            .into_iter()
+            .map(|h| h.to_lowercase())
+            .collect();
+
+        hashes.insert(crate::signature_sync::EICAR_SIGNATURE_SHA256.to_lowercase());
+
+        Ok(Self { hashes })
+    }
+
     pub fn len(&self) -> usize {
         self.hashes.len()
     }
@@ -123,5 +144,29 @@ mod tests {
             check_hash(content, &hash, &signatures),
             HashCheck::KnownMalicious
         ));
+    }
+
+    #[test]
+    fn load_from_cache_seeds_eicar_even_with_an_empty_database() {
+        let conn = crate::storage::open_in_memory().unwrap();
+        let signatures = SignatureSet::load_from_cache(&conn).unwrap();
+        assert!(
+            signatures.contains(crate::signature_sync::EICAR_SIGNATURE_SHA256),
+            "EICAR hash must be seeded unconditionally, even before any sync has run"
+        );
+    }
+
+    #[test]
+    fn load_from_cache_picks_up_persisted_signatures() {
+        let conn = crate::storage::open_in_memory().unwrap();
+        let hash = "1".repeat(64); // a valid-length placeholder hash, exact content doesn't matter
+        conn.execute(
+            "INSERT INTO signature_cache (sha256, source, added_at) VALUES (?1, 'test', 0)",
+            rusqlite::params![hash],
+        )
+        .unwrap();
+
+        let signatures = SignatureSet::load_from_cache(&conn).unwrap();
+        assert!(signatures.contains(&hash));
     }
 }
