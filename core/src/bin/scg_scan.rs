@@ -2,7 +2,7 @@ use clap::{ Parser, Subcommand };
 use secureguard_core::hash_match::SignatureSet;
 use secureguard_core::yara_scan::RuleSet;
 use secureguard_core::{ scan_file, signature_sync, storage, DEFAULT_RULES };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// SecureGuard detection core CLI. Used both for manual testing and as the
@@ -64,7 +64,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_scan(path: &PathBuf, json: bool, db: &PathBuf) -> ExitCode {
+fn run_scan(path: &Path, json: bool, db: &Path) -> ExitCode {
     let rules = match RuleSet::compile(DEFAULT_RULES) {
         Ok(r) => r,
         Err(e) => {
@@ -111,7 +111,7 @@ fn run_scan(path: &PathBuf, json: bool, db: &PathBuf) -> ExitCode {
     }
 }
 
-fn run_sync(db: &PathBuf, feed_urls: &[String]) -> ExitCode {
+fn run_sync(db: &Path, feed_urls: &[String]) -> ExitCode {
     let conn = match storage::open(&db.to_string_lossy()) {
         Ok(c) => c,
         Err(e) => {
