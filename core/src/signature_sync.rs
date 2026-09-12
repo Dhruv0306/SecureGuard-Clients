@@ -180,8 +180,8 @@ mod tests {
     #[test]
     fn syncs_new_signatures_from_a_local_feed() {
         let conn = storage::open_in_memory().unwrap();
-        let hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-        let url = spawn_single_response_server(hash, "HTTP/1.1 200 OK");
+        let hash = "c".repeat(64);
+        let url = spawn_single_response_server(hash.leak(), "HTTP/1.1 200 OK");
 
         let result = sync_signatures(&[&url], &conn).unwrap();
 
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn stale_cache_survives_a_fetch_that_returns_nothing_new() {
         let conn = storage::open_in_memory().unwrap();
-        let existing = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let existing = "d".repeat(64);
         conn.execute(
             "INSERT INTO signature_cache (sha256, source, added_at) VALUES (?1, 'seed', 0)",
             params![existing]
@@ -214,10 +214,10 @@ mod tests {
     #[test]
     fn one_bad_feed_does_not_abort_or_affect_a_good_one() {
         let conn = storage::open_in_memory().unwrap();
-        let good_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let good_hash = "e".repeat(64);
 
         let bad_url = spawn_single_response_server("", "HTTP/1.1 500 Internal Server Error");
-        let good_url = spawn_single_response_server(good_hash, "HTTP/1.1 200 OK");
+        let good_url = spawn_single_response_server(good_hash.leak(), "HTTP/1.1 200 OK");
 
         let result = sync_signatures(&[&bad_url, &good_url], &conn).unwrap();
 
