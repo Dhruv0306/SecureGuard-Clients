@@ -26,10 +26,10 @@ fn contains_sequence(content: &[u8], sequence: &[u8]) -> bool {
 
 fn in_rootkit_location(path: &Path) -> bool {
     let path_str = path.to_string_lossy().to_lowercase();
-    path_str.contains("/lib/modules/")
-        || path_str.contains("/boot/")
-        || path_str.contains("\\system32\\drivers\\")
-        || path_str.contains("\\syswow64\\drivers\\")
+    path_str.contains("/lib/modules/") ||
+        path_str.contains("/boot/") ||
+        path_str.contains("\\system32\\drivers\\") ||
+        path_str.contains("\\syswow64\\drivers\\")
 }
 
 pub struct RootkitScore {

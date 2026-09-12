@@ -6,16 +6,16 @@
 //! more sibling files share an unrecognized extension, a lone weird
 //! extension or a lone note-like filename alone is not enough evidence.
 
-use crate::extension::{get_file_extension, COMMON_EXTENSIONS, RANSOMWARE_EXTENSIONS};
+use crate::extension::{ get_file_extension, COMMON_EXTENSIONS, RANSOMWARE_EXTENSIONS };
 use std::collections::HashMap;
 use std::path::Path;
 
 fn looks_like_ransom_note(file_name_lowercase: &str) -> bool {
-    (file_name_lowercase.contains("readme") && file_name_lowercase.contains("txt"))
-        || file_name_lowercase.contains("how_to_decrypt")
-        || file_name_lowercase.contains("recovery")
-        || file_name_lowercase.contains("help_decrypt")
-        || file_name_lowercase.contains("decrypt_instructions")
+    (file_name_lowercase.contains("readme") && file_name_lowercase.contains("txt")) ||
+        file_name_lowercase.contains("how_to_decrypt") ||
+        file_name_lowercase.contains("recovery") ||
+        file_name_lowercase.contains("help_decrypt") ||
+        file_name_lowercase.contains("decrypt_instructions")
 }
 
 /// `path` is the file being scanned; its parent directory's other entries
@@ -40,9 +40,10 @@ pub fn score_ransomware_directory_behavior(path: &Path) -> i32 {
         }
 
         let ext = get_file_extension(&name);
-        if !ext.is_empty()
-            && !COMMON_EXTENSIONS.contains(&ext.as_str())
-            && !RANSOMWARE_EXTENSIONS.contains(&ext.as_str())
+        if
+            !ext.is_empty() &&
+            !COMMON_EXTENSIONS.contains(&ext.as_str()) &&
+            !RANSOMWARE_EXTENSIONS.contains(&ext.as_str())
         {
             *unknown_ext_counts.entry(ext).or_insert(0) += 1;
         }

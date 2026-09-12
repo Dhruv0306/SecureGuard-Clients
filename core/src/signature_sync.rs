@@ -21,10 +21,10 @@
 //! reasoning.
 
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{ params, Connection };
 use std::collections::HashSet;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{ SystemTime, UNIX_EPOCH };
 
 /// Ported verbatim from ThreatIntelSignatureService.EICAR_SHA256: seeded
 /// unconditionally by SignatureSet::load_from_cache, whether or not any
@@ -76,7 +76,8 @@ fn now_unix() -> i64 {
 fn fetch_feed_text(url: &str) -> Result<String, String> {
     use std::io::Read;
 
-    let response = ureq::get(url)
+    let response = ureq
+        ::get(url)
         .call()
         .map_err(|e| format!("request to {url} failed: {e}"))?;
 
@@ -103,7 +104,7 @@ pub fn sync_signatures(feed_urls: &[&str], conn: &Connection) -> rusqlite::Resul
                     let inserted = conn.execute(
                         "INSERT OR IGNORE INTO signature_cache (sha256, source, added_at) \
                          VALUES (?1, ?2, ?3)",
-                        params![hash, url, added_at],
+                        params![hash, url, added_at]
                     )?;
                     if inserted > 0 {
                         result.new_signatures += 1;
@@ -116,10 +117,8 @@ pub fn sync_signatures(feed_urls: &[&str], conn: &Connection) -> rusqlite::Resul
         }
     }
 
-    result.total_signatures = conn.query_row(
-        "SELECT COUNT(*) FROM signature_cache",
-        [],
-        |row| row.get::<_, i64>(0),
+    result.total_signatures = conn.query_row("SELECT COUNT(*) FROM signature_cache", [], |row|
+        row.get::<_, i64>(0)
     )? as usize;
 
     Ok(result)
@@ -129,21 +128,26 @@ pub fn sync_signatures(feed_urls: &[&str], conn: &Connection) -> rusqlite::Resul
 mod tests {
     use super::*;
     use crate::storage;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{ BufRead, BufReader, Write };
     use std::net::TcpListener;
     use std::thread;
 
     #[test]
     fn extracts_sha256_hashes_from_loosely_formatted_text() {
-        let text = "\
+        let text =
+            "\
             # some comment line\n\
             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
             not-a-hash-at-all\n\
             BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB, trailing text\n";
         let hashes = extract_sha256_signatures(text);
         assert_eq!(hashes.len(), 2);
-        assert!(hashes.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-        assert!(hashes.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(
+            hashes.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(
+            hashes.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
     }
 
     /// Minimal single-request test HTTP server: accepts one connection,
@@ -192,9 +196,8 @@ mod tests {
         let existing = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         conn.execute(
             "INSERT INTO signature_cache (sha256, source, added_at) VALUES (?1, 'seed', 0)",
-            params![existing],
-        )
-        .unwrap();
+            params![existing]
+        ).unwrap();
 
         // Feed responds successfully but with no hashes in the body.
         let url = spawn_single_response_server("no signatures here", "HTTP/1.1 200 OK");
@@ -202,7 +205,8 @@ mod tests {
 
         assert_eq!(result.new_signatures, 0);
         assert_eq!(
-            result.total_signatures, 1,
+            result.total_signatures,
+            1,
             "a previously-learned signature must survive an empty fetch, not be lost"
         );
     }
@@ -219,7 +223,8 @@ mod tests {
 
         assert_eq!(result.feed_errors.len(), 1, "the bad feed should be recorded as an error");
         assert_eq!(
-            result.new_signatures, 1,
+            result.new_signatures,
+            1,
             "the good feed should still contribute despite the other feed failing"
         );
     }

@@ -21,7 +21,8 @@ use yara_scan::RuleSet;
 /// to prove the YARA-X integration end-to-end; the real signature/rule
 /// content is a Phase 2 threat-intel concern, not part of this crate's
 /// initial scope.
-pub const DEFAULT_RULES: &str = r#"
+pub const DEFAULT_RULES: &str =
+    r#"
 rule eicar_marker_present {
     strings:
         $eicar = "EICAR-STANDARD-ANTIVIRUS-TEST-FILE"
@@ -39,20 +40,14 @@ rule eicar_marker_present {
 pub fn scan_file(
     path: &Path,
     signatures: &SignatureSet,
-    rules: &RuleSet,
+    rules: &RuleSet
 ) -> std::io::Result<ScanResult> {
     let content = fs::read(path)?;
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
-    Ok(scoring::score_file(
-        &file_name,
-        &content,
-        signatures,
-        rules,
-        Some(path),
-    ))
+    Ok(scoring::score_file(&file_name, &content, signatures, rules, Some(path)))
 }
 
 #[cfg(test)]
@@ -83,8 +78,7 @@ mod tests {
     )]
     fn scans_an_eicar_file_on_disk() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(hash_match::EICAR_TEST_STRING.as_bytes())
-            .unwrap();
+        tmp.write_all(hash_match::EICAR_TEST_STRING.as_bytes()).unwrap();
 
         let rules = RuleSet::compile(DEFAULT_RULES).unwrap();
         let result = scan_file(tmp.path(), &SignatureSet::new(), &rules).unwrap();

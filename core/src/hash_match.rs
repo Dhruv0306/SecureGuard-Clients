@@ -1,4 +1,4 @@
-use sha2::{Digest, Sha256};
+use sha2::{ Digest, Sha256 };
 use std::collections::HashSet;
 
 /// The standard EICAR antivirus test string. Detecting it is a deliberate,
@@ -28,7 +28,10 @@ impl SignatureSet {
 
     pub fn from_hashes<I: IntoIterator<Item = String>>(hashes: I) -> Self {
         Self {
-            hashes: hashes.into_iter().map(|h| h.to_lowercase()).collect(),
+            hashes: hashes
+                .into_iter()
+                .map(|h| h.to_lowercase())
+                .collect(),
         }
     }
 
@@ -94,8 +97,7 @@ fn content_is_eicar(content: &[u8]) -> bool {
     // comparison), since some test harnesses append trailing
     // whitespace/newlines to the canonical string.
     if let Ok(text) = std::str::from_utf8(content) {
-        text.trim_end().ends_with(EICAR_TEST_STRING)
-            || text.contains(EICAR_TEST_STRING)
+        text.trim_end().ends_with(EICAR_TEST_STRING) || text.contains(EICAR_TEST_STRING)
     } else {
         false
     }
@@ -108,10 +110,12 @@ mod tests {
     #[test]
     fn detects_eicar_string() {
         let content = EICAR_TEST_STRING.as_bytes();
-        assert!(matches!(
-            check_hash(content, &sha256_hex(content), &SignatureSet::new()),
-            HashCheck::EicarTestFile
-        ));
+        assert!(
+            matches!(
+                check_hash(content, &sha256_hex(content), &SignatureSet::new()),
+                HashCheck::EicarTestFile
+            )
+        );
     }
 
     #[test]
@@ -119,20 +123,14 @@ mod tests {
         let content = b"totally-not-malware-bytes";
         let hash = sha256_hex(content);
         let signatures = SignatureSet::from_hashes(vec![hash.clone()]);
-        assert!(matches!(
-            check_hash(content, &hash, &signatures),
-            HashCheck::KnownMalicious
-        ));
+        assert!(matches!(check_hash(content, &hash, &signatures), HashCheck::KnownMalicious));
     }
 
     #[test]
     fn clean_content_has_no_match() {
         let content = b"just a normal file";
         let hash = sha256_hex(content);
-        assert!(matches!(
-            check_hash(content, &hash, &SignatureSet::new()),
-            HashCheck::NoMatch
-        ));
+        assert!(matches!(check_hash(content, &hash, &SignatureSet::new()), HashCheck::NoMatch));
     }
 
     #[test]
@@ -140,10 +138,7 @@ mod tests {
         let content = b"case-test";
         let hash = sha256_hex(content);
         let signatures = SignatureSet::from_hashes(vec![hash.to_uppercase()]);
-        assert!(matches!(
-            check_hash(content, &hash, &signatures),
-            HashCheck::KnownMalicious
-        ));
+        assert!(matches!(check_hash(content, &hash, &signatures), HashCheck::KnownMalicious));
     }
 
     #[test]
@@ -162,9 +157,8 @@ mod tests {
         let hash = "1".repeat(64); // a valid-length placeholder hash, exact content doesn't matter
         conn.execute(
             "INSERT INTO signature_cache (sha256, source, added_at) VALUES (?1, 'test', 0)",
-            rusqlite::params![hash],
-        )
-        .unwrap();
+            rusqlite::params![hash]
+        ).unwrap();
 
         let signatures = SignatureSet::load_from_cache(&conn).unwrap();
         assert!(signatures.contains(&hash));

@@ -1,14 +1,17 @@
-use crate::entropy::{shannon_entropy, ENTROPY_SAMPLE_BYTES, THRESHOLD_HIGH_ENTROPY};
+use crate::entropy::{ shannon_entropy, ENTROPY_SAMPLE_BYTES, THRESHOLD_HIGH_ENTROPY };
 use crate::extension::{
-    check_extension_masquerade, get_file_extension, is_executable_like_for_entropy,
-    RANSOMWARE_EXTENSIONS, TROJAN_NAME_SIGNATURES,
+    check_extension_masquerade,
+    get_file_extension,
+    is_executable_like_for_entropy,
+    RANSOMWARE_EXTENSIONS,
+    TROJAN_NAME_SIGNATURES,
 };
-use crate::hash_match::{check_hash, HashCheck, SignatureSet};
+use crate::hash_match::{ check_hash, HashCheck, SignatureSet };
 use crate::rootkit::score_rootkit;
-use crate::text_patterns::{contains_ransomware_pattern, score_text_patterns};
-use crate::types::{ScanResult, ScoreContribution, Verdict};
+use crate::text_patterns::{ contains_ransomware_pattern, score_text_patterns };
+use crate::types::{ ScanResult, ScoreContribution, Verdict };
 use crate::yara_scan::RuleSet;
-use crate::zip_scan::{scan_zip, ZipCheck};
+use crate::zip_scan::{ scan_zip, ZipCheck };
 use std::path::Path;
 
 /// Ported from SecurityServiceImpl. An exact known-malware hash match or
@@ -53,7 +56,7 @@ pub fn score_file(
     content: &[u8],
     signatures: &SignatureSet,
     rules: &RuleSet,
-    path: Option<&Path>,
+    path: Option<&Path>
 ) -> ScanResult {
     let sha256 = crate::hash_match::sha256_hex(content);
 
@@ -120,8 +123,7 @@ pub fn score_file(
     if masquerade_score > 0 {
         score += masquerade_score;
         contributions.push(ScoreContribution {
-            reason: "EXTENSION_MASQUERADE: header bytes don't match the file's extension"
-                .to_string(),
+            reason: "EXTENSION_MASQUERADE: header bytes don't match the file's extension".to_string(),
             points: masquerade_score,
         });
     }
@@ -176,10 +178,7 @@ pub fn score_file(
     // 6. Trojan filename signature, scores at most once even if multiple
     // signatures match, matching Java's break-on-first-match loop.
     let file_name_lower = file_name.to_lowercase();
-    if TROJAN_NAME_SIGNATURES
-        .iter()
-        .any(|sig| file_name_lower.contains(sig))
-    {
+    if TROJAN_NAME_SIGNATURES.iter().any(|sig| file_name_lower.contains(sig)) {
         score += SCORE_TROJAN_NAME;
         contributions.push(ScoreContribution {
             reason: "TROJAN_NAME_SIGNATURE".to_string(),
@@ -286,9 +285,8 @@ mod tests {
                 condition:
                     false
             }
-            "#,
-        )
-        .expect("placeholder rule should compile")
+            "#
+        ).expect("placeholder rule should compile")
     }
 
     #[test]
@@ -307,7 +305,8 @@ mod tests {
         assert_eq!(result.verdict, Verdict::Malicious);
         assert_eq!(result.threat_type.as_deref(), Some("VIRUS"));
         assert_eq!(
-            result.score, SCORE_KNOWN_HASH,
+            result.score,
+            SCORE_KNOWN_HASH,
             "known-hash matches score SCORE_KNOWN_HASH (100), not merely enough to cross \
              THRESHOLD_MALICIOUS, these are numerically different in the Java source"
         );
@@ -363,24 +362,24 @@ mod tests {
 
     #[test]
     fn extension_masquerade_is_detected() {
-        let mut content = vec![0x4D, 0x5A]; // "MZ"
+        let mut content = vec![0x4d, 0x5a]; // "MZ"
         content.extend(std::iter::repeat(0u8).take(100));
-        let result = score_file("invoice.pdf", &content, &SignatureSet::new(), &empty_rules(), None);
-        assert!(result
-            .contributions
-            .iter()
-            .any(|c| c.reason.contains("EXTENSION_MASQUERADE")));
+        let result = score_file(
+            "invoice.pdf",
+            &content,
+            &SignatureSet::new(),
+            &empty_rules(),
+            None
+        );
+        assert!(result.contributions.iter().any(|c| c.reason.contains("EXTENSION_MASQUERADE")));
     }
 
     #[test]
     fn genuine_exe_with_mz_header_is_not_masquerade() {
-        let mut content = vec![0x4D, 0x5A];
+        let mut content = vec![0x4d, 0x5a];
         content.extend(std::iter::repeat(0u8).take(100));
         let result = score_file("tool.exe", &content, &SignatureSet::new(), &empty_rules(), None);
-        assert!(!result
-            .contributions
-            .iter()
-            .any(|c| c.reason.contains("EXTENSION_MASQUERADE")));
+        assert!(!result.contributions.iter().any(|c| c.reason.contains("EXTENSION_MASQUERADE")));
     }
 
     #[test]
@@ -390,7 +389,7 @@ mod tests {
             b"arbitrary encrypted-looking content",
             &SignatureSet::new(),
             &empty_rules(),
-            None,
+            None
         );
         assert!(result.score >= SCORE_RANSOMWARE_EXTENSION);
     }
@@ -410,10 +409,9 @@ mod tests {
             b"ordinary content",
             &SignatureSet::new(),
             &empty_rules(),
-            None,
+            None
         );
-        let trojan_contributions: Vec<_> = result
-            .contributions
+        let trojan_contributions: Vec<_> = result.contributions
             .iter()
             .filter(|c| c.reason == "TROJAN_NAME_SIGNATURE")
             .collect();
@@ -428,7 +426,7 @@ mod tests {
             b"details on a syscall table hook implementation",
             &SignatureSet::new(),
             &empty_rules(),
-            None,
+            None
         );
         assert!(result.score >= SCORE_ROOTKIT_TEXT);
     }
@@ -437,14 +435,15 @@ mod tests {
     fn score_is_capped_at_100_even_with_many_stacked_signals() {
         // Stack ransomware extension + ransomware text + trojan name +
         // rootkit text, comfortably over 100 before capping.
-        let content = b"Your files have been encrypted, contact our btc wallet, \
+        let content =
+            b"Your files have been encrypted, contact our btc wallet, \
                          syscall table hook detected";
         let result = score_file(
             "trojan_backdoor.locked",
             content,
             &SignatureSet::new(),
             &empty_rules(),
-            None,
+            None
         );
         assert!(result.score <= 100);
     }
@@ -459,9 +458,8 @@ mod tests {
                 condition:
                     $a
             }
-            "#,
-        )
-        .unwrap();
+            "#
+        ).unwrap();
         let content = b"benign wrapper MALWARE_MARKER more benign content";
         let result = score_file("suspect.bin", content, &SignatureSet::new(), &rules, None);
         assert!(result.score >= SCORE_STRONG_PATTERN);

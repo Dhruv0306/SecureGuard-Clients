@@ -1,7 +1,7 @@
-use clap::{Parser, Subcommand};
+use clap::{ Parser, Subcommand };
 use secureguard_core::hash_match::SignatureSet;
 use secureguard_core::yara_scan::RuleSet;
-use secureguard_core::{scan_file, signature_sync, storage, DEFAULT_RULES};
+use secureguard_core::{ scan_file, signature_sync, storage, DEFAULT_RULES };
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -100,10 +100,7 @@ fn run_scan(path: &PathBuf, json: bool, db: &PathBuf) -> ExitCode {
                     }
                 }
             } else {
-                println!(
-                    "{}: {} (score {})",
-                    result.file_name, result.verdict, result.score
-                );
+                println!("{}: {} (score {})", result.file_name, result.verdict, result.score);
             }
             ExitCode::SUCCESS
         }
@@ -133,7 +130,8 @@ fn run_sync(db: &PathBuf, feed_urls: &[String]) -> ExitCode {
         Ok(result) => {
             println!(
                 "synced {} new signature(s), {} total in database",
-                result.new_signatures, result.total_signatures
+                result.new_signatures,
+                result.total_signatures
             );
             if !result.feed_errors.is_empty() {
                 eprintln!("{} feed(s) failed (others still applied):", result.feed_errors.len());

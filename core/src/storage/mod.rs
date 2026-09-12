@@ -1,5 +1,5 @@
-use crate::types::{ScanResult, Verdict};
-use rusqlite::{params, Connection, Result as SqliteResult};
+use crate::types::{ ScanResult, Verdict };
+use rusqlite::{ params, Connection, Result as SqliteResult };
 
 pub fn open(path: &str) -> SqliteResult<Connection> {
     let conn = Connection::open(path)?;
@@ -26,8 +26,8 @@ pub fn record_scan(conn: &Connection, result: &ScanResult) -> SqliteResult<()> {
             result.sha256,
             result.verdict.as_str(),
             result.score,
-            result.threat_type,
-        ],
+            result.threat_type
+        ]
     )?;
     Ok(())
 }
@@ -35,7 +35,7 @@ pub fn record_scan(conn: &Connection, result: &ScanResult) -> SqliteResult<()> {
 pub fn recent_scans(conn: &Connection, limit: i64) -> SqliteResult<Vec<ScanResult>> {
     let mut stmt = conn.prepare(
         "SELECT file_name, sha256, verdict, score, threat_type
-         FROM scan_results ORDER BY scanned_at DESC LIMIT ?1",
+         FROM scan_results ORDER BY scanned_at DESC LIMIT ?1"
     )?;
     let rows = stmt.query_map(params![limit], |row| {
         let verdict_str: String = row.get(2)?;
