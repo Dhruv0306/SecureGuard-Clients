@@ -4,6 +4,7 @@ pub mod extension;
 pub mod hash_match;
 pub mod rootkit;
 pub mod scoring;
+pub mod signature_sync;
 pub mod storage;
 pub mod text_patterns;
 pub mod types;

@@ -24,7 +24,7 @@ clap = { version = "4", features = ["derive"] }
 zip = "8.6"
 hex = "0.4"
 regex = "1"
+ureq = "3.4"
 
 [dev-dependencies]
 tempfile = "3"
-ureq = "3.4"
