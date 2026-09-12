@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>SecureGuard</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+    <header>
+        <h1>SecureGuard</h1>
+        <button id="sync-btn">Sync signatures</button>
+        <span id="sync-status"></span>
+    </header>
+
+    <main>
+        <section id="scan-section">
+            <button id="pick-file-btn">Choose file to scan…</button>
+            <span id="picked-file"></span>
+            <div id="verdict-panel" class="hidden">
+                <div id="verdict-badge"></div>
+                <div id="verdict-details"></div>
+            </div>
+        </section>
+
+        <section id="history-section">
+            <h2>Recent scans</h2>
+            <ul id="history-list"></ul>
+        </section>
+    </main>
+
+    <script src="main.js"></script>
+</body>
+</html>
