@@ -3,9 +3,33 @@
 /// gating, and entropy-scoring gating), kept as one shared set here for the
 /// same reason: it's one list in the Java source, not three.
 pub const SUSPICIOUS_EXTENSIONS: &[&str] = &[
-    ".exe", ".dll", ".bat", ".cmd", ".scr", ".js", ".vbs", ".hta", ".sys", ".bin", ".com",
-    ".msi", ".pif", ".gadget", ".msp", ".cpl", ".msc", ".jar", ".ps1", ".psm1", ".vbe", ".ws",
-    ".wsf", ".wsh", ".sct", ".shb", ".tmp",
+    ".exe",
+    ".dll",
+    ".bat",
+    ".cmd",
+    ".scr",
+    ".js",
+    ".vbs",
+    ".hta",
+    ".sys",
+    ".bin",
+    ".com",
+    ".msi",
+    ".pif",
+    ".gadget",
+    ".msp",
+    ".cpl",
+    ".msc",
+    ".jar",
+    ".ps1",
+    ".psm1",
+    ".vbe",
+    ".ws",
+    ".wsf",
+    ".wsh",
+    ".sct",
+    ".shb",
+    ".tmp",
 ];
 
 /// Ported verbatim from SecurityServiceImpl.RANSOMWARE_EXTENSIONS.
@@ -31,12 +55,65 @@ pub const RANSOMWARE_EXTENSIONS: &[&str] = &[
 /// the ransomware directory-behavior heuristic to decide which sibling-file
 /// extensions are unremarkable versus suspiciously novel.
 pub const COMMON_EXTENSIONS: &[&str] = &[
-    ".txt", ".md", ".json", ".yaml", ".yml", ".xml", ".java", ".js", ".ts", ".jsx", ".tsx",
-    ".py", ".c", ".cpp", ".h", ".css", ".html", ".htm", ".jpg", ".jpeg", ".png", ".gif", ".bmp",
-    ".svg", ".ico", ".mp3", ".mp4", ".wav", ".avi", ".mov", ".mkv", ".pdf", ".doc", ".docx",
-    ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".zip", ".rar", ".7z", ".tar", ".gz",
-    ".properties", ".gitignore", ".env", ".log", ".sql", ".sh", ".bat", ".ini", ".conf",
-    ".lock", ".toml", ".class", ".jar", ".exe", ".dll",
+    ".txt",
+    ".md",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".java",
+    ".js",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    ".py",
+    ".c",
+    ".cpp",
+    ".h",
+    ".css",
+    ".html",
+    ".htm",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".svg",
+    ".ico",
+    ".mp3",
+    ".mp4",
+    ".wav",
+    ".avi",
+    ".mov",
+    ".mkv",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".csv",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".properties",
+    ".gitignore",
+    ".env",
+    ".log",
+    ".sql",
+    ".sh",
+    ".bat",
+    ".ini",
+    ".conf",
+    ".lock",
+    ".toml",
+    ".class",
+    ".jar",
+    ".exe",
+    ".dll",
 ];
 
 /// Ported verbatim from SecurityServiceImpl.TROJAN_NAME_SIGNATURES. Deliberately
@@ -67,10 +144,10 @@ pub fn get_file_extension(name: &str) -> String {
 /// something else, see check_extension_masquerade.
 pub fn contains_suspicious_bytes(header: &[u8]) -> bool {
     if header.len() >= 4 {
-        if header[0] == 0x4D && header[1] == 0x5A {
+        if header[0] == 0x4d && header[1] == 0x5a {
             return true; // "MZ"
         }
-        if header[0] == 0x7F && header[1] == 0x45 && header[2] == 0x4C && header[3] == 0x46 {
+        if header[0] == 0x7f && header[1] == 0x45 && header[2] == 0x4c && header[3] == 0x46 {
             return true; // ELF
         }
     }

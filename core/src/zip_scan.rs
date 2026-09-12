@@ -29,7 +29,9 @@ pub fn scan_zip(data: &[u8]) -> ZipCheck {
     let cursor = std::io::Cursor::new(data);
     let mut archive = match ZipArchive::new(cursor) {
         Ok(a) => a,
-        Err(_) => return ZipCheck::NotAZip,
+        Err(_) => {
+            return ZipCheck::NotAZip;
+        }
     };
 
     let compressed_size = data.len() as u64;
@@ -39,12 +41,16 @@ pub fn scan_zip(data: &[u8]) -> ZipCheck {
     for i in 0..archive.len() {
         let entry = match archive.by_index(i) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(_) => {
+                continue;
+            }
         };
         total_uncompressed += entry.size();
 
-        if total_uncompressed > MAX_UNCOMPRESSED_BYTES
-            || (compressed_size > 0 && total_uncompressed / compressed_size.max(1) > MAX_COMPRESSION_RATIO)
+        if
+            total_uncompressed > MAX_UNCOMPRESSED_BYTES ||
+            (compressed_size > 0 &&
+                total_uncompressed / compressed_size.max(1) > MAX_COMPRESSION_RATIO)
         {
             return ZipCheck::LikelyZipBomb;
         }
@@ -108,11 +114,13 @@ mod tests {
 
     #[test]
     fn multiple_suspicious_entries_accumulate_score() {
-        let data = build_test_zip(&[
-            ("a.exe", b"one"),
-            ("b.dll", b"two"),
-            ("c.txt", b"clean"),
-        ]);
+        let data = build_test_zip(
+            &[
+                ("a.exe", b"one"),
+                ("b.dll", b"two"),
+                ("c.txt", b"clean"),
+            ]
+        );
         match scan_zip(&data) {
             ZipCheck::Scored(score) => assert_eq!(score, SCORE_ZIP_SUSPICIOUS_ENTRY * 2),
             other => panic!("expected accumulated score, got {other:?}"),

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{ Deserialize, Serialize };
 
 /// Verdict tiers, matching the Java backend's SecurityServiceImpl exactly.
 /// Do not rename these variants without updating the cross-engine diff job,

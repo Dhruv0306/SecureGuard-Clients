@@ -30,9 +30,9 @@ fn strong_patterns() -> &'static [Regex] {
             r"(?i)\bpost\b.{0,80}\bpassword\b.{0,80}(?:https?://|socket|connect)",
             r"(?i)\bkeylog(?:ger)?\b.{0,80}(?:getasynckeystate|setwindowshookex|keyboard_event)",
         ]
-        .iter()
-        .map(|p| Regex::new(p).expect("strong pattern regex must compile"))
-        .collect()
+            .iter()
+            .map(|p| Regex::new(p).expect("strong pattern regex must compile"))
+            .collect()
     })
 }
 
@@ -65,9 +65,9 @@ fn weak_patterns() -> &'static [Regex] {
             r"(?i)\bdecode(?:uri)?\b",
             r"(?i)\bfromcharcode\b",
         ]
-        .iter()
-        .map(|p| Regex::new(p).expect("weak pattern regex must compile"))
-        .collect()
+            .iter()
+            .map(|p| Regex::new(p).expect("weak pattern regex must compile"))
+            .collect()
     })
 }
 
@@ -83,9 +83,9 @@ fn ransomware_patterns() -> &'static [Regex] {
             r"(?i)\bbitcoin\b.{0,80}(?:wallet|payment|transfer)",
             r"(?i)\bransom\b.{0,80}(?:payment|demand|note)",
         ]
-        .iter()
-        .map(|p| Regex::new(p).expect("ransomware pattern regex must compile"))
-        .collect()
+            .iter()
+            .map(|p| Regex::new(p).expect("ransomware pattern regex must compile"))
+            .collect()
     })
 }
 
@@ -102,9 +102,9 @@ fn kernel_patterns() -> &'static [Regex] {
             r"(?i)idt.{0,20}hook",
             r"(?i)process.{0,20}hiding",
         ]
-        .iter()
-        .map(|p| Regex::new(p).expect("kernel pattern regex must compile"))
-        .collect()
+            .iter()
+            .map(|p| Regex::new(p).expect("kernel pattern regex must compile"))
+            .collect()
     })
 }
 
@@ -127,12 +127,19 @@ pub struct PatternScore {
 pub fn score_text_patterns(content: &[u8]) -> PatternScore {
     let text = bounded_text(content);
 
-    let strong_matches = strong_patterns().iter().filter(|p| p.is_match(&text)).count();
-    let weak_matches = weak_patterns().iter().filter(|p| p.is_match(&text)).count();
+    let strong_matches = strong_patterns()
+        .iter()
+        .filter(|p| p.is_match(&text))
+        .count();
+    let weak_matches = weak_patterns()
+        .iter()
+        .filter(|p| p.is_match(&text))
+        .count();
 
-    let strong_score = strong_matches as i32 * crate::scoring::SCORE_STRONG_PATTERN;
-    let weak_score = (weak_matches as i32 * crate::scoring::SCORE_WEAK_PATTERN)
-        .min(crate::scoring::MAX_WEAK_PATTERN_SCORE);
+    let strong_score = (strong_matches as i32) * crate::scoring::SCORE_STRONG_PATTERN;
+    let weak_score = ((weak_matches as i32) * crate::scoring::SCORE_WEAK_PATTERN).min(
+        crate::scoring::MAX_WEAK_PATTERN_SCORE
+    );
 
     PatternScore {
         strong_matches,
@@ -145,14 +152,18 @@ pub fn score_text_patterns(content: &[u8]) -> PatternScore {
 /// Ported from SecurityServiceImpl.containsRansomwarePatterns.
 pub fn contains_ransomware_pattern(content: &[u8]) -> bool {
     let text = bounded_text(content);
-    ransomware_patterns().iter().any(|p| p.is_match(&text))
+    ransomware_patterns()
+        .iter()
+        .any(|p| p.is_match(&text))
 }
 
 /// Ported from the kernel-pattern loop inside SecurityServiceImpl.scoreRootkit:
 /// scores once (break on first match), not once per pattern.
 pub fn contains_kernel_pattern(content: &[u8]) -> bool {
     let text = bounded_text(content);
-    kernel_patterns().iter().any(|p| p.is_match(&text))
+    kernel_patterns()
+        .iter()
+        .any(|p| p.is_match(&text))
 }
 
 #[cfg(test)]
@@ -170,7 +181,8 @@ mod tests {
     #[test]
     fn detects_and_caps_weak_patterns() {
         // Many weak patterns at once, score should cap at MAX_WEAK_PATTERN_SCORE.
-        let content = b"eval(x); document.write(y); shell_exec(z); system(w); \
+        let content =
+            b"eval(x); document.write(y); shell_exec(z); system(w); \
                          passthru(v); base64_decode(u); runtime.exec(t);";
         let result = score_text_patterns(content);
         assert!(result.weak_matches >= 5);
@@ -186,9 +198,11 @@ mod tests {
 
     #[test]
     fn detects_ransomware_note_text() {
-        assert!(contains_ransomware_pattern(
-            b"Your files have been encrypted. Send payment to our BTC wallet."
-        ));
+        assert!(
+            contains_ransomware_pattern(
+                b"Your files have been encrypted. Send payment to our BTC wallet."
+            )
+        );
         assert!(!contains_ransomware_pattern(b"just an ordinary document"));
     }
 

@@ -33,7 +33,7 @@ use secureguard_core::scoring::score_file;
 use secureguard_core::types::Verdict;
 use secureguard_core::yara_scan::RuleSet;
 use secureguard_core::DEFAULT_RULES;
-use sha2::{Digest, Sha256};
+use sha2::{ Digest, Sha256 };
 use std::io::Read;
 
 /// Pinned commit in Dhruv0306/Antivirus. Update deliberately when the corpus
@@ -65,14 +65,8 @@ const KNOWN_GOOD_SAMPLES: &[KnownGoodSample] = &[
 
 /// Mirrors ScanEvasionIT.java's KNOWN_MALWARE_IOCS exactly.
 const KNOWN_MALWARE_IOCS: &[(&str, &str)] = &[
-    (
-        "WannaCry",
-        "6cf273e91bb4a2455f08604ed402d151d39ab528ef9901738c45770097b35ebb",
-    ),
-    (
-        "NotPetya",
-        "027cc450ef5f8c5f653329641ec1fed91f694e0d229928963b30f6b0d7d3a745",
-    ),
+    ("WannaCry", "6cf273e91bb4a2455f08604ed402d151d39ab528ef9901738c45770097b35ebb"),
+    ("NotPetya", "027cc450ef5f8c5f653329641ec1fed91f694e0d229928963b30f6b0d7d3a745"),
 ];
 
 fn fetch_known_good_sample(path: &str) -> Vec<u8> {
@@ -80,7 +74,8 @@ fn fetch_known_good_sample(path: &str) -> Vec<u8> {
         "https://raw.githubusercontent.com/Dhruv0306/Antivirus/{PINNED_MAIN_REPO_COMMIT}/src/test/resources/known-good-samples/{path}"
     );
 
-    let response = ureq::get(&url)
+    let response = ureq
+        ::get(&url)
         .call()
         .unwrap_or_else(|e| panic!("failed to fetch corpus file {path} from {url}: {e}"));
 
@@ -106,8 +101,7 @@ fn known_malware_iocs_are_recognized_by_the_lookup_mechanism() {
     // Not a file-scan test, this project holds no live malware. Mirrors the
     // Java side's own seedSignature/isKnownMalicious lookup-mechanism test
     // exactly, same published hashes, same "was it recognized" question.
-    let hashes: Vec<String> = KNOWN_MALWARE_IOCS
-        .iter()
+    let hashes: Vec<String> = KNOWN_MALWARE_IOCS.iter()
         .map(|(_, hash)| hash.to_string())
         .collect();
 
@@ -132,19 +126,14 @@ fn known_good_archives_are_never_flagged_as_malicious() {
         let actual_hash = sha256_hex(&bytes);
 
         assert_eq!(
-            actual_hash, sample.expected_sha256,
+            actual_hash,
+            sample.expected_sha256,
             "integrity check failed for {}: fetched content doesn't match the pinned SHA-256 \
              in the main repo's PROVENANCE.md, don't trust this fixture until that's resolved",
             sample.path
         );
 
-        let result = score_file(
-            sample.path,
-            &bytes,
-            &SignatureSet::new(),
-            &rules,
-            None,
-        );
+        let result = score_file(sample.path, &bytes, &SignatureSet::new(), &rules, None);
 
         // Matches the Java test's actual guarantee, not a stronger one: a
         // gzip archive is inherently high-entropy, SUSPICIOUS from entropy
@@ -168,13 +157,7 @@ fn eicar_is_detected_matching_the_java_engines_verdict() {
 
     let eicar = secureguard_core::hash_match::EICAR_TEST_STRING.as_bytes();
 
-    let result = score_file(
-        "eicar.com",
-        eicar,
-        &SignatureSet::new(),
-        &rules,
-        None,
-    );
+    let result = score_file("eicar.com", eicar, &SignatureSet::new(), &rules, None);
 
     assert_eq!(
         result.verdict,

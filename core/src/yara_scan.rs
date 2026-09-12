@@ -1,4 +1,4 @@
-use yara_x::{Compiler, Rules, Scanner};
+use yara_x::{ Compiler, Rules, Scanner };
 
 /// A compiled rule set, wraps yara-x::Rules. Kept as its own type so the rest
 /// of the crate depends on this thin wrapper, not on yara-x's API directly,
@@ -19,9 +19,7 @@ impl RuleSet {
     /// a file on disk.
     pub fn compile(source: &str) -> Result<Self, String> {
         let mut compiler = Compiler::new();
-        compiler
-            .add_source(source)
-            .map_err(|e| format!("YARA-X rule compilation failed: {e}"))?;
+        compiler.add_source(source).map_err(|e| format!("YARA-X rule compilation failed: {e}"))?;
         let rules = compiler.build();
         Ok(Self { rules })
     }
@@ -32,15 +30,15 @@ impl RuleSet {
     /// matches.
     pub fn scan(&self, data: &[u8]) -> Result<Vec<MatchedRule>, String> {
         let mut scanner = Scanner::new(&self.rules);
-        let results = scanner
-            .scan(data)
-            .map_err(|e| format!("YARA-X scan failed: {e}"))?;
-        Ok(results
-            .matching_rules()
-            .map(|r| MatchedRule {
-                identifier: r.identifier().to_string(),
-            })
-            .collect())
+        let results = scanner.scan(data).map_err(|e| format!("YARA-X scan failed: {e}"))?;
+        Ok(
+            results
+                .matching_rules()
+                .map(|r| MatchedRule {
+                    identifier: r.identifier().to_string(),
+                })
+                .collect()
+        )
     }
 }
 
@@ -58,9 +56,8 @@ mod tests {
                 condition:
                     $a
             }
-            "#,
-        )
-        .expect("rule should compile");
+            "#
+        ).expect("rule should compile");
 
         let matches = rules
             .scan(b"some bytes MALWARE_MARKER more bytes")
@@ -80,13 +77,10 @@ mod tests {
                 condition:
                     $a
             }
-            "#,
-        )
-        .expect("rule should compile");
+            "#
+        ).expect("rule should compile");
 
-        let matches = rules
-            .scan(b"perfectly ordinary file contents")
-            .expect("scan should succeed");
+        let matches = rules.scan(b"perfectly ordinary file contents").expect("scan should succeed");
 
         assert!(matches.is_empty());
     }

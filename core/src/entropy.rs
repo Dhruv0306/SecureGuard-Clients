@@ -28,7 +28,7 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
         .iter()
         .filter(|&&c| c > 0)
         .map(|&c| {
-            let p = c as f64 / len;
+            let p = (c as f64) / len;
             -p * p.log2()
         })
         .sum()
@@ -80,10 +80,7 @@ mod tests {
             }
         }
         let entropy = shannon_entropy(&data);
-        assert!(
-            entropy > 7.9,
-            "expected near-maximum entropy, got {entropy}"
-        );
+        assert!(entropy > 7.9, "expected near-maximum entropy, got {entropy}");
     }
 
     #[test]
@@ -122,7 +119,7 @@ mod tests {
         const TEST_BOUND: usize = 8192;
 
         let mut data = Vec::new();
-        for _ in 0..(TEST_BOUND / 256) {
+        for _ in 0..TEST_BOUND / 256 {
             for b in 0u8..=255 {
                 data.push(b);
             }
