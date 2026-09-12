@@ -26,7 +26,6 @@ friends on Linux. See the [Tauri v2 prerequisites guide](https://v2.tauri.app/st
 ```bash
 cd desktop
 npm install
-npx tauri icon path/to/a/logo.png   # one-time, only needed before `npm run build`
 npm run dev
 ```
 

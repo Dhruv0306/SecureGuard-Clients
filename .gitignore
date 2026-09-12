@@ -7,11 +7,13 @@ Cargo.lock
 node_modules/
 desktop/src-tauri/gen/
 
-# Tauri-generated icons (see desktop/src-tauri/icons/README.md)
-desktop/src-tauri/icons/*.png
-desktop/src-tauri/icons/*.icns
-desktop/src-tauri/icons/*.ico
-!desktop/src-tauri/icons/README.md
+# Note: desktop/src-tauri/icons/*.png|.ico|.icns ARE committed, unlike a
+# typical Tauri scaffold. tauri-build's build script requires them to exist
+# for any `cargo build`/`cargo test` on Windows (embeds a Windows resource),
+# not only for `npm run build`, so a placeholder set is checked in rather
+# than left as a manual pre-build step every contributor has to remember.
+# Replace with real branding whenever that exists; regenerate via
+# `npx tauri icon path/to/logo.png` from inside desktop/.
 
 # Local databases created by running scg-scan or the desktop app
 *.db
