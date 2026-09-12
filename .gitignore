@@ -21,3 +21,12 @@ desktop/src-tauri/icons/*.ico
 .vscode/
 .idea/
 .DS_Store
+
+# Ignore the .env file if it exists, but keep the example file
+.env
+.env.*
+!.env.example
+
+# Ignore .patch and .bundle files created by the desktop app
+*.patch
+*.bundle
