@@ -52,7 +52,7 @@ pub fn extract_sha256_signatures(text: &str) -> HashSet<String> {
         .collect()
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct SyncResult {
     /// Count of hashes newly inserted this sync (already-known hashes are
     /// not counted again).

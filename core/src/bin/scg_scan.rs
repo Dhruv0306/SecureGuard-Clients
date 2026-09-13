@@ -91,6 +91,17 @@ fn run_scan(path: &Path, json: bool, db: &Path) -> ExitCode {
 
     match scan_file(path, &signatures, &rules) {
         Ok(result) => {
+            // Persist every scan to history. This was never wired up before
+            // Phase 3, storage::record_scan existed and was tested since
+            // Phase 1 but nothing actually called it in a real code path,
+            // history was buildable but never actually built.
+            if let Err(e) = storage::record_scan(&conn, &result) {
+                eprintln!("warning: failed to record scan to history: {e}");
+                // Not fatal: the scan itself succeeded and its result is
+                // still reported below, losing a history row shouldn't
+                // hide a real verdict from the user.
+            }
+
             if json {
                 match serde_json::to_string_pretty(&result) {
                     Ok(text) => println!("{text}"),
