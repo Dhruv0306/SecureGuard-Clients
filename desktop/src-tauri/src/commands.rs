@@ -4,7 +4,7 @@
 //! directly without touching Tauri's IPC/mock-runtime test infrastructure
 //! at all, see the tests module below.
 
-use rusqlite::Connection;
+use secureguard_core::rusqlite::Connection;
 use secureguard_core::hash_match::SignatureSet;
 use secureguard_core::signature_sync::{self, SyncResult};
 use secureguard_core::storage;

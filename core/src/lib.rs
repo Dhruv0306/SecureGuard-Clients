@@ -11,6 +11,14 @@ pub mod types;
 pub mod yara_scan;
 pub mod zip_scan;
 
+/// Re-exported so downstream crates (the desktop app, later the Android
+/// bindings) hold Connection values sourced from this crate's own rusqlite
+/// dependency, not a second, independently-versioned copy pulled in via
+/// their own Cargo.toml. Two different rusqlite versions in the dependency
+/// graph would mean two distinct, incompatible Connection types, breaking
+/// at the type level, not just a version-skew inconvenience.
+pub use rusqlite;
+
 use hash_match::SignatureSet;
 use std::fs;
 use std::path::Path;
