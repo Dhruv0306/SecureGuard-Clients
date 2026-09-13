@@ -6,7 +6,7 @@
 
 use secureguard_core::rusqlite::Connection;
 use secureguard_core::hash_match::SignatureSet;
-use secureguard_core::signature_sync::{self, SyncResult};
+use secureguard_core::signature_sync::{ self, SyncResult };
 use secureguard_core::storage;
 use secureguard_core::types::ScanResult;
 use secureguard_core::yara_scan::RuleSet;
@@ -30,10 +30,12 @@ pub struct AppState {
 impl AppState {
     pub fn new(db_path: &str) -> Result<Self, String> {
         let conn = storage::open(db_path).map_err(|e| format!("failed to open database: {e}"))?;
-        let rules = RuleSet::compile(DEFAULT_RULES)
-            .map_err(|e| format!("failed to compile rule set: {e}"))?;
-        let signatures = SignatureSet::load_from_cache(&conn)
-            .map_err(|e| format!("failed to load signatures: {e}"))?;
+        let rules = RuleSet::compile(DEFAULT_RULES).map_err(|e|
+            format!("failed to compile rule set: {e}")
+        )?;
+        let signatures = SignatureSet::load_from_cache(&conn).map_err(|e|
+            format!("failed to load signatures: {e}")
+        )?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -46,18 +48,15 @@ impl AppState {
 // --- Plain functions: the actual logic, testable directly, no Tauri types ---
 
 pub fn do_scan(state: &AppState, path: &str) -> Result<ScanResult, String> {
-    let signatures = state
-        .signatures
+    let signatures = state.signatures
         .lock()
         .map_err(|_| "signature set lock poisoned".to_string())?;
 
-    let result = secureguard_core::scan_file(&PathBuf::from(path), &signatures, &state.rules)
+    let result = secureguard_core
+        ::scan_file(&PathBuf::from(path), &signatures, &state.rules)
         .map_err(|e| format!("failed to scan {path}: {e}"))?;
 
-    let conn = state
-        .conn
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
     // Matches the CLI's own behavior: a failure to record history is
     // logged, not fatal, the scan itself succeeded and the caller still
     // gets a real verdict either way.
@@ -69,30 +68,23 @@ pub fn do_scan(state: &AppState, path: &str) -> Result<ScanResult, String> {
 }
 
 pub fn do_recent_scans(state: &AppState, limit: i64) -> Result<Vec<ScanResult>, String> {
-    let conn = state
-        .conn
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
     storage::recent_scans(&conn, limit).map_err(|e| format!("failed to load history: {e}"))
 }
 
 pub fn do_sync(state: &AppState) -> Result<SyncResult, String> {
-    let conn = state
-        .conn
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
 
-    let result = signature_sync::sync_signatures(&[signature_sync::DEFAULT_FEED_URL], &conn)
+    let result = signature_sync
+        ::sync_signatures(&[signature_sync::DEFAULT_FEED_URL], &conn)
         .map_err(|e| format!("sync failed: {e}"))?;
 
     // Reload in-memory signatures so a scan run immediately after this
     // sync sees the newly learned hashes, not just on next app restart.
-    let refreshed = SignatureSet::load_from_cache(&conn)
-        .map_err(|e| format!("sync succeeded but reloading signatures failed: {e}"))?;
-    *state
-        .signatures
-        .lock()
-        .map_err(|_| "signature set lock poisoned".to_string())? = refreshed;
+    let refreshed = SignatureSet::load_from_cache(&conn).map_err(|e|
+        format!("sync succeeded but reloading signatures failed: {e}")
+    )?;
+    *state.signatures.lock().map_err(|_| "signature set lock poisoned".to_string())? = refreshed;
 
     Ok(result)
 }
@@ -160,7 +152,8 @@ mod tests {
     fn do_scan_detects_eicar() {
         let (state, dir) = test_state();
         let file_path = dir.path().join("eicar_test.txt");
-        std::fs::write(&file_path, secureguard_core::hash_match::EICAR_TEST_STRING.as_bytes())
+        std::fs
+            ::write(&file_path, secureguard_core::hash_match::EICAR_TEST_STRING.as_bytes())
             .unwrap();
 
         let result = do_scan(&state, &file_path.to_string_lossy()).unwrap();
