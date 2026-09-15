@@ -63,11 +63,15 @@ fn parse_verdict(s: &str) -> Verdict {
 /// signal of "active", no separate is_active flag like the Java schema has,
 /// see docs/phase4-desktop-privileged-helper-plan.md for why that's a
 /// deliberate simplification, not an oversight.
-pub fn add_blocked_domain(conn: &Connection, domain: &str, reason: Option<&str>) -> SqliteResult<()> {
+pub fn add_blocked_domain(
+    conn: &Connection,
+    domain: &str,
+    reason: Option<&str>
+) -> SqliteResult<()> {
     conn.execute(
         "INSERT OR REPLACE INTO blocked_domains (domain, reason, added_at)
          VALUES (?1, ?2, strftime('%s','now'))",
-        params![domain, reason],
+        params![domain, reason]
     )?;
     Ok(())
 }

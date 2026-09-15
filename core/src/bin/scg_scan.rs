@@ -2,7 +2,7 @@ use clap::{ Parser, Subcommand };
 use secureguard_core::hash_match::SignatureSet;
 use secureguard_core::yara_scan::RuleSet;
 use secureguard_core::{ scan_file, signature_sync, storage, DEFAULT_RULES };
-use std::path::{Path, PathBuf};
+use std::path::{ Path, PathBuf };
 use std::process::ExitCode;
 
 /// SecureGuard detection core CLI. Used both for manual testing and as the

@@ -95,10 +95,11 @@ pub fn do_sync(state: &AppState) -> Result<SyncResult, String> {
 pub fn do_block_domain(
     state: &AppState,
     domain: &str,
-    reason: Option<&str>,
+    reason: Option<&str>
 ) -> Result<Vec<String>, String> {
     let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
-    storage::add_blocked_domain(&conn, domain, reason)
+    storage
+        ::add_blocked_domain(&conn, domain, reason)
         .map_err(|e| format!("failed to record blocked domain: {e}"))?;
     storage::list_blocked_domains(&conn).map_err(|e| format!("failed to list blocked domains: {e}"))
 }
@@ -106,7 +107,8 @@ pub fn do_block_domain(
 /// DB-only, same reasoning as do_block_domain.
 pub fn do_unblock_domain(state: &AppState, domain: &str) -> Result<Vec<String>, String> {
     let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
-    storage::remove_blocked_domain(&conn, domain)
+    storage
+        ::remove_blocked_domain(&conn, domain)
         .map_err(|e| format!("failed to remove blocked domain: {e}"))?;
     storage::list_blocked_domains(&conn).map_err(|e| format!("failed to list blocked domains: {e}"))
 }
@@ -143,7 +145,7 @@ pub fn sync_signatures_cmd(state: State<AppState>) -> Result<SyncResult, String>
 pub fn block_domain_cmd(
     state: State<AppState>,
     domain: String,
-    reason: Option<String>,
+    reason: Option<String>
 ) -> Result<(), String> {
     let active = do_block_domain(&state, &domain, reason.as_deref())?;
 

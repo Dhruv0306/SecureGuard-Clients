@@ -15,7 +15,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{ Path, PathBuf };
 
 const MARKER: &str = "# SECUREGUARD_BLOCKED_DOMAIN";
 
@@ -116,9 +116,7 @@ mod tests {
     #[test]
     fn writes_blocked_domains_with_marker() {
         let (writer, file) = writer_for("127.0.0.1 localhost\n");
-        writer
-            .write(&["malware.example.com".to_string()])
-            .unwrap();
+        writer.write(&["malware.example.com".to_string()]).unwrap();
 
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("127.0.0.1 localhost"));
@@ -129,12 +127,10 @@ mod tests {
     fn removes_stale_marker_lines_not_in_the_active_set() {
         let (writer, file) = writer_for(
             "127.0.0.1 localhost\n\
-             127.0.0.1 old-blocked.example.com # SECUREGUARD_BLOCKED_DOMAIN\n",
+             127.0.0.1 old-blocked.example.com # SECUREGUARD_BLOCKED_DOMAIN\n"
         );
 
-        writer
-            .write(&["new-blocked.example.com".to_string()])
-            .unwrap();
+        writer.write(&["new-blocked.example.com".to_string()]).unwrap();
 
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("127.0.0.1 localhost"));
@@ -146,7 +142,7 @@ mod tests {
     fn empty_active_set_removes_all_marker_lines_but_keeps_system_entries() {
         let (writer, file) = writer_for(
             "127.0.0.1 localhost\n\
-             127.0.0.1 blocked.example.com # SECUREGUARD_BLOCKED_DOMAIN\n",
+             127.0.0.1 blocked.example.com # SECUREGUARD_BLOCKED_DOMAIN\n"
         );
 
         writer.write(&[]).unwrap();

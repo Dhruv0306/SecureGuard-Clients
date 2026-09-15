@@ -4,30 +4,29 @@
 //! before: the `interprocess` API usage here is written against that
 //! crate's documented API, not compiled against here.
 
-use interprocess::local_socket::{
-    prelude::*, GenericNamespaced, ListenerOptions, ToNsName,
-};
-use secureguard_core::helper_protocol::{HelperRequest, HelperResponse};
+use interprocess::local_socket::{ prelude::*, GenericNamespaced, ListenerOptions, ToNsName };
+use secureguard_core::helper_protocol::{ HelperRequest, HelperResponse };
 use secureguard_core::hosts_writer::HostsFileWriter;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{ BufRead, BufReader, Write };
 
 /// Binds the given socket name and serves requests forever, one connection
 /// at a time. Blocking, meant to be the entire body of `main()`.
 pub fn run_helper_server(socket_name: &str, writer: HostsFileWriter) -> ! {
-    let name = socket_name
-        .to_ns_name::<GenericNamespaced>()
-        .unwrap_or_else(|e| {
-            eprintln!("failed to construct socket name: {e}");
-            std::process::exit(1);
-        });
-
-    let listener = ListenerOptions::new().name(name).create_sync().unwrap_or_else(|e| {
-        eprintln!(
-            "failed to bind helper socket (already running elsewhere, or a \
-             permissions problem): {e}"
-        );
+    let name = socket_name.to_ns_name::<GenericNamespaced>().unwrap_or_else(|e| {
+        eprintln!("failed to construct socket name: {e}");
         std::process::exit(1);
     });
+
+    let listener = ListenerOptions::new()
+        .name(name)
+        .create_sync()
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "failed to bind helper socket (already running elsewhere, or a \
+             permissions problem): {e}"
+            );
+            std::process::exit(1);
+        });
 
     eprintln!("secureguard-helper listening on '{socket_name}'");
 
@@ -57,17 +56,20 @@ pub fn handle_connection(conn: impl std::io::Read + std::io::Write, writer: &Hos
     }
 
     let response = match serde_json::from_str::<HelperRequest>(&line) {
-        Ok(request) => match writer.write(&request.active_domains) {
-            Ok(()) => HelperResponse { success: true, error: None },
-            Err(e) => HelperResponse {
+        Ok(request) =>
+            match writer.write(&request.active_domains) {
+                Ok(()) => HelperResponse { success: true, error: None },
+                Err(e) =>
+                    HelperResponse {
+                        success: false,
+                        error: Some(format!("failed to write hosts file: {e}")),
+                    },
+            }
+        Err(e) =>
+            HelperResponse {
                 success: false,
-                error: Some(format!("failed to write hosts file: {e}")),
+                error: Some(format!("malformed request: {e}")),
             },
-        },
-        Err(e) => HelperResponse {
-            success: false,
-            error: Some(format!("malformed request: {e}")),
-        },
     };
 
     let Ok(mut response_json) = serde_json::to_string(&response) else {

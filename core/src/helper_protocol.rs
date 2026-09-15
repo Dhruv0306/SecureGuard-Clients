@@ -8,7 +8,7 @@
 //! the full active domain list every time it changes, the helper always
 //! writes the complete set, not a delta.
 
-use serde::{Deserialize, Serialize};
+use serde::{ Deserialize, Serialize };
 
 /// Name the helper listens on. Not a filesystem path, `interprocess`
 /// resolves this per-platform (a named pipe name on Windows, a socket

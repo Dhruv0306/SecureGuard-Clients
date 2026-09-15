@@ -4,10 +4,10 @@
 //! round-trip, just pointed at a temp file instead of the OS hosts file, so
 //! it's safe to run in CI without touching real system state.
 
-use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream, ToNsName};
-use secureguard_core::helper_protocol::{HelperRequest, HelperResponse};
+use interprocess::local_socket::{ prelude::*, GenericNamespaced, Stream, ToNsName };
+use secureguard_core::helper_protocol::{ HelperRequest, HelperResponse };
 use secureguard_core::hosts_writer::HostsFileWriter;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{ BufRead, BufReader, Write };
 use std::thread;
 
 fn unique_socket_name(test_name: &str) -> String {
@@ -17,9 +17,7 @@ fn unique_socket_name(test_name: &str) -> String {
 }
 
 fn send_request(socket_name: &str, active_domains: Vec<String>) -> HelperResponse {
-    let name = socket_name
-        .to_ns_name::<GenericNamespaced>()
-        .expect("valid socket name");
+    let name = socket_name.to_ns_name::<GenericNamespaced>().expect("valid socket name");
 
     // The server side binds asynchronously in a spawned thread; give it a
     // moment to be ready. A fixed sleep is not ideal, but this crate has no
@@ -50,10 +48,9 @@ fn round_trips_a_successful_domain_block_request() {
     let server_socket_name = socket_name.clone();
 
     let server = thread::spawn(move || {
-        let name = server_socket_name
-            .to_ns_name::<GenericNamespaced>()
-            .expect("valid socket name");
-        let listener = interprocess::local_socket::ListenerOptions::new()
+        let name = server_socket_name.to_ns_name::<GenericNamespaced>().expect("valid socket name");
+        let listener = interprocess::local_socket::ListenerOptions
+            ::new()
             .name(name)
             .create_sync()
             .expect("test server should bind");
@@ -86,10 +83,9 @@ fn round_trips_a_malformed_request_as_a_reported_error_not_a_crash() {
     let server_socket_name = socket_name.clone();
 
     let server = thread::spawn(move || {
-        let name = server_socket_name
-            .to_ns_name::<GenericNamespaced>()
-            .expect("valid socket name");
-        let listener = interprocess::local_socket::ListenerOptions::new()
+        let name = server_socket_name.to_ns_name::<GenericNamespaced>().expect("valid socket name");
+        let listener = interprocess::local_socket::ListenerOptions
+            ::new()
             .name(name)
             .create_sync()
             .expect("test server should bind");
