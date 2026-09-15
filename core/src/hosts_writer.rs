@@ -15,7 +15,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{ Path, PathBuf };
+use std::path::PathBuf;
 
 const MARKER: &str = "# SECUREGUARD_BLOCKED_DOMAIN";
 
@@ -179,6 +179,7 @@ mod tests {
 
     #[test]
     fn default_hosts_path_matches_the_current_platform() {
+        use std::path::Path;
         let path = default_hosts_path();
         if cfg!(windows) {
             assert_eq!(path, Path::new(r"C:\Windows\System32\drivers\etc\hosts"));

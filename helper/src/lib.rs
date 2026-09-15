@@ -7,7 +7,7 @@
 use interprocess::local_socket::{ prelude::*, GenericNamespaced, ListenerOptions, ToNsName };
 use secureguard_core::helper_protocol::{ HelperRequest, HelperResponse };
 use secureguard_core::hosts_writer::HostsFileWriter;
-use std::io::{ BufRead, BufReader, Write };
+use std::io::{ BufRead, BufReader };
 
 /// Binds the given socket name and serves requests forever, one connection
 /// at a time. Blocking, meant to be the entire body of `main()`.
