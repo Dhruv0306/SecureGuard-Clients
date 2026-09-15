@@ -2,6 +2,8 @@ pub mod dir_behavior;
 pub mod entropy;
 pub mod extension;
 pub mod hash_match;
+pub mod helper_protocol;
+pub mod hosts_writer;
 pub mod rootkit;
 pub mod scoring;
 pub mod signature_sync;

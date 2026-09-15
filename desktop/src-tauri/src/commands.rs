@@ -89,6 +89,35 @@ pub fn do_sync(state: &AppState) -> Result<SyncResult, String> {
     Ok(result)
 }
 
+/// DB-only, no IPC to the helper, so it's directly testable. Returns the
+/// new full active list so the caller (the Tauri command) knows exactly
+/// what to send the helper next, rather than re-querying.
+pub fn do_block_domain(
+    state: &AppState,
+    domain: &str,
+    reason: Option<&str>
+) -> Result<Vec<String>, String> {
+    let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
+    storage
+        ::add_blocked_domain(&conn, domain, reason)
+        .map_err(|e| format!("failed to record blocked domain: {e}"))?;
+    storage::list_blocked_domains(&conn).map_err(|e| format!("failed to list blocked domains: {e}"))
+}
+
+/// DB-only, same reasoning as do_block_domain.
+pub fn do_unblock_domain(state: &AppState, domain: &str) -> Result<Vec<String>, String> {
+    let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
+    storage
+        ::remove_blocked_domain(&conn, domain)
+        .map_err(|e| format!("failed to remove blocked domain: {e}"))?;
+    storage::list_blocked_domains(&conn).map_err(|e| format!("failed to list blocked domains: {e}"))
+}
+
+pub fn do_list_blocked_domains(state: &AppState) -> Result<Vec<String>, String> {
+    let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
+    storage::list_blocked_domains(&conn).map_err(|e| format!("failed to list blocked domains: {e}"))
+}
+
 // --- Thin Tauri command wrappers, the only place tauri::State is touched ---
 
 #[tauri::command]
@@ -104,6 +133,59 @@ pub fn recent_scans_cmd(state: State<AppState>, limit: i64) -> Result<Vec<ScanRe
 #[tauri::command]
 pub fn sync_signatures_cmd(state: State<AppState>) -> Result<SyncResult, String> {
     do_sync(&state)
+}
+
+/// Unlike the other commands, this one's DB step (do_block_domain) and its
+/// IPC step (sending the updated list to the helper) are deliberately
+/// separate calls here, not both inside one testable "do_" function, since
+/// the IPC step can't be safely exercised in a unit test against the real
+/// hosts file. On a helper failure, the DB insert is rolled back so local
+/// state doesn't claim a domain is blocked when it demonstrably isn't.
+#[tauri::command]
+pub fn block_domain_cmd(
+    state: State<AppState>,
+    domain: String,
+    reason: Option<String>
+) -> Result<(), String> {
+    let active = do_block_domain(&state, &domain, reason.as_deref())?;
+
+    match crate::helper_client::send_domain_list(&active) {
+        Ok(response) if response.success => Ok(()),
+        Ok(response) => {
+            let _ = do_unblock_domain(&state, &domain); // roll back, it isn't actually blocked
+            Err(response.error.unwrap_or_else(|| "helper reported failure".to_string()))
+        }
+        Err(e) => {
+            let _ = do_unblock_domain(&state, &domain);
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn unblock_domain_cmd(state: State<AppState>, domain: String) -> Result<(), String> {
+    // Need the domain's prior reason to roll back accurately; simplest
+    // correct approach is re-adding without a reason on rollback, losing
+    // the original reason string in that specific failure case is an
+    // acceptable tradeoff, the domain still ends up correctly re-blocked.
+    let active = do_unblock_domain(&state, &domain)?;
+
+    match crate::helper_client::send_domain_list(&active) {
+        Ok(response) if response.success => Ok(()),
+        Ok(response) => {
+            let _ = do_block_domain(&state, &domain, None);
+            Err(response.error.unwrap_or_else(|| "helper reported failure".to_string()))
+        }
+        Err(e) => {
+            let _ = do_block_domain(&state, &domain, None);
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn list_blocked_domains_cmd(state: State<AppState>) -> Result<Vec<String>, String> {
+    do_list_blocked_domains(&state)
 }
 
 #[cfg(test)]
@@ -173,5 +255,29 @@ mod tests {
 
         let history = do_recent_scans(&state, 3).unwrap();
         assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn do_block_domain_adds_to_the_active_list() {
+        let (state, _dir) = test_state();
+        let active = do_block_domain(&state, "malware.example.com", Some("test")).unwrap();
+        assert_eq!(active, vec!["malware.example.com"]);
+    }
+
+    #[test]
+    fn do_unblock_domain_removes_from_the_active_list() {
+        let (state, _dir) = test_state();
+        do_block_domain(&state, "malware.example.com", None).unwrap();
+        let active = do_unblock_domain(&state, "malware.example.com").unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn do_list_blocked_domains_reflects_current_state() {
+        let (state, _dir) = test_state();
+        do_block_domain(&state, "a.example.com", None).unwrap();
+        do_block_domain(&state, "b.example.com", None).unwrap();
+        let active = do_list_blocked_domains(&state).unwrap();
+        assert_eq!(active, vec!["a.example.com", "b.example.com"]);
     }
 }
