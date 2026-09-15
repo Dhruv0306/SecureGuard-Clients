@@ -1,4 +1,5 @@
 mod commands;
+mod helper_client;
 
 use commands::AppState;
 use tauri::Manager;
@@ -30,7 +31,10 @@ fn main() {
             tauri::generate_handler![
                 commands::scan_file_cmd,
                 commands::recent_scans_cmd,
-                commands::sync_signatures_cmd
+                commands::sync_signatures_cmd,
+                commands::block_domain_cmd,
+                commands::unblock_domain_cmd,
+                commands::list_blocked_domains_cmd
             ]
         )
         .run(tauri::generate_context!())
