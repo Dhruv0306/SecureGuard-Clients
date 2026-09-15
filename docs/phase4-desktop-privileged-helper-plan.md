@@ -174,3 +174,14 @@ without a real OS to test against, unlike everything else in this repo so far.
 - `blocked_domains` gained real CRUD (`add_blocked_domain`/`remove_blocked_domain`/
   `list_blocked_domains`) in `core::storage`; only the table schema existed before,
   the same "buildable but never actually built" gap `record_scan` had before Phase 3.
+
+## Follow-up reminder: no UI wired up yet
+
+The backend for domain blocking (Tauri commands, helper process, IPC round-trip) is
+fully implemented and tested, but nothing in `desktop/src/` calls
+`block_domain_cmd`/`unblock_domain_cmd`/`list_blocked_domains_cmd` yet, there's no
+input field, button, or list view for this feature. As a result, this has never been
+exercised end-to-end against a real hosts file, only against temp files in tests.
+Adding that UI (mirroring how scan/sync already work) is a small, separate follow-up,
+and should happen before considering domain blocking actually done from a user's
+perspective, not just from a "the code exists and is tested" perspective.
