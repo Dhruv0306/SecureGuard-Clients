@@ -1,0 +1,23 @@
+[package]
+name = "secureguard-helper"
+version = "0.1.0"
+description = "SecureGuard privileged helper: the only process that writes the hosts file. See docs/phase4-desktop-privileged-helper-plan.md."
+edition = "2021"
+rust-version = "1.74"
+
+[[bin]]
+name = "secureguard-helper"
+path = "src/main.rs"
+
+[lib]
+name = "secureguard_helper"
+path = "src/lib.rs"
+
+[dependencies]
+secureguard-core = { path = "../core" }
+interprocess = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
