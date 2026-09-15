@@ -59,6 +59,34 @@ fn parse_verdict(s: &str) -> Verdict {
     }
 }
 
+/// Ported concept from Phase 4's design: presence in this table is the only
+/// signal of "active", no separate is_active flag like the Java schema has,
+/// see docs/phase4-desktop-privileged-helper-plan.md for why that's a
+/// deliberate simplification, not an oversight.
+pub fn add_blocked_domain(conn: &Connection, domain: &str, reason: Option<&str>) -> SqliteResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO blocked_domains (domain, reason, added_at)
+         VALUES (?1, ?2, strftime('%s','now'))",
+        params![domain, reason],
+    )?;
+    Ok(())
+}
+
+pub fn remove_blocked_domain(conn: &Connection, domain: &str) -> SqliteResult<()> {
+    conn.execute("DELETE FROM blocked_domains WHERE domain = ?1", params![domain])?;
+    Ok(())
+}
+
+pub fn list_blocked_domains(conn: &Connection) -> SqliteResult<Vec<String>> {
+    // Ordered by rowid, not added_at: added_at has only second resolution,
+    // two domains added within the same second would tie and risk a
+    // nondeterministic order. rowid is monotonic per insert on a normal
+    // (non-WITHOUT-ROWID) table, guaranteeing insertion order exactly.
+    let mut stmt = conn.prepare("SELECT domain FROM blocked_domains ORDER BY rowid ASC")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +126,35 @@ mod tests {
         assert_eq!(scans.len(), 3);
         // Most recently inserted should come first.
         assert_eq!(scans[0].file_name, "f4.txt");
+    }
+
+    #[test]
+    fn adds_and_lists_blocked_domains() {
+        let conn = open_in_memory().unwrap();
+        add_blocked_domain(&conn, "malware.example.com", Some("test")).unwrap();
+        add_blocked_domain(&conn, "phishing.example.com", None).unwrap();
+
+        let domains = list_blocked_domains(&conn).unwrap();
+        assert_eq!(domains, vec!["malware.example.com", "phishing.example.com"]);
+    }
+
+    #[test]
+    fn removing_a_blocked_domain_drops_it_from_the_active_list() {
+        let conn = open_in_memory().unwrap();
+        add_blocked_domain(&conn, "malware.example.com", None).unwrap();
+        remove_blocked_domain(&conn, "malware.example.com").unwrap();
+
+        let domains = list_blocked_domains(&conn).unwrap();
+        assert!(domains.is_empty());
+    }
+
+    #[test]
+    fn adding_the_same_domain_twice_does_not_duplicate_it() {
+        let conn = open_in_memory().unwrap();
+        add_blocked_domain(&conn, "malware.example.com", Some("first")).unwrap();
+        add_blocked_domain(&conn, "malware.example.com", Some("updated reason")).unwrap();
+
+        let domains = list_blocked_domains(&conn).unwrap();
+        assert_eq!(domains.len(), 1);
     }
 }
