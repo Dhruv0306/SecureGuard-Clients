@@ -1,6 +1,6 @@
 [package]
 name = "secureguard-helper"
-version = "0.1.0"
+version.workspace = true
 description = "SecureGuard privileged helper: the only process that writes the hosts file. See docs/phase4-desktop-privileged-helper-plan.md."
 edition = "2021"
 rust-version = "1.74"

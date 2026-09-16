@@ -1,6 +1,6 @@
 [package]
 name = "secureguard-desktop"
-version = "0.1.0"
+version.workspace = true
 description = "SecureGuard Antivirus desktop shell: wraps secureguard-core directly, in-process, no backend."
 edition = "2021"
 rust-version = "1.74"
