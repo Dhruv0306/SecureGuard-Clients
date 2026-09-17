@@ -1,0 +1,201 @@
+name: Release
+
+# Triggered on version tags (v1.0.0 etc.), not a branch push, matching the
+# distribution plan: GitHub Releases only, one tag = one release. Uses the
+# official tauri-apps/tauri-action for the desktop bundle rather than
+# hand-rolling platform-specific bundle invocations, see
+# docs/phase5-release-workflow-plan.md's "Build strategy" section for why.
+#
+# NOTE ON VERIFICATION: this workflow has never actually run. Its real test
+# gate, per the plan doc, is a live tag push, not more code or more tests.
+# Expect the first real run to surface something this file didn't
+# anticipate, especially around matrix artifact-passing between the build
+# and sign jobs, a common source of GitHub Actions bugs independent of
+# anything Tauri- or Rust-specific.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  check-version-matches-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      release_notes: ${{ steps.notes.outputs.body }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify the pushed tag matches [workspace.package].version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep -A1 '\[workspace.package\]' Cargo.toml | grep version | sed -E 's/version = "(.*)"/\1/')
+          echo "Tag version: $TAG_VERSION"
+          echo "Cargo workspace version: $CARGO_VERSION"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION does not match [workspace.package].version ($CARGO_VERSION). Fix Cargo.toml or the tag before releasing."
+            exit 1
+          fi
+
+      - name: Extract CHANGELOG.md section for this version
+        id: notes
+        run: |
+          # Same pattern as the main Antivirus repo's release.yml: match the
+          # "## [VERSION]" heading (tag with its leading "v" stripped) up to
+          # the next "## [" heading, fail loudly if nothing matches rather
+          # than shipping a release with an empty or stale body. Before
+          # tagging a real release, the "## [Unreleased]" section in
+          # CHANGELOG.md must be renamed to "## [VERSION] - DATE" first.
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v version="$VERSION" '
+              BEGIN { found = 0 }
+              $0 ~ "^## \\[" version "\\]" { found = 1; next }
+              found && /^## \[/ { exit }
+              found { print }
+          ' CHANGELOG.md > changelog-section.md
+
+          if [ ! -s changelog-section.md ]; then
+            echo "::error::No CHANGELOG.md section found for version $VERSION. Add a \"## [$VERSION]\" heading before tagging."
+            exit 1
+          fi
+
+          {
+            echo "See \`checksums.txt\` and \`checksums.txt.asc\` (attached once all"
+            echo "platform builds complete) to verify your download. **GitHub is the"
+            echo "only official distribution source for SecureGuard**, do not trust"
+            echo "installers found anywhere else."
+            echo
+            cat changelog-section.md
+          } > release-notes.md
+
+          # Multi-line job output: the documented GitHub Actions delimiter
+          # pattern, a plain `echo "body=...".` only handles single-line
+          # values.
+          echo "body<<RELEASE_NOTES_EOF" >> "$GITHUB_OUTPUT"
+          cat release-notes.md >> "$GITHUB_OUTPUT"
+          echo "RELEASE_NOTES_EOF" >> "$GITHUB_OUTPUT"
+
+  build-desktop:
+    needs: check-version-matches-tag
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'windows-latest'
+            target-triple: 'x86_64-pc-windows-msvc'
+          - platform: 'macos-latest'
+            target-triple: 'aarch64-apple-darwin'
+          - platform: 'macos-latest'
+            target-triple: 'x86_64-apple-darwin'
+          - platform: 'ubuntu-22.04'
+            target-triple: 'x86_64-unknown-linux-gnu'
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Tauri Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libxdo-dev \
+            build-essential \
+            curl \
+            wget \
+            file
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target-triple }}
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target-triple }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install desktop app npm dependencies
+        working-directory: desktop
+        run: npm install
+
+      - name: Build and release the desktop bundle
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: 'SecureGuard ${{ github.ref_name }}'
+          releaseBody: ${{ needs.check-version-matches-tag.outputs.release_notes }}
+          releaseDraft: true
+          prerelease: false
+          args: '--target ${{ matrix.target-triple }}'
+
+      - name: Build the privileged helper binary
+        run: cargo build --release --package secureguard-helper --target ${{ matrix.target-triple }}
+
+      - name: Build the scg-scan CLI binary
+        run: cargo build --release --package secureguard-core --bin scg-scan --target ${{ matrix.target-triple }}
+
+      - name: Upload helper and CLI binaries as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: secureguard-extra-binaries-${{ matrix.target-triple }}
+          path: |
+            target/${{ matrix.target-triple }}/release/secureguard-helper*
+            target/${{ matrix.target-triple }}/release/scg-scan*
+          if-no-files-found: error
+
+  checksum-and-sign:
+    needs: build-desktop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: release-artifacts
+
+      - name: Compute SHA-256 checksums
+        working-directory: release-artifacts
+        run: |
+          find . -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name 'secureguard-helper*' -o -name 'scg-scan*' \) \
+            -exec sha256sum {} \; > ../checksums.txt
+          cat ../checksums.txt
+
+      - name: Import GPG signing key
+        run: echo "${{ secrets.RELEASE_GPG_PRIVATE_KEY }}" | gpg --batch --import
+
+      - name: Sign the checksums file
+        run: |
+          gpg --batch --yes --passphrase "${{ secrets.RELEASE_GPG_PASSPHRASE }}" \
+            --pinentry-mode loopback --armor --detach-sign checksums.txt
+
+      - name: Attach checksums and signature to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            checksums.txt
+            checksums.txt.asc

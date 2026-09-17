@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["core", "desktop/src-tauri", "helper"]
+
+[workspace.package]
+# Single source of truth for the version across all three crates. A
+# release tag (v1.0.0) is checked against this value before the release
+# workflow builds anything, see docs/phase5-release-workflow-plan.md.
+version = "0.1.0"
