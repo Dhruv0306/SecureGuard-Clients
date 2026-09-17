@@ -173,7 +173,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Download all platform artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: release-artifacts
 
