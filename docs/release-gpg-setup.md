@@ -4,6 +4,42 @@ This has to happen on your machine, not in an automated session. A private signi
 shouldn't be generated anywhere other than the place that's going to hold onto it
 long-term.
 
+## 0. Install GPG
+
+Skip this if `gpg --version` already prints something.
+
+**Windows**
+
+```powershell
+winget install GnuPG.Gpg4win
+```
+Or download the installer directly from [gpg4win.org](https://www.gpg4win.org/) if you
+don't have `winget`. Close and reopen your terminal afterward so `PATH` picks up the
+new install, then confirm with `gpg --version`.
+
+**macOS**
+
+```bash
+brew install gnupg
+```
+Or install [GPG Suite](https://gpgtools.org/) if you'd rather have a GUI key manager
+alongside the command-line tools.
+
+**Linux**
+
+Usually already installed. If not:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install gnupg
+
+# Fedora
+sudo dnf install gnupg2
+
+# Arch
+sudo pacman -S gnupg
+```
+
 ## 1. Generate a dedicated signing key
 
 ```bash
