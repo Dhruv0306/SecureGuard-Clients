@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.0] - 17/09/2026
 
 Standalone, no-backend Rust detection engine plus desktop client and privileged helper.
 First five phases of the [standalone clients plan](docs/standalone-native-clients-plan.md),
