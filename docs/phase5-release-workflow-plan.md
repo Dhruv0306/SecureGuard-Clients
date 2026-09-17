@@ -140,3 +140,9 @@ push to surface something this plan didn't anticipate.
   so there's a manual review-and-publish step after the workflow completes, worth
   keeping even once this workflow is trusted, a bad release is much cheaper to catch
   before it's public than after.
+- Release notes are pulled from `CHANGELOG.md`, matching the main Antivirus repo's own
+  `release.yml` pattern exactly: an `awk` extraction of the `## [VERSION]` section up
+  to the next `## [` heading, failing loudly if no matching section exists rather than
+  shipping an empty or stale body. This means the `## [Unreleased]` heading in
+  `CHANGELOG.md` must be renamed to `## [VERSION] - DATE` before tagging a real
+  release, the tag push itself doesn't do this automatically.
