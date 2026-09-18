@@ -32,7 +32,20 @@ jobs:
       - name: Verify the pushed tag matches [workspace.package].version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(grep -A1 '\[workspace.package\]' Cargo.toml | grep version | sed -E 's/version = "(.*)"/\1/')
+          # awk, not a naive `grep -A1`: the previous version silently
+          # grabbed whatever line happened to sit one line below
+          # "[workspace.package]", which broke the moment a comment was
+          # added there (the comment's own text contained the word
+          # "version", so `grep version` matched the comment instead of
+          # the real `version = "..."` line below it). This scans the
+          # section explicitly for a line that actually starts with
+          # `version =`, ignoring comment lines, and stops at the next
+          # `[section]` header if reached first.
+          CARGO_VERSION=$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            in_section && /^\[/ { exit }
+            in_section && /^version[[:space:]]*=/ { print; exit }
+          ' Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"(.*)"/\1/')
           echo "Tag version: $TAG_VERSION"
           echo "Cargo workspace version: $CARGO_VERSION"
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
