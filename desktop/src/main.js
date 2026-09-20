@@ -14,6 +14,10 @@ const verdictDetails = document.getElementById("verdict-details");
 const historyList = document.getElementById("history-list");
 const syncBtn = document.getElementById("sync-btn");
 const syncStatus = document.getElementById("sync-status");
+const domainInput = document.getElementById("domain-input");
+const blockDomainBtn = document.getElementById("block-domain-btn");
+const domainStatus = document.getElementById("domain-status");
+const blockedDomainsList = document.getElementById("blocked-domains-list");
 
 async function refreshHistory() {
     try {
@@ -95,3 +99,76 @@ syncBtn.addEventListener("click", async () => {
 });
 
 refreshHistory();
+refreshBlockedDomains();
+
+async function refreshBlockedDomains() {
+    try {
+        const domains = await invoke("list_blocked_domains_cmd");
+        renderBlockedDomains(domains);
+    } catch (err) {
+        console.error("failed to load blocked domains:", err);
+    }
+}
+
+function renderBlockedDomains(domains) {
+    blockedDomainsList.innerHTML = "";
+    for (const domain of domains) {
+        const li = document.createElement("li");
+        li.className = "domain-item";
+
+        const label = document.createElement("span");
+        label.textContent = domain;
+        li.appendChild(label);
+
+        const unblockBtn = document.createElement("button");
+        unblockBtn.textContent = "Unblock";
+        unblockBtn.className = "unblock-btn";
+        unblockBtn.addEventListener("click", () => unblockDomain(domain));
+        li.appendChild(unblockBtn);
+
+        blockedDomainsList.appendChild(li);
+    }
+}
+
+async function unblockDomain(domain) {
+    domainStatus.textContent = `Unblocking ${domain}\u2026`;
+    try {
+        await invoke("unblock_domain_cmd", { domain });
+        domainStatus.textContent = `Unblocked ${domain}`;
+        await refreshBlockedDomains();
+    } catch (err) {
+        // block_domain_cmd/unblock_domain_cmd roll back their DB change on
+        // helper failure (see desktop/src-tauri/src/commands.rs), so a
+        // failure here means the domain's active state is unchanged, not
+        // left inconsistent, refreshing still shows the accurate list.
+        domainStatus.textContent = `Failed to unblock ${domain}: ${err}`;
+        await refreshBlockedDomains();
+    }
+}
+
+blockDomainBtn.addEventListener("click", async () => {
+    const domain = domainInput.value.trim();
+    if (!domain) {
+        return;
+    }
+
+    blockDomainBtn.disabled = true;
+    domainStatus.textContent = `Blocking ${domain}\u2026`;
+
+    try {
+        await invoke("block_domain_cmd", { domain, reason: null });
+        domainStatus.textContent = `Blocked ${domain}`;
+        domainInput.value = "";
+        await refreshBlockedDomains();
+    } catch (err) {
+        domainStatus.textContent = `Failed to block ${domain}: ${err}`;
+    } finally {
+        blockDomainBtn.disabled = false;
+    }
+});
+
+domainInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+        blockDomainBtn.click();
+    }
+});

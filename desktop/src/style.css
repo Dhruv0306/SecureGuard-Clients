@@ -126,3 +126,56 @@ button:disabled {
 .history-item.verdict-malicious {
     border-left-color: #c0392b;
 }
+
+.hint {
+    color: #9aa0aa;
+    font-size: 12px;
+    margin: 4px 0 12px;
+}
+
+.domain-input-row {
+    display: flex;
+    gap: 8px;
+}
+
+#domain-input {
+    flex: 1;
+    background: #22262e;
+    border: 1px solid #3a3f4a;
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: #e6e6e6;
+    font-size: 14px;
+}
+
+#domain-status {
+    display: block;
+    margin-top: 8px;
+    font-size: 13px;
+    color: #9aa0aa;
+}
+
+#blocked-domains-list {
+    list-style: none;
+    padding: 0;
+    margin: 12px 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.domain-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: #22262e;
+    font-size: 13px;
+}
+
+.unblock-btn {
+    background: #6b1f1f;
+    padding: 4px 10px;
+    font-size: 12px;
+}

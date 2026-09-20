@@ -26,6 +26,25 @@
             <h2>Recent scans</h2>
             <ul id="history-list"></ul>
         </section>
+
+        <section id="domain-block-section">
+            <h2>Blocked domains</h2>
+            <p class="hint">
+                Requires the privileged helper to be running (elevated), it's the only
+                process that writes the hosts file.
+            </p>
+            <div class="domain-input-row">
+                <input
+                    id="domain-input"
+                    type="text"
+                    placeholder="malware.example.com"
+                    autocomplete="off"
+                />
+                <button id="block-domain-btn">Block</button>
+            </div>
+            <span id="domain-status"></span>
+            <ul id="blocked-domains-list"></ul>
+        </section>
     </main>
 
     <script src="main.js"></script>
