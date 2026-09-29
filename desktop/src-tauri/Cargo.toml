@@ -16,6 +16,10 @@ serde_json = "1"
 secureguard-core = { path = "../../core" }
 interprocess = "2"
 
+[features]
+# Throwaway Phase 5.3 spike probes (see src/spike_probes.rs). Off by default.
+spike-probes = []
+
 [[bin]]
 name = "secureguard-desktop"
 path = "src/main.rs"

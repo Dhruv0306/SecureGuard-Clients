@@ -28,3 +28,10 @@ ureq = "3.4"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Phase 5.3 spike (throwaway): candidate network-observation crates, used only
+# by examples/net_probe.rs. Promoted to [dependencies] (or dropped) once the
+# spike decides.
+listeners = "0.6"
+netstat2 = "0.11"
+if-addrs = "0.15"
