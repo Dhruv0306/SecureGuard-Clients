@@ -7,9 +7,10 @@ packer detection, and weighted scoring, tied together into a `CLEAN`/`SUSPICIOUS
 
 ## Requirements
 
-Rust 1.74+ (matches YARA-X's own MSRV). If you're on a Rust toolchain installed any
-time in the last couple of years via `rustup`, you're fine, this only matters if
-you're relying on a distro-packaged compiler that may be older.
+Rust 1.93+. The floor is set by the YARA-X and wasmtime versions in `Cargo.lock`
+(both declare `rust-version = "1.93.0"`), so it will rise whenever those do. CI checks
+it on exactly 1.93 with `--locked`. Install or update with `rustup update stable`; a
+distro-packaged compiler is very unlikely to be new enough.
 
 ## Build and test
 

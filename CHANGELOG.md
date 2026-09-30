@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- Declared `rust-version` raised from 1.74 to 1.93 in `secureguard-core`,
+  `secureguard-helper` and `secureguard-desktop`. The old value was never true for the
+  committed `Cargo.lock`: `yara-x` and `wasmtime` require 1.93 and several other
+  dependencies need edition 2024 manifests. A new `msrv` CI job runs
+  `cargo check --workspace --locked` on Rust 1.93, so a dependency bump that raises the
+  floor again fails CI instead of silently breaking older toolchains.
+
 ## [0.1.0] - 17/09/2026
 
 Standalone, no-backend Rust detection engine plus desktop client and privileged helper.
