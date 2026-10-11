@@ -3,6 +3,12 @@
 //! plain function taking &AppState, so tests exercise the real logic
 //! directly without touching Tauri's IPC/mock-runtime test infrastructure
 //! at all, see the tests module below.
+//!
+//! Every command is an `async fn` that runs its plain function on Tauri's
+//! blocking thread pool (see `run_blocking`). A plain `fn` command runs on
+//! the main thread and blocks every other command until it returns; the
+//! Phase 5.3 spike measured an 8.5 s stall for a 10 s plain command against
+//! 3 ms for the async shape (docs/phase5-3-spike-results.md).
 
 use secureguard_core::rusqlite::Connection;
 use secureguard_core::hash_match::SignatureSet;
@@ -13,7 +19,7 @@ use secureguard_core::yara_scan::RuleSet;
 use secureguard_core::DEFAULT_RULES;
 use std::path::PathBuf;
 use std::sync::{ Arc, Mutex };
-use tauri::State;
+use tauri::{ AppHandle, Manager };
 
 /// Shared app state, initialized once at startup, not per command call. The
 /// CLI reopens its DB and recompiles the rule set on every invocation,
@@ -136,21 +142,38 @@ pub fn do_list_blocked_domains(state: &AppState) -> Result<Vec<String>, String> 
     storage::list_blocked_domains(&conn).map_err(|e| format!("failed to list blocked domains: {e}"))
 }
 
-// --- Thin Tauri command wrappers, the only place tauri::State is touched ---
+// --- Thin Tauri command wrappers, the only place Tauri types are touched ---
 
-#[tauri::command]
-pub fn scan_file_cmd(state: State<AppState>, path: String) -> Result<ScanResult, String> {
-    do_scan(&state, &path)
+/// Runs `work` against the managed `AppState` on Tauri's blocking thread
+/// pool, so a slow database call, a network fetch or a file scan never runs
+/// on, or queues behind, the main thread. The `AppHandle` is moved into the
+/// closure because blocking work needs an owned, `'static` handle, not the
+/// borrowed `State` a plain command would take.
+async fn run_blocking<T, F>(app: AppHandle, label: &'static str, work: F) -> Result<T, String>
+    where F: FnOnce(&AppState) -> Result<T, String> + Send + 'static, T: Send + 'static
+{
+    tauri::async_runtime
+        ::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            work(&state)
+        })
+        .await
+        .map_err(|e| format!("{label} task failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn recent_scans_cmd(state: State<AppState>, limit: i64) -> Result<Vec<ScanResult>, String> {
-    do_recent_scans(&state, limit)
+pub async fn scan_file_cmd(app: AppHandle, path: String) -> Result<ScanResult, String> {
+    run_blocking(app, "scan", move |state| do_scan(state, &path)).await
 }
 
 #[tauri::command]
-pub fn sync_signatures_cmd(state: State<AppState>) -> Result<SyncResult, String> {
-    do_sync(&state)
+pub async fn recent_scans_cmd(app: AppHandle, limit: i64) -> Result<Vec<ScanResult>, String> {
+    run_blocking(app, "history", move |state| do_recent_scans(state, limit)).await
+}
+
+#[tauri::command]
+pub async fn sync_signatures_cmd(app: AppHandle) -> Result<SyncResult, String> {
+    run_blocking(app, "sync", do_sync).await
 }
 
 /// Unlike the other commands, this one's DB step (do_block_domain) and its
@@ -160,50 +183,54 @@ pub fn sync_signatures_cmd(state: State<AppState>) -> Result<SyncResult, String>
 /// hosts file. On a helper failure, the DB insert is rolled back so local
 /// state doesn't claim a domain is blocked when it demonstrably isn't.
 #[tauri::command]
-pub fn block_domain_cmd(
-    state: State<AppState>,
+pub async fn block_domain_cmd(
+    app: AppHandle,
     domain: String,
     reason: Option<String>
 ) -> Result<(), String> {
-    let active = do_block_domain(&state, &domain, reason.as_deref())?;
+    run_blocking(app, "block domain", move |state| {
+        let active = do_block_domain(state, &domain, reason.as_deref())?;
 
-    match crate::helper_client::send_domain_list(&active) {
-        Ok(response) if response.success => Ok(()),
-        Ok(response) => {
-            let _ = do_unblock_domain(&state, &domain); // roll back, it isn't actually blocked
-            Err(response.error.unwrap_or_else(|| "helper reported failure".to_string()))
+        match crate::helper_client::send_domain_list(&active) {
+            Ok(response) if response.success => Ok(()),
+            Ok(response) => {
+                let _ = do_unblock_domain(state, &domain); // roll back, it isn't actually blocked
+                Err(response.error.unwrap_or_else(|| "helper reported failure".to_string()))
+            }
+            Err(e) => {
+                let _ = do_unblock_domain(state, &domain);
+                Err(e)
+            }
         }
-        Err(e) => {
-            let _ = do_unblock_domain(&state, &domain);
-            Err(e)
-        }
-    }
+    }).await
 }
 
 #[tauri::command]
-pub fn unblock_domain_cmd(state: State<AppState>, domain: String) -> Result<(), String> {
-    // Need the domain's prior reason to roll back accurately; simplest
-    // correct approach is re-adding without a reason on rollback, losing
-    // the original reason string in that specific failure case is an
-    // acceptable tradeoff, the domain still ends up correctly re-blocked.
-    let active = do_unblock_domain(&state, &domain)?;
+pub async fn unblock_domain_cmd(app: AppHandle, domain: String) -> Result<(), String> {
+    run_blocking(app, "unblock domain", move |state| {
+        // Need the domain's prior reason to roll back accurately; simplest
+        // correct approach is re-adding without a reason on rollback, losing
+        // the original reason string in that specific failure case is an
+        // acceptable tradeoff, the domain still ends up correctly re-blocked.
+        let active = do_unblock_domain(state, &domain)?;
 
-    match crate::helper_client::send_domain_list(&active) {
-        Ok(response) if response.success => Ok(()),
-        Ok(response) => {
-            let _ = do_block_domain(&state, &domain, None);
-            Err(response.error.unwrap_or_else(|| "helper reported failure".to_string()))
+        match crate::helper_client::send_domain_list(&active) {
+            Ok(response) if response.success => Ok(()),
+            Ok(response) => {
+                let _ = do_block_domain(state, &domain, None);
+                Err(response.error.unwrap_or_else(|| "helper reported failure".to_string()))
+            }
+            Err(e) => {
+                let _ = do_block_domain(state, &domain, None);
+                Err(e)
+            }
         }
-        Err(e) => {
-            let _ = do_block_domain(&state, &domain, None);
-            Err(e)
-        }
-    }
+    }).await
 }
 
 #[tauri::command]
-pub fn list_blocked_domains_cmd(state: State<AppState>) -> Result<Vec<String>, String> {
-    do_list_blocked_domains(&state)
+pub async fn list_blocked_domains_cmd(app: AppHandle) -> Result<Vec<String>, String> {
+    run_blocking(app, "list blocked domains", do_list_blocked_domains).await
 }
 
 #[cfg(test)]
