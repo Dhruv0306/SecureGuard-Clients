@@ -3,8 +3,9 @@ name: Phase 5.3 network spike (throwaway)
 # Runs only on the spike branch. Answers two questions with evidence:
 #   1. Do the candidate network crates build and observe a live socket on
 #      Linux, Windows and macOS?  (job: net-probe)
-#   2. What Rust version does secureguard-core really need with the committed
-#      Cargo.lock?  (job: msrv-probe, failures are expected and informative)
+#   2. Does secureguard-core build with the committed Cargo.lock on Rust 1.93,
+#      the floor set by YARA-X and wasmtime, and on current stable?
+#      (job: msrv-probe; 1.93 must pass, a failure there is a real finding)
 # Delete this file when the spike is decided.
 
 on:
@@ -26,11 +27,10 @@ jobs:
 
   msrv-probe:
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        toolchain: ["1.74", "1.85", "1.93", "stable"]
+        toolchain: ["1.93", "stable"]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master

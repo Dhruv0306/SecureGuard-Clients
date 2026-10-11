@@ -27,9 +27,11 @@ Must end with `RESULT: PASS`. Run it once normally and once elevated
 sockets with a resolved process name, and TCP sockets with an owning pid. Push the branch to run
 the three-OS matrix and the MSRV matrix in `.github/workflows/net-spike.yml`.
 
-Known before this spike: the committed `Cargo.lock` already needs Rust 1.93
-(`yara-x-parser 1.20.0`), so the 1.74 and 1.85 MSRV jobs are expected to fail.
-The open question is whether the new crates build on 1.93 on every OS.
+Already settled: the committed `Cargo.lock` needs Rust 1.93 (`yara-x` and
+`wasmtime` declare it), and CI runs on 1.74 and 1.85 confirmed they cannot build
+it, so those two toolchains were removed from the matrix. The `msrv-probe` job
+now runs 1.93 and stable only, and 1.93 must pass. The open question is whether
+the new crates build on 1.93 on every OS.
 
 ## Test 3: does `core:default` allow event listening?
 
