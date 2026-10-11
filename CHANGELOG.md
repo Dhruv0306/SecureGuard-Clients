@@ -15,6 +15,12 @@ project uses [Semantic Versioning](https://semver.org/).
   `cargo check --workspace --locked` on Rust 1.93, so a dependency bump that raises the
   floor again fails CI instead of silently breaking older toolchains.
 
+### Fixed
+- Desktop: `do_scan` held the signature-set lock while waiting for the database lock,
+  and `do_sync` took the two locks in the opposite order, so a scan racing a sync could
+  deadlock. The signature set is now an `Arc` snapshot: scans clone it under a momentary
+  lock and no code path holds both locks at once.
+
 ## [0.1.0] - 17/09/2026
 
 Standalone, no-backend Rust detection engine plus desktop client and privileged helper.
