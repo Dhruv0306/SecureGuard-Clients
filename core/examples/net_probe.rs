@@ -33,7 +33,12 @@ fn main() -> ExitCode {
     // 1. listening sockets + owning process (listeners crate)
     match listeners::get_all() {
         Ok(all) => {
-            println!("listeners: {} listening sockets visible", all.len());
+            let named = all.iter().filter(|l| !l.process.name.is_empty()).count();
+            println!(
+                "listeners: {} listening sockets visible, {} with a resolved process name",
+                all.len(),
+                named
+            );
             let mine = all
                 .iter()
                 .find(|l| l.socket.port() == port && l.process.pid == my_pid);
@@ -61,7 +66,15 @@ fn main() -> ExitCode {
                 }
                 _ => false,
             });
-            println!("netstat2: {} TCP sockets visible", sockets.len());
+            let with_pid = sockets
+                .iter()
+                .filter(|s| !s.associated_pids.is_empty())
+                .count();
+            println!(
+                "netstat2: {} TCP sockets visible, {} with an owning pid",
+                sockets.len(),
+                with_pid
+            );
             if established_to_port {
                 println!("netstat2: OK found established connection involving port {port}");
             } else {

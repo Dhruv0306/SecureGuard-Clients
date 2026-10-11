@@ -23,7 +23,8 @@ An HTML or JSON body means the plain-text parser would misread it. Check the
     cargo run --locked -p secureguard-core --example net_probe
 
 Must end with `RESULT: PASS`. Run it once normally and once elevated
-(Administrator or sudo), and compare the process names. Push the branch to run
+(Administrator or sudo), and compare the two counters it prints: listening
+sockets with a resolved process name, and TCP sockets with an owning pid. Push the branch to run
 the three-OS matrix and the MSRV matrix in `.github/workflows/net-spike.yml`.
 
 Known before this spike: the committed `Cargo.lock` already needs Rust 1.93
@@ -48,44 +49,26 @@ restore the file.
 
 ## Test 4: does `command(async)` keep the UI responsive?
 
+Start the app with the probes, open devtools (right-click in the window, then
+Inspect, Console tab), and paste the whole of `scripts/spike/tauri-console-checks.js`:
+
     cd desktop/src-tauri
     cargo tauri dev --features spike-probes
 
-Install the heartbeat once in the devtools console:
+The script runs Test 3 (event listen and emit) and Test 4 in about a minute and
+prints a PASS/FAIL table plus JSON. The control step freezes the window for
+about 10 seconds on purpose. While it runs, try dragging the window: the
+control should be unresponsive and the async probes should not be.
 
-    window.__hb = { last: performance.now(), stalls: [] };
-    setInterval(() => {
-      const now = performance.now(), gap = now - window.__hb.last;
-      if (gap > 250) { window.__hb.stalls.push(Math.round(gap)); console.warn('UI stall', Math.round(gap), 'ms'); }
-      window.__hb.last = now;
-    }, 100);
-    const { invoke } = window.__TAURI__.core;
-    await window.__TAURI__.event.listen('probe-tick', e => console.log('tick', e.payload));
+It measures two things that do not depend on how the web view is scheduled:
+how late a trivial second command (`recent_scans_cmd`) is answered while a
+probe runs, and when the `probe-tick` events reach the page. A page timer gap
+is printed for information only. On Windows the web view renders out of
+process, so a JavaScript timer can keep ticking while the app's main thread is
+blocked. That is why timer gaps alone are not used to decide.
 
-Each probe runs about 10 seconds and returns the number of 100 ms steps it
-completed (100 means it ran to the end).
-
-| Probe | Run | Expected |
-|---|---|---|
-| Control | `await invoke('probe_blocking')` | one stall of several seconds, window may show Not responding |
-| Async | `await invoke('probe_async')` | no stall warnings, window drags smoothly |
-| Recommended | `await invoke('probe_spawn_blocking')` | no stall warnings |
-
-Interleaving: start a probe without `await`, then time a normal command.
-
-    invoke('probe_async');
-    console.time('other'); await invoke('recent_scans_cmd', { limit: 1 }); console.timeEnd('other');
-
-It should return in milliseconds. With `probe_blocking` it waits behind the probe.
-
-Cancel:
-
-    const p = invoke('probe_spawn_blocking');
-    setTimeout(() => invoke('probe_cancel'), 2000);
-    console.log('steps completed', await p);   // expect roughly 20, not 100
-
-Parallel load: start `probe_spawn_blocking` three times without `await` and
-confirm the heartbeat still reports no stalls.
-
-Note that `probe_async` sleeps on an async runtime worker. That is fine for one
-probe but is why the real scan should use the `probe_spawn_blocking` shape.
+Expected: the control (`probe_blocking`) shows a stall, and `probe_async` and
+`probe_spawn_blocking` do not. Both async shapes must cancel within about a
+second of `probe_cancel`. `probe_async` sleeps on an async runtime worker,
+which is fine for one probe but is why the real scan should use the
+`probe_spawn_blocking` shape.
