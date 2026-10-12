@@ -24,7 +24,7 @@ use regex::Regex;
 use rusqlite::{ params, Connection };
 use std::collections::HashSet;
 use std::sync::OnceLock;
-use std::time::{ SystemTime, UNIX_EPOCH };
+use std::time::{ Duration, SystemTime, UNIX_EPOCH };
 
 /// Ported verbatim from ThreatIntelSignatureService.EICAR_SHA256: seeded
 /// unconditionally by SignatureSet::load_from_cache, whether or not any
@@ -73,13 +73,46 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Upper bound for one whole feed request: connecting, sending, waiting and
+/// reading the body. Without a bound, a feed that accepts the connection and
+/// then goes quiet would hang the sync, and with it any caller waiting on it.
+pub const FEED_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Identifies this client to feed operators. Some reject or rate-limit
+/// anonymous library defaults, and a named agent makes our traffic easy for
+/// them to recognize.
+const FEED_USER_AGENT: &str = concat!(
+    "SecureGuard-Clients/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/Dhruv0306/SecureGuard-Clients)"
+);
+
 fn fetch_feed_text(url: &str) -> Result<String, String> {
+    fetch_feed_text_with(url, FEED_REQUEST_TIMEOUT)
+}
+
+fn fetch_feed_text_with(url: &str, timeout: Duration) -> Result<String, String> {
     use std::io::Read;
 
-    let response = ureq
-        ::get(url)
+    let config = ureq::Agent
+        ::config_builder()
+        .timeout_global(Some(timeout))
+        .user_agent(FEED_USER_AGENT)
+        .build();
+    let agent: ureq::Agent = config.into();
+
+    let response = agent
+        .get(url)
         .call()
-        .map_err(|e| format!("request to {url} failed: {e}"))?;
+        .map_err(|e| match e {
+            // abuse.ch has announced mandatory authentication for its APIs;
+            // say so plainly instead of leaving a bare status code.
+            ureq::Error::StatusCode(code @ (401 | 403)) =>
+                format!(
+                    "request to {url} was rejected (HTTP {code}); the feed may now require an Auth-Key"
+                ),
+            other => format!("request to {url} failed: {other}"),
+        })?;
 
     let mut text = String::new();
     response
@@ -175,6 +208,85 @@ mod tests {
             }
         });
         format!("http://{addr}/")
+    }
+
+    /// Accepts one connection and then says nothing, like a feed that has
+    /// stalled. Holds the socket open well past any test timeout.
+    fn spawn_silent_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                thread::sleep(Duration::from_secs(5));
+                drop(stream);
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Like spawn_single_response_server, but also hands back the raw request
+    /// headers so a test can inspect what the client sent.
+    fn spawn_capturing_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                let _ = tx.send(request);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (format!("http://{addr}/"), rx)
+    }
+
+    #[test]
+    fn a_stalled_feed_times_out_instead_of_hanging() {
+        let url = spawn_silent_server();
+        let started = std::time::Instant::now();
+
+        let result = fetch_feed_text_with(&url, Duration::from_millis(300));
+
+        assert!(result.is_err(), "a feed that never answers must be an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "timeout did not fire promptly, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn feed_requests_identify_themselves_with_a_user_agent() {
+        let (url, requests) = spawn_capturing_server();
+
+        fetch_feed_text(&url).unwrap();
+
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap().to_lowercase();
+        assert!(
+            request.contains("user-agent: secureguard-clients/"),
+            "expected a SecureGuard-Clients user agent, request was:\n{request}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_feed_error_mentions_the_auth_key() {
+        let url = spawn_single_response_server("", "HTTP/1.1 403 Forbidden");
+
+        let error = fetch_feed_text(&url).unwrap_err();
+
+        assert!(error.contains("403"), "error should carry the status code: {error}");
+        assert!(error.contains("Auth-Key"), "error should explain the likely cause: {error}");
     }
 
     #[test]

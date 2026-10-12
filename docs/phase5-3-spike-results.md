@@ -52,10 +52,18 @@ Two things that did not behave as first assumed:
 2. Progress is reported with `AppHandle::emit`; cancel is a shared `AtomicBool` in
    managed state, set by a separate async command and checked per directory entry
    and per file.
-3. All six existing desktop commands are plain `fn`, so they run on the main
-   thread. That includes `sync_signatures_cmd`, which does network I/O, and
-   `signature_sync::fetch_feed_text` sets no timeout. Convert the slow ones
-   (`sync_signatures_cmd`, `scan_file_cmd`) to the same async shape.
+3. All six existing desktop commands were plain `fn`, so they ran on the main
+   thread. That included `sync_signatures_cmd`, which does network I/O, and
+   `signature_sync::fetch_feed_text` set no timeout. **Done:** all six are now
+   `async fn` commands through one `run_blocking` helper, not only the two slow
+   ones. Converting just `sync_signatures_cmd` and `scan_file_cmd` would not have
+   been enough: `do_sync` holds the database lock for the whole network fetch, so
+   any command left on the main thread that touches the database would still
+   freeze the window behind a sync. The feed fetcher now has a 30 s timeout and a
+   named User-Agent.
+   Still open: `do_sync` holds that database lock during the fetch, so a scan
+   waits to record its history until a running sync finishes. Fix by splitting
+   fetch from persist in `signature_sync`.
 4. Bulk scan history records non-clean results only for now, with no schema
    migration. This is a deliberate shortcut; revisit with a `PRAGMA user_version`
    migrator when per-scan detail is needed.
@@ -78,7 +86,8 @@ Two things that did not behave as first assumed:
    report a 401 or 403 clearly. abuse.ch has announced mandatory authentication
    for its APIs; it is not enforced on these two URLs today.
 3. Show how old the cached list is. A stale list gives false confidence.
-4. Add a request timeout and a User-Agent to the shared feed fetcher.
+4. Add a request timeout and a User-Agent to the shared feed fetcher. (Both are
+   already in place; see the Phase 5.2 note above.)
 
 ### Toolchain
 

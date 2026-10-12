@@ -15,6 +15,19 @@ project uses [Semantic Versioning](https://semver.org/).
   `cargo check --workspace --locked` on Rust 1.93, so a dependency bump that raises the
   floor again fails CI instead of silently breaking older toolchains.
 
+### Fixed
+- Desktop: every Tauri command was a plain `fn`, so it ran on the main thread and
+  blocked all other commands until it returned (including `sync_signatures_cmd`, which
+  does network I/O). All six commands are now `async fn` and run on Tauri's blocking
+  thread pool.
+- Signature feed requests had no timeout and used the library's default User-Agent. They
+  now time out after 30 s, send a named `SecureGuard-Clients` User-Agent, and a 401 or
+  403 reports that the feed may now require an Auth-Key.
+- Desktop: `do_scan` held the signature-set lock while waiting for the database lock,
+  and `do_sync` took the two locks in the opposite order, so a scan racing a sync could
+  deadlock. The signature set is now an `Arc` snapshot: scans clone it under a momentary
+  lock and no code path holds both locks at once.
+
 ## [0.1.0] - 17/09/2026
 
 Standalone, no-backend Rust detection engine plus desktop client and privileged helper.
