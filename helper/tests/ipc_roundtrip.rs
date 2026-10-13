@@ -48,12 +48,12 @@ fn round_trips_a_successful_domain_block_request() {
     let server_socket_name = socket_name.clone();
 
     let server = thread::spawn(move || {
-        let name = server_socket_name.to_ns_name::<GenericNamespaced>().expect("valid socket name");
-        let listener = interprocess::local_socket::ListenerOptions
-            ::new()
-            .name(name)
-            .create_sync()
-            .expect("test server should bind");
+        // The same constructor the real helper uses, so on Windows these
+        // tests also prove the pipe's security descriptor is accepted and
+        // that a client in this session can still connect.
+        let listener = secureguard_helper::bind_listener(&server_socket_name).expect(
+            "test server should bind"
+        );
         let conn = listener
             .incoming()
             .next()
@@ -83,12 +83,12 @@ fn round_trips_a_malformed_request_as_a_reported_error_not_a_crash() {
     let server_socket_name = socket_name.clone();
 
     let server = thread::spawn(move || {
-        let name = server_socket_name.to_ns_name::<GenericNamespaced>().expect("valid socket name");
-        let listener = interprocess::local_socket::ListenerOptions
-            ::new()
-            .name(name)
-            .create_sync()
-            .expect("test server should bind");
+        // The same constructor the real helper uses, so on Windows these
+        // tests also prove the pipe's security descriptor is accepted and
+        // that a client in this session can still connect.
+        let listener = secureguard_helper::bind_listener(&server_socket_name).expect(
+            "test server should bind"
+        );
         let conn = listener
             .incoming()
             .next()

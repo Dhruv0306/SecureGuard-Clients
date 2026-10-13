@@ -11,6 +11,7 @@
 //! 3 ms for the async shape (docs/phase5-3-spike-results.md).
 
 use secureguard_core::rusqlite::Connection;
+use secureguard_core::blocked_domain::{ BlockedDomain, MAX_BLOCKED_DOMAINS };
 use secureguard_core::hash_match::SignatureSet;
 use secureguard_core::signature_sync::{ self, SyncResult };
 use secureguard_core::storage;
@@ -116,16 +117,53 @@ pub fn do_sync(state: &AppState) -> Result<SyncResult, String> {
 /// DB-only, no IPC to the helper, so it's directly testable. Returns the
 /// new full active list so the caller (the Tauri command) knows exactly
 /// what to send the helper next, rather than re-querying.
+/// Checks and normalizes what the user typed (trims, lowercases, drops one
+/// trailing dot). Only names that pass can be blocked, so the list that
+/// reaches the helper holds nothing that could add or change another hosts
+/// entry. The helper checks again on its side; this just gives the user the
+/// reason straight away.
+pub fn normalize_domain(input: &str) -> Result<String, String> {
+    BlockedDomain::parse(input.trim())
+        .map(|d| d.as_str().to_string())
+        .map_err(|e| format!("not a valid domain name: {e}"))
+}
+
+/// Refuses a new entry once the list is at its limit. Re-blocking a name that
+/// is already on the list is always fine.
+fn check_capacity(current_len: usize, already_present: bool) -> Result<(), String> {
+    if current_len >= MAX_BLOCKED_DOMAINS && !already_present {
+        return Err(format!("the blocklist is full ({MAX_BLOCKED_DOMAINS} domains)"));
+    }
+    Ok(())
+}
+
 pub fn do_block_domain(
     state: &AppState,
     domain: &str,
     reason: Option<&str>
 ) -> Result<Vec<String>, String> {
+    let domain = normalize_domain(domain)?;
     let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
+
+    let current = storage
+        ::list_blocked_domains(&conn)
+        .map_err(|e| format!("failed to list blocked domains: {e}"))?;
+    check_capacity(current.len(), current.iter().any(|d| d == &domain))?;
+
     storage
-        ::add_blocked_domain(&conn, domain, reason)
+        ::add_blocked_domain(&conn, &domain, reason)
         .map_err(|e| format!("failed to record blocked domain: {e}"))?;
     storage::list_blocked_domains(&conn).map_err(|e| format!("failed to list blocked domains: {e}"))
+}
+
+/// Puts a name back exactly as it was, without validating it. Used only to
+/// undo an unblock when the helper fails: the entry was on the list before,
+/// and an older entry that would not pass today's checks must not be lost
+/// just because the helper happened to be unreachable.
+fn restore_blocked_domain(state: &AppState, domain: &str) {
+    if let Ok(conn) = state.conn.lock() {
+        let _ = storage::add_blocked_domain(&conn, domain, None);
+    }
 }
 
 /// DB-only, same reasoning as do_block_domain.
@@ -189,6 +227,9 @@ pub async fn block_domain_cmd(
     reason: Option<String>
 ) -> Result<(), String> {
     run_blocking(app, "block domain", move |state| {
+        // Normalize once up front: the rollback below must remove the same
+        // string that was stored, not the raw text the user typed.
+        let domain = normalize_domain(&domain)?;
         let active = do_block_domain(state, &domain, reason.as_deref())?;
 
         match crate::helper_client::send_domain_list(&active) {
@@ -217,11 +258,11 @@ pub async fn unblock_domain_cmd(app: AppHandle, domain: String) -> Result<(), St
         match crate::helper_client::send_domain_list(&active) {
             Ok(response) if response.success => Ok(()),
             Ok(response) => {
-                let _ = do_block_domain(state, &domain, None);
+                restore_blocked_domain(state, &domain);
                 Err(response.error.unwrap_or_else(|| "helper reported failure".to_string()))
             }
             Err(e) => {
-                let _ = do_block_domain(state, &domain, None);
+                restore_blocked_domain(state, &domain);
                 Err(e)
             }
         }
@@ -338,6 +379,53 @@ mod tests {
         let (state, _dir) = test_state();
         let active = do_block_domain(&state, "malware.example.com", Some("test")).unwrap();
         assert_eq!(active, vec!["malware.example.com"]);
+    }
+
+    #[test]
+    fn do_block_domain_normalizes_what_the_user_typed() {
+        let (state, _dir) = test_state();
+        let active = do_block_domain(&state, "  Malware.Example.COM. ", None).unwrap();
+        assert_eq!(active, vec!["malware.example.com"]);
+    }
+
+    #[test]
+    fn do_block_domain_rejects_injection_and_stores_nothing() {
+        let (state, _dir) = test_state();
+        for bad in [
+            "ok.example.com\n93.184.216.34 bank.example",
+            "evil.example.com # x",
+            "localhost",
+            "127.0.0.1",
+            "",
+            "exa mple.com",
+        ] {
+            let error = do_block_domain(&state, bad, None).unwrap_err();
+            assert!(error.starts_with("not a valid domain name"), "{bad:?}: {error}");
+        }
+        assert!(do_list_blocked_domains(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_full_blocklist_refuses_new_names_but_not_ones_already_on_it() {
+        assert!(check_capacity(MAX_BLOCKED_DOMAINS - 1, false).is_ok());
+        assert!(check_capacity(MAX_BLOCKED_DOMAINS, false).is_err());
+        assert!(check_capacity(MAX_BLOCKED_DOMAINS, true).is_ok());
+    }
+
+    #[test]
+    fn an_older_entry_that_fails_todays_checks_can_still_be_removed_and_restored() {
+        let (state, _dir) = test_state();
+        {
+            let conn = state.conn.lock().unwrap();
+            storage::add_blocked_domain(&conn, "Legacy Entry", None).unwrap();
+        }
+        assert_eq!(do_list_blocked_domains(&state).unwrap(), vec!["Legacy Entry"]);
+
+        let after = do_unblock_domain(&state, "Legacy Entry").unwrap();
+        assert!(after.is_empty());
+
+        restore_blocked_domain(&state, "Legacy Entry");
+        assert_eq!(do_list_blocked_domains(&state).unwrap(), vec!["Legacy Entry"]);
     }
 
     #[test]

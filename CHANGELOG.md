@@ -28,6 +28,17 @@ project uses [Semantic Versioning](https://semver.org/).
   deadlock. The signature set is now an `Arc` snapshot: scans clone it under a momentary
   lock and no code path holds both locks at once.
 
+### Security
+- Helper: the named pipe had no explicit access control, so only elevated processes could
+  connect and a normal desktop app was refused ("Access is denied"). It now allows SYSTEM,
+  administrators and the interactive user, and nobody else (Windows). See
+  `docs/helper-security-model.md`.
+- Helper: the hosts-file writer wrote whatever domain string it received, so a name
+  containing a newline could add arbitrary hosts entries. Hostnames are now checked by a
+  `BlockedDomain` type that the writer requires, in the helper (which rejects the whole
+  request if any entry is bad), and in the desktop app. A blocklist is limited to 5,000
+  entries.
+
 ## [0.1.0] - 17/09/2026
 
 Standalone, no-backend Rust detection engine plus desktop client and privileged helper.

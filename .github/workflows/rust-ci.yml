@@ -95,3 +95,29 @@ jobs:
 
       - name: Check on the minimum supported Rust version
         run: cargo check --workspace --locked
+
+  windows:
+    # The helper's named-pipe access control is cfg(windows) code that the Linux jobs
+    # never compile. This job builds it, lints it, and runs the helper's socket tests,
+    # which create the real pipe with the security descriptor.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Clippy (core and helper)
+        run: cargo clippy --locked -p secureguard-core -p secureguard-helper -- -D warnings
+
+      - name: Test (core and helper)
+        run: cargo test --locked -p secureguard-core -p secureguard-helper
