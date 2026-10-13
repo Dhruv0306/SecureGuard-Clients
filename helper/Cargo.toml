@@ -19,5 +19,11 @@ interprocess = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Builds the Windows named-pipe security descriptor from its string form. Already
+# in the dependency tree through interprocess; named here because it appears in
+# interprocess's public API (U16CStr).
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+
 [dev-dependencies]
 tempfile = "3"

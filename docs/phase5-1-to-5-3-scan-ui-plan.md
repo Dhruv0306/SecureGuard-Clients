@@ -1,5 +1,10 @@
 # Phase 5.1–5.3: Missing Desktop UI — Plan
 
+> **Superseded for 5.2 and 5.3** by [phase5-2-5-3-design-plan.md](phase5-2-5-3-design-plan.md).
+> Two statements below are wrong: the Java network scan is not "real, not simulated"
+> (its suspicious-connection result is hardcoded), and 5.2 now includes progress and
+> cancel. The 5.1 section stands.
+
 Grounded in the web app's actual implementations, not assumed from feature names.
 
 ## 5.1: Domain blocking UI

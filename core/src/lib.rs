@@ -1,3 +1,4 @@
+pub mod blocked_domain;
 pub mod dir_behavior;
 pub mod entropy;
 pub mod extension;

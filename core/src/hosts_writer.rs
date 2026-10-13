@@ -13,6 +13,7 @@
 //! app or system-agent), so there's no reason to match that exact string,
 //! only the mechanism.
 
+use crate::blocked_domain::BlockedDomain;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -61,7 +62,11 @@ impl HostsFileWriter {
     /// that backup rather than leaving a partially-written file in place,
     /// same behavior as the Java version, ported line for line, not just
     /// in spirit.
-    pub fn write(&self, active_domains: &[String]) -> io::Result<()> {
+    ///
+    /// Takes `BlockedDomain`, not `String`: a name that was not checked
+    /// cannot be written, so a newline or `#` in a domain can never add or
+    /// change another hosts entry.
+    pub fn write(&self, active_domains: &[BlockedDomain]) -> io::Result<()> {
         let existing = fs::read_to_string(&self.hosts_path)?;
 
         let system_entries: Vec<&str> = existing
@@ -71,7 +76,7 @@ impl HostsFileWriter {
 
         let blocked_entries: Vec<String> = active_domains
             .iter()
-            .map(|domain| format!("127.0.0.1 {domain} {MARKER}"))
+            .map(|domain| format!("127.0.0.1 {} {MARKER}", domain.as_str()))
             .collect();
 
         let mut new_content = system_entries.join("\n");
@@ -106,6 +111,10 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    fn domain(name: &str) -> BlockedDomain {
+        BlockedDomain::parse(name).unwrap()
+    }
+
     fn writer_for(content: &str) -> (HostsFileWriter, NamedTempFile) {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(content.as_bytes()).unwrap();
@@ -116,7 +125,7 @@ mod tests {
     #[test]
     fn writes_blocked_domains_with_marker() {
         let (writer, file) = writer_for("127.0.0.1 localhost\n");
-        writer.write(&["malware.example.com".to_string()]).unwrap();
+        writer.write(&[domain("malware.example.com")]).unwrap();
 
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("127.0.0.1 localhost"));
@@ -130,7 +139,7 @@ mod tests {
              127.0.0.1 old-blocked.example.com # SECUREGUARD_BLOCKED_DOMAIN\n"
         );
 
-        writer.write(&["new-blocked.example.com".to_string()]).unwrap();
+        writer.write(&[domain("new-blocked.example.com")]).unwrap();
 
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("127.0.0.1 localhost"));
@@ -155,7 +164,7 @@ mod tests {
     #[test]
     fn creates_a_backup_before_writing() {
         let (writer, file) = writer_for("127.0.0.1 localhost\n");
-        writer.write(&["x.example.com".to_string()]).unwrap();
+        writer.write(&[domain("x.example.com")]).unwrap();
 
         let mut backup_path = file.path().as_os_str().to_owned();
         backup_path.push(".backup");
