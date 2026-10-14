@@ -58,6 +58,33 @@ pub fn score_file(
     rules: &RuleSet,
     path: Option<&Path>
 ) -> ScanResult {
+    score_impl(file_name, content, signatures, rules, path, None)
+}
+
+/// Same as [`score_file`] for a file on disk, but with the folder's
+/// ransomware-behavior score supplied by the caller (see
+/// `dir_behavior::score_from_names`). A scanner walking a folder computes it
+/// once per folder; without this, every file triggers a fresh read of its whole
+/// folder, which is quadratic in the number of files per folder.
+pub fn score_file_in_directory(
+    file_name: &str,
+    content: &[u8],
+    signatures: &SignatureSet,
+    rules: &RuleSet,
+    path: &Path,
+    directory_score: i32
+) -> ScanResult {
+    score_impl(file_name, content, signatures, rules, Some(path), Some(directory_score))
+}
+
+fn score_impl(
+    file_name: &str,
+    content: &[u8],
+    signatures: &SignatureSet,
+    rules: &RuleSet,
+    path: Option<&Path>,
+    directory_score: Option<i32>
+) -> ScanResult {
     let sha256 = crate::hash_match::sha256_hex(content);
 
     // Fast path: an exact known-malware hash match or the EICAR test file
@@ -165,7 +192,9 @@ pub fn score_file(
 
     // 5. Ransomware directory behavior, only meaningful with a real path.
     if let Some(p) = path {
-        let dir_score = crate::dir_behavior::score_ransomware_directory_behavior(p);
+        let dir_score = directory_score.unwrap_or_else(||
+            crate::dir_behavior::score_ransomware_directory_behavior(p)
+        );
         if dir_score > 0 {
             score += dir_score;
             contributions.push(ScoreContribution {
@@ -464,5 +493,30 @@ mod tests {
         let result = score_file("suspect.bin", content, &SignatureSet::new(), &rules, None);
         assert!(result.score >= SCORE_STRONG_PATTERN);
         assert_ne!(result.verdict, Verdict::Clean);
+    }
+
+    #[test]
+    fn a_supplied_directory_score_replaces_reading_the_folder() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("README.txt"), b"pay us").unwrap();
+        for i in 0..5 {
+            fs::write(dir.path().join(format!("doc{i}.xyz123")), b"x").unwrap();
+        }
+        let path = dir.path().join("doc0.xyz123");
+        let signatures = SignatureSet::new();
+        let rules = empty_rules();
+
+        let read_it = score_file("doc0.xyz123", b"x", &signatures, &rules, Some(&path));
+        let supplied = score_file_in_directory(
+            "doc0.xyz123", b"x", &signatures, &rules, &path, SCORE_RANSOMWARE_DIR_BEHAVIOR
+        );
+        assert!(read_it.contributions.iter().any(|c| c.reason == "RANSOMWARE_DIRECTORY_BEHAVIOR"));
+        assert_eq!(read_it.score, supplied.score);
+
+        // Proof the supplied value is what is used: 0 wins even though the
+        // folder on disk would score.
+        let overridden = score_file_in_directory("doc0.xyz123", b"x", &signatures, &rules, &path, 0);
+        assert!(!overridden.contributions.iter().any(|c| c.reason == "RANSOMWARE_DIRECTORY_BEHAVIOR"));
     }
 }
