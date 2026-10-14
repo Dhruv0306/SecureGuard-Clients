@@ -7,7 +7,21 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Core: a directory and system scan engine (`secureguard_core::dir_scan`) with a cancel flag,
+  throttled progress, a findings cap, a time budget for system scans, and a report of what was
+  scanned, flagged and skipped. Symlinks and junctions are not followed; system folders are
+  skipped by name directly under a drive root; a folder chosen explicitly is never skipped.
+- CLI: `scg-scan scan-dir <path> [--recursive] [--json]` and `scg-scan scan-dir --system`.
+- Core: `storage::record_scans` records many results in one transaction.
+- CI: a macOS job runs the core tests.
+
 ### Changed
+- The ransomware directory heuristic is computed once per folder instead of re-reading the
+  folder for every file scanned (`dir_behavior::score_from_names`,
+  `scoring::score_file_in_directory`). Existing functions keep their behavior.
+- `recent_scans` breaks ties by insertion order, so newest-first is deterministic for rows
+  written in the same second.
 - Declared `rust-version` raised from 1.74 to 1.93 in `secureguard-core`,
   `secureguard-helper` and `secureguard-desktop`. The old value was never true for the
   committed `Cargo.lock`: `yara-x` and `wasmtime` require 1.93 and several other
