@@ -32,10 +32,37 @@ pub fn record_scan(conn: &Connection, result: &ScanResult) -> SqliteResult<()> {
     Ok(())
 }
 
+/// Records many results in one transaction: one commit instead of one per row,
+/// which matters when a folder scan reports hundreds of findings.
+pub fn record_scans(conn: &Connection, results: &[ScanResult]) -> SqliteResult<()> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO scan_results (file_name, sha256, verdict, score, threat_type, scanned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))"
+        )?;
+        for result in results {
+            insert.execute(
+                params![
+                    result.file_name,
+                    result.sha256,
+                    result.verdict.as_str(),
+                    result.score,
+                    result.threat_type
+                ]
+            )?;
+        }
+    }
+    tx.commit()
+}
+
 pub fn recent_scans(conn: &Connection, limit: i64) -> SqliteResult<Vec<ScanResult>> {
     let mut stmt = conn.prepare(
         "SELECT file_name, sha256, verdict, score, threat_type
-         FROM scan_results ORDER BY scanned_at DESC LIMIT ?1"
+         FROM scan_results ORDER BY scanned_at DESC, rowid DESC LIMIT ?1"
     )?;
     let rows = stmt.query_map(params![limit], |row| {
         let verdict_str: String = row.get(2)?;
@@ -130,6 +157,22 @@ mod tests {
         assert_eq!(scans.len(), 3);
         // Most recently inserted should come first.
         assert_eq!(scans[0].file_name, "f4.txt");
+    }
+
+    #[test]
+    fn record_scans_inserts_every_result_and_newest_comes_first_within_one_second() {
+        let conn = open_in_memory().unwrap();
+        let batch: Vec<ScanResult> = (0..4)
+            .map(|i| sample_result(&format!("batch{i}.txt"), Verdict::Malicious))
+            .collect();
+        record_scans(&conn, &batch).unwrap();
+        record_scans(&conn, &[]).unwrap();
+
+        let all = recent_scans(&conn, 10).unwrap();
+        assert_eq!(all.len(), 4);
+        // Same-second inserts tie on time; the last one inserted must still be first.
+        assert_eq!(all[0].file_name, "batch3.txt");
+        assert_eq!(all[3].file_name, "batch0.txt");
     }
 
     #[test]
