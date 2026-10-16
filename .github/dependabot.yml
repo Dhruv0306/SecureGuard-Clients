@@ -10,3 +10,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # The tag of dtolnay/rust-toolchain is the Rust toolchain version, not an
+      # action version. The msrv job pins @1.93 to match rust-version in the
+      # crates, so a bump (e.g. to 1.120) requests a nonexistent compiler. Raise
+      # the MSRV by hand, together with rust-version in the Cargo.toml files.
+      - dependency-name: "dtolnay/rust-toolchain"
