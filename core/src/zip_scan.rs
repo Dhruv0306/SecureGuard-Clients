@@ -55,7 +55,17 @@ pub fn scan_zip(data: &[u8]) -> ZipCheck {
             return ZipCheck::LikelyZipBomb;
         }
 
-        if entry_is_suspicious(entry.name()) {
+        // zip 9 decodes names on demand, so name() returns a Result. Today it
+        // decodes non-UTF-8 bytes as CP437 and does not fail in practice, but
+        // the signature allows it. Fall back to a lossy decode of the raw bytes
+        // instead of skipping the entry, so a decode error can never let an
+        // archive hide an executable (the extension check only needs the
+        // ASCII tail).
+        let name = match entry.name() {
+            Ok(n) => n,
+            Err(_) => String::from_utf8_lossy(entry.name_raw()),
+        };
+        if entry_is_suspicious(&name) {
             score += SCORE_ZIP_SUSPICIOUS_ENTRY;
         }
     }
@@ -124,6 +134,30 @@ mod tests {
         match scan_zip(&data) {
             ZipCheck::Scored(score) => assert_eq!(score, SCORE_ZIP_SUSPICIOUS_ENTRY * 2),
             other => panic!("expected accumulated score, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entry_with_non_utf8_name_is_still_scored() {
+        // The writer only accepts &str names, so write a valid UTF-8 name and
+        // patch two bytes to an invalid sequence in both the local and central
+        // directory headers. The extension must still be detected.
+        let valid = "\u{e9}vil.exe".as_bytes().to_vec();
+        let mut invalid = valid.clone();
+        invalid[..2].copy_from_slice(&[0xff, 0xfe]);
+        let mut buf = build_test_zip(&[("\u{e9}vil.exe", b"MZ fake pe header")]);
+        let mut patched = 0;
+        for i in 0..buf.len().saturating_sub(valid.len()) {
+            if buf[i..i + valid.len()] == valid[..] {
+                buf[i..i + valid.len()].copy_from_slice(&invalid);
+                patched += 1;
+            }
+        }
+        assert_eq!(patched, 2, "name should appear in local and central headers");
+
+        match scan_zip(&buf) {
+            ZipCheck::Scored(score) => assert_eq!(score, SCORE_ZIP_SUSPICIOUS_ENTRY),
+            other => panic!("expected Scored({SCORE_ZIP_SUSPICIOUS_ENTRY}), got {other:?}"),
         }
     }
 }
