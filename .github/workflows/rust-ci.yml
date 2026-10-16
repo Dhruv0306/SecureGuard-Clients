@@ -82,7 +82,7 @@ jobs:
             file
 
       - name: Install Rust 1.93
-        uses: dtolnay/rust-toolchain@1.120
+        uses: dtolnay/rust-toolchain@1.93
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v6
