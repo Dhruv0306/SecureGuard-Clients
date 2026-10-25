@@ -34,6 +34,7 @@ use crate::yara_scan::RuleSet;
 use serde::{ Deserialize, Serialize };
 use sha2::{ Digest, Sha256 };
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::path::{ Path, PathBuf };
@@ -46,6 +47,8 @@ use std::time::{ Duration, Instant };
 pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// How long a system scan may run. Matches the Java engine.
 pub const SYSTEM_SCAN_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
+/// How long a quick scan may run.
+pub const QUICK_SCAN_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 /// Most findings kept in a report.
 pub const MAX_FINDINGS: usize = 2_000;
 /// Progress callbacks are at most this often unless the caller asks otherwise.
@@ -108,6 +111,25 @@ impl ScanOptions {
             reuse_identical_results: true,
             workers: default_workers(),
         }
+    }
+
+    /// The places malware usually lands first (see [`quick_scan_roots`]), with a
+    /// 5-minute budget.
+    pub fn quick() -> Self {
+        Self {
+            limits: ScanLimits {
+                max_duration: Some(QUICK_SCAN_MAX_DURATION),
+                ..ScanLimits::default()
+            },
+            ..Self::directory(true)
+        }
+    }
+
+    /// Everything, with no time limit: the quick-scan places first, then every
+    /// fixed drive (see [`full_scan_roots`]). It runs until it is done or the
+    /// caller cancels.
+    pub fn full() -> Self {
+        Self::directory(true)
     }
 
     /// Every fixed drive, with the 5-minute budget.
@@ -212,6 +234,90 @@ pub fn system_roots() -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         vec![PathBuf::from("/")]
+    }
+}
+
+/// The places malware usually lands first, in the order to scan them: Downloads,
+/// Desktop, Documents, the temp folder and the startup folders. Only folders
+/// that exist are returned. A quick scan covers these; a full scan scans them
+/// first and then everything else, so a scan that is cancelled early has still
+/// checked the likeliest places.
+pub fn quick_scan_roots() -> Vec<PathBuf> {
+    quick_roots_from(cfg!(windows), &|name| std::env::var_os(name), &|path| path.is_dir())
+}
+
+/// [`quick_scan_roots`] followed by [`system_roots`], without repeats.
+pub fn full_scan_roots() -> Vec<PathBuf> {
+    combine_roots(quick_scan_roots(), system_roots())
+}
+
+fn combine_roots(first: Vec<PathBuf>, then: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = first;
+    for root in then {
+        if !roots.iter().any(|existing| same_path(existing, &root)) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// The list, with the platform and the environment injected so both platforms'
+/// lists can be tested anywhere.
+fn quick_roots_from(
+    windows: bool,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    is_dir: &dyn Fn(&Path) -> bool
+) -> Vec<PathBuf> {
+    let var = |name: &str| env(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if windows {
+        if let Some(profile) = var("USERPROFILE") {
+            candidates.push(profile.join("Downloads"));
+            candidates.push(profile.join("Desktop"));
+            candidates.push(profile.join("Documents"));
+        }
+        if let Some(temp) = var("TEMP") {
+            candidates.push(temp);
+        }
+        if let Some(local) = var("LOCALAPPDATA") {
+            candidates.push(local.join("Temp"));
+        }
+        if let Some(roaming) = var("APPDATA") {
+            candidates.push(roaming.join(r"Microsoft\Windows\Start Menu\Programs\Startup"));
+        }
+        if let Some(shared) = var("PROGRAMDATA") {
+            candidates.push(shared.join(r"Microsoft\Windows\Start Menu\Programs\StartUp"));
+        }
+    } else {
+        if let Some(home) = var("HOME") {
+            candidates.push(home.join("Downloads"));
+            candidates.push(home.join("Desktop"));
+            candidates.push(home.join("Documents"));
+        }
+        candidates.push(var("TMPDIR").unwrap_or_else(|| PathBuf::from("/tmp")));
+        if let Some(home) = var("HOME") {
+            candidates.push(home.join(".config/autostart"));
+            candidates.push(home.join("Library/LaunchAgents"));
+        }
+    }
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if is_dir(&candidate) && !roots.iter().any(|existing| same_path(existing, &candidate)) {
+            roots.push(candidate);
+        }
+    }
+    roots
+}
+
+/// Path equality for "have we scanned this already": case-insensitive on
+/// Windows, where the file system is.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        a == b
     }
 }
 
@@ -502,6 +608,10 @@ struct Run<'a> {
     is_volume_root: &'a dyn Fn(&Path) -> bool,
     system_dir_names: &'a [&'a str],
     pool: Option<Pool<'a>>,
+    /// Roots already scanned in this run. A folder that is one of them is not
+    /// entered again when it turns up under a later root (a full scan walks the
+    /// drive after the quick-scan folders, which are inside it).
+    scanned_roots: Vec<PathBuf>,
     started: Instant,
     last_progress: Option<Instant>,
     current_dir: PathBuf,
@@ -532,6 +642,7 @@ impl<'a> Run<'a> {
             is_volume_root,
             system_dir_names,
             pool,
+            scanned_roots: Vec::new(),
             started: Instant::now(),
             last_progress: None,
             current_dir: PathBuf::new(),
@@ -561,7 +672,11 @@ impl<'a> Run<'a> {
             // Absolute, but links are not resolved: the paths stay as the user
             // would write them (no `\\?\` prefix in the UI).
             let root = std::path::absolute(root).unwrap_or_else(|_| root.clone());
+            if self.scanned_roots.iter().any(|done| same_path(done, &root)) {
+                continue;
+            }
             self.walk_root(&root);
+            self.scanned_roots.push(root);
             if self.stop.is_some() {
                 break;
             }
@@ -688,6 +803,8 @@ impl<'a> Run<'a> {
                     }
                     if dir_is_volume_root && is_system_dir_name(&name, self.system_dir_names) {
                         self.report.skipped_excluded += 1;
+                    } else if self.scanned_roots.iter().any(|done| same_path(done, &entry.path())) {
+                        // Already scanned as a root of this run; not an exclusion.
                     } else {
                         subdirs.push(entry.path());
                     }
@@ -1608,6 +1725,121 @@ mod tests {
         assert!((1..=MAX_DEFAULT_WORKERS).contains(&workers), "{workers}");
         assert_eq!(ScanOptions::directory(true).workers, workers);
         assert_eq!(ScanOptions::system().workers, workers);
+    }
+
+    // --- quick and full scan targets ---
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |name| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| OsString::from(*v))
+    }
+
+    #[test]
+    fn the_windows_quick_list_has_the_expected_folders_in_priority_order() {
+        let env = env_of(&[
+            ("USERPROFILE", r"C:\Users\Pat"),
+            ("TEMP", r"D:\scratch"),
+            ("LOCALAPPDATA", r"C:\Users\Pat\AppData\Local"),
+            ("APPDATA", r"C:\Users\Pat\AppData\Roaming"),
+            ("PROGRAMDATA", r"C:\ProgramData"),
+        ]);
+        let roots = quick_roots_from(true, &env, &|_| true);
+
+        let as_text: Vec<String> = roots.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert_eq!(as_text.len(), 7, "{as_text:?}");
+        assert!(as_text[0].contains("Downloads"));
+        assert!(as_text[1].contains("Desktop"));
+        assert!(as_text[2].contains("Documents"));
+        assert!(as_text[3].ends_with("scratch"), "{as_text:?}");
+        assert!(as_text[4].ends_with("Temp"), "{as_text:?}");
+        assert!(as_text[5].contains("Startup"));
+        assert!(as_text[6].contains("StartUp"));
+    }
+
+    #[test]
+    fn the_unix_quick_list_uses_home_and_the_temp_dir() {
+        let env = env_of(&[("HOME", "/home/pat"), ("TMPDIR", "/var/tmp")]);
+        let roots = quick_roots_from(false, &env, &|_| true);
+        let as_text: Vec<String> = roots.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            as_text,
+            [
+                "/home/pat/Downloads",
+                "/home/pat/Desktop",
+                "/home/pat/Documents",
+                "/var/tmp",
+                "/home/pat/.config/autostart",
+                "/home/pat/Library/LaunchAgents",
+            ]
+        );
+
+        let no_tmpdir = env_of(&[("HOME", "/home/pat")]);
+        let roots = quick_roots_from(false, &no_tmpdir, &|_| true);
+        assert!(roots.contains(&PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn missing_folders_and_empty_variables_are_left_out_and_repeats_removed() {
+        let env = env_of(&[("HOME", "/home/pat"), ("TMPDIR", "")]);
+        let only_documents = |p: &Path| p == Path::new("/home/pat/Documents") || p == Path::new("/tmp");
+        let roots = quick_roots_from(false, &env, &only_documents);
+        assert_eq!(roots, [PathBuf::from("/home/pat/Documents"), PathBuf::from("/tmp")]);
+
+        let nothing = quick_roots_from(false, &env_of(&[]), &|_| false);
+        assert!(nothing.is_empty());
+
+        let same = env_of(&[("HOME", "/h"), ("TMPDIR", "/h/Downloads")]);
+        let roots = quick_roots_from(false, &same, &|_| true);
+        assert_eq!(roots.iter().filter(|p| p.as_path() == Path::new("/h/Downloads")).count(), 1);
+    }
+
+    #[test]
+    fn the_full_list_is_the_quick_list_then_the_drives_without_repeats() {
+        let combined = combine_roots(
+            vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            vec![PathBuf::from("/b"), PathBuf::from("/")]
+        );
+        assert_eq!(combined, [PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/")]);
+        assert!(full_scan_roots().len() >= system_roots().len().min(1));
+    }
+
+    #[test]
+    fn quick_scans_have_a_time_limit_and_full_scans_do_not() {
+        assert_eq!(ScanOptions::quick().limits.max_duration, Some(Duration::from_secs(300)));
+        assert!(ScanOptions::quick().recursive);
+        assert_eq!(ScanOptions::full().limits.max_duration, None);
+        assert!(ScanOptions::full().recursive);
+    }
+
+    #[test]
+    fn a_folder_scanned_as_an_earlier_root_is_not_scanned_again_under_a_later_one() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "priority/a.txt", b"a");
+        write(dir.path(), "priority/inner/b.txt", b"b");
+        write(dir.path(), "other/c.txt", b"c");
+        write(dir.path(), "top.txt", b"top");
+
+        let priority = dir.path().join("priority");
+        let report = scan_roots(
+            &[priority, dir.path().to_path_buf()],
+            &opts(true),
+            &SignatureSet::new(),
+            &rules(),
+            &AtomicBool::new(false),
+            &mut |_| {}
+        );
+        assert_eq!(report.scanned, 4, "each file once");
+        assert_eq!(report.skipped_excluded, 0, "an already-scanned root is not an exclusion");
+
+        // The same root given twice is scanned once.
+        let twice = scan_roots(
+            &[dir.path().to_path_buf(), dir.path().to_path_buf()],
+            &opts(true),
+            &SignatureSet::new(),
+            &rules(),
+            &AtomicBool::new(false),
+            &mut |_| {}
+        );
+        assert_eq!(twice.scanned, 4);
     }
 }
 

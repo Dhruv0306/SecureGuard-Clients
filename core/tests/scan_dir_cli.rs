@@ -135,3 +135,65 @@ fn the_number_of_workers_does_not_change_the_report() {
     assert_eq!(single["malicious"], 5);
     assert_eq!(run("4"), single);
 }
+
+#[test]
+fn quick_full_system_and_a_path_are_mutually_exclusive() {
+    assert_eq!(scg(&["scan-dir", "--quick", "--system"]).status.code(), Some(2));
+    assert_eq!(scg(&["scan-dir", "--quick", "--full"]).status.code(), Some(2));
+    assert_eq!(scg(&["scan-dir", "--full", "somewhere"]).status.code(), Some(2));
+    assert_eq!(scg(&["scan-dir", "--quick", "somewhere"]).status.code(), Some(2));
+}
+
+#[test]
+fn quick_scan_checks_the_standard_folders_under_the_home_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join("Downloads")).unwrap();
+    fs::write(home.join("Downloads").join("bad.bin"), BAD).unwrap();
+    fs::write(home.join("Downloads").join("ok.txt"), b"fine").unwrap();
+    // Folders that would otherwise be real ones on the machine running the test.
+    let nowhere = dir.path().join("nowhere");
+    let db = dir.path().join("test.db");
+    seed_signature(&db, BAD);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scg-scan"))
+        .args(["scan-dir", "--quick", "--json", "--db", &db.to_string_lossy()])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("TMPDIR", &nowhere)
+        .env("TEMP", &nowhere)
+        .env("TMP", &nowhere)
+        .env("LOCALAPPDATA", &nowhere)
+        .env("APPDATA", &nowhere)
+        .env("PROGRAMDATA", &nowhere)
+        .output()
+        .expect("failed to run scg-scan");
+
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["scanned"], 2);
+    assert_eq!(report["malicious"], 1);
+}
+
+#[test]
+fn quick_scan_with_no_standard_folders_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let nowhere = dir.path().join("nowhere");
+    let db = dir.path().join("test.db");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scg-scan"))
+        .args(["scan-dir", "--quick", "--db", &db.to_string_lossy()])
+        .env("HOME", &nowhere)
+        .env("USERPROFILE", &nowhere)
+        .env("TMPDIR", &nowhere)
+        .env("TEMP", &nowhere)
+        .env("TMP", &nowhere)
+        .env("LOCALAPPDATA", &nowhere)
+        .env("APPDATA", &nowhere)
+        .env("PROGRAMDATA", &nowhere)
+        .output()
+        .expect("failed to run scg-scan");
+
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("standard folders"));
+}

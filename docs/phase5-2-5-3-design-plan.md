@@ -27,6 +27,10 @@ decisions is in [phase5-3-spike-results.md](phase5-3-spike-results.md) and
 | D8 | One skip list for both scan modes, not Java's two |
 | D9 | Hidden dot-files stay excluded as in Java; an "include hidden" switch can come later |
 | D10 | A small `scg-scan scan-dir` developer command ships with the engine; the user feature is in the app (5.2b) |
+| D11 | Fix false positives in the Rust engine now; document the same changes for the Java engine (docs/java-engine-false-positive-fixes.md) |
+| D12 | In the app: a Quick scan (priority places) and a Full scan (no time limit); the CLI `--system` keeps its 5-minute limit |
+| D13 | Scan on a bounded pool of worker threads |
+| D14 | Reuse the result for an identical file within one scan |
 
 ## What the Java source shows
 
@@ -141,6 +145,27 @@ could not run. Non-clean results are recorded to the history database in one tra
 - Progress throttling with a fake clock.
 - A manual benchmark on a large tree, to confirm the per-folder fix.
 - CI: a Windows and macOS job for `core` (the Windows job already exists once PR 1 lands).
+
+## Phase 5.2 follow-up: detection quality and throughput (built)
+
+Measured in a release build on a developer's Windows machine: a system scan covered 11,508 files in
+301.7 s (about 38 files a second, one thread), flagged 528 files (4.6%), and never got past hidden
+folders in the user profile, so it never reached Desktop, Documents or Downloads. Nearly all
+flagged files were legitimate. The engine work that followed, all in `secureguard-core`:
+
+- **False positives (D11).** `.jar` and `.msi` are no longer entropy-checked by extension alone;
+  weak text patterns are capped below the suspicious threshold; an ELF `.so`/`.ko`/`.node` or a
+  Windows `.pyd`/`.node` with a matching header is not "extension masquerade"; zip suspicious-entry
+  points are added once and only for `.zip`, `.jar` and `.war` names, as in Java (the port added
+  them per entry for any zip-shaped file). See docs/java-engine-false-positive-fixes.md.
+- **Throughput (D13, D14).** A pool of worker threads (default half the cores, 1 to 8) with a
+  256 MB cap on file content held at once, and reuse of the result for an identical file. Re-run
+  the system scan in a release build to see the new rate.
+- **Targets (D12, core part).** `quick_scan_roots()`, `full_scan_roots()`, `ScanOptions::quick()`
+  and `full()`, and CLI `--quick` and `--full`.
+
+Still for 5.2b: the app commands and screens for Quick scan and Full scan, progress, cancel and
+results; running a full scan in the background; and wiring the worker count.
 
 ## Phase 5.3a: local network scan
 

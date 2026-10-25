@@ -8,6 +8,16 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Core: quick and full scan targets. `quick_scan_roots()` lists the places malware usually lands
+  (Downloads, Desktop, Documents, the temp folder, startup folders; only those that exist);
+  `full_scan_roots()` is those followed by every fixed drive, and a folder already scanned as an
+  earlier root is not scanned again. `ScanOptions::quick()` has a 5-minute limit,
+  `ScanOptions::full()` none. CLI: `scg-scan scan-dir --quick` and `--full`.
+- Core: scanning on a pool of worker threads (`ScanOptions::workers`, default half the cores, 1 to
+  8; CLI `--workers N`). The report is the same for any count. A 256 MB byte budget bounds the
+  file content held in memory at once.
+- Core: a file identical to one already scanned in the same run (same SHA-256, name and folder
+  score) reuses its result (`ScanReport::reused_results`, `ScanOptions::reuse_identical_results`).
 - Core: a directory and system scan engine (`secureguard_core::dir_scan`) with a cancel flag,
   throttled progress, a findings cap, a time budget for system scans, and a report of what was
   scanned, flagged and skipped. Symlinks and junctions are not followed; system folders are

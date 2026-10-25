@@ -41,14 +41,19 @@ enum Command {
         #[arg(long, default_value = "secureguard.db")]
         db: PathBuf,
     },
-    /// Scan a folder, or every fixed drive with --system, and print a report.
+    /// Scan a folder, the quick-scan places (--quick), or everything (--full or
+    /// --system), and print a report.
     ///
     /// A developer and diagnostic tool: the desktop app has the same scan
     /// built in. Exit code 0 means the scan ran, not that nothing was found;
     /// 1 means it could not run (bad path, unreadable database).
+    #[command(
+        group(
+            clap::ArgGroup::new("target").required(true).args(["path", "system", "quick", "full"])
+        )
+    )]
     ScanDir {
-        /// Folder to scan. Not used with --system.
-        #[arg(required_unless_present = "system", conflicts_with = "system")]
+        /// Folder to scan. Give exactly one of this, --quick, --full or --system.
         path: Option<PathBuf>,
 
         /// Include subfolders.
@@ -59,6 +64,16 @@ enum Command {
         /// Always includes subfolders.
         #[arg(long)]
         system: bool,
+
+        /// Scan the places malware usually lands (Downloads, Desktop, Documents,
+        /// the temp folder, startup folders), stopping after 5 minutes.
+        #[arg(long)]
+        quick: bool,
+
+        /// Scan the quick-scan places first and then every fixed drive, with no
+        /// time limit.
+        #[arg(long)]
+        full: bool,
 
         /// Print the whole report as JSON on stdout.
         #[arg(long)]
@@ -95,8 +110,8 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Scan { path, json, db } => run_scan(&path, json, &db),
-        Command::ScanDir { path, recursive, system, json, workers, db } =>
-            run_scan_dir(path.as_deref(), recursive, system, json, workers, &db),
+        Command::ScanDir { path, recursive, system, quick, full, json, workers, db } =>
+            run_scan_dir(path.as_deref(), recursive, system, quick, full, json, workers, &db),
         Command::Sync { db, feed_url } => run_sync(&db, &feed_url),
     }
 }
@@ -147,10 +162,13 @@ fn print_report(report: &ScanReport) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_scan_dir(
     path: Option<&Path>,
     recursive: bool,
     system: bool,
+    quick: bool,
+    full: bool,
     json: bool,
     workers: Option<usize>,
     db: &Path
@@ -184,11 +202,19 @@ fn run_scan_dir(
         }
     };
 
-    let (roots, mut options) = if system {
+    let (roots, mut options) = if quick {
+        (dir_scan::quick_scan_roots(), ScanOptions::quick())
+    } else if full {
+        (dir_scan::full_scan_roots(), ScanOptions::full())
+    } else if system {
         (dir_scan::system_roots(), ScanOptions::system())
     } else {
-        (vec![path.expect("clap requires a path without --system").to_path_buf()], ScanOptions::directory(recursive))
+        (vec![path.expect("clap requires a target").to_path_buf()], ScanOptions::directory(recursive))
     };
+    if roots.is_empty() {
+        eprintln!("none of the standard folders to scan were found on this machine");
+        return ExitCode::FAILURE;
+    }
     if let Some(workers) = workers {
         options.workers = workers;
     }
