@@ -64,6 +64,10 @@ enum Command {
         #[arg(long)]
         json: bool,
 
+        /// Scan threads (1 scans on the main thread). Default: half the cores, 1 to 8.
+        #[arg(long)]
+        workers: Option<usize>,
+
         /// Path to the local signature database; non-clean results are
         /// recorded to its history.
         #[arg(long, default_value = "secureguard.db")]
@@ -91,8 +95,8 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Scan { path, json, db } => run_scan(&path, json, &db),
-        Command::ScanDir { path, recursive, system, json, db } =>
-            run_scan_dir(path.as_deref(), recursive, system, json, &db),
+        Command::ScanDir { path, recursive, system, json, workers, db } =>
+            run_scan_dir(path.as_deref(), recursive, system, json, workers, &db),
         Command::Sync { db, feed_url } => run_sync(&db, &feed_url),
     }
 }
@@ -148,6 +152,7 @@ fn run_scan_dir(
     recursive: bool,
     system: bool,
     json: bool,
+    workers: Option<usize>,
     db: &Path
 ) -> ExitCode {
     if let Some(path) = path {
@@ -179,11 +184,14 @@ fn run_scan_dir(
         }
     };
 
-    let (roots, options) = if system {
+    let (roots, mut options) = if system {
         (dir_scan::system_roots(), ScanOptions::system())
     } else {
         (vec![path.expect("clap requires a path without --system").to_path_buf()], ScanOptions::directory(recursive))
     };
+    if let Some(workers) = workers {
+        options.workers = workers;
+    }
 
     // Progress is for a person watching: only on a terminal, never mixed into
     // --json output. Ctrl+C simply ends the process; the desktop app is where

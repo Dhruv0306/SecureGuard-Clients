@@ -38,6 +38,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{ Path, PathBuf };
 use std::sync::atomic::{ AtomicBool, Ordering };
+use std::sync::mpsc::{ self, Receiver, Sender, SyncSender, TrySendError };
+use std::sync::{ Condvar, Mutex };
 use std::time::{ Duration, Instant };
 
 /// Files larger than this are counted, not scanned. Matches the Java engine.
@@ -50,6 +52,16 @@ pub const MAX_FINDINGS: usize = 2_000;
 pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Most results remembered for reuse in one scan (about 50 bytes each).
 pub const MAX_REUSABLE_RESULTS: usize = 500_000;
+/// Most bytes of file content all scan threads hold in memory at once.
+pub const IN_FLIGHT_BYTES_LIMIT: u64 = 256 * 1024 * 1024;
+/// Most scan threads used by default, however many cores there are.
+pub const MAX_DEFAULT_WORKERS: usize = 8;
+
+/// Half the cores (the machine stays usable while scanning), between 1 and 8.
+pub fn default_workers() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cores / 2).clamp(1, MAX_DEFAULT_WORKERS)
+}
 
 #[derive(Debug, Clone)]
 pub struct ScanLimits {
@@ -76,6 +88,14 @@ pub struct ScanOptions {
     /// running every check again. Copies of the same library, extension or
     /// package are common; this skips the expensive part of scanning them.
     pub reuse_identical_results: bool,
+    /// Scan threads. 0 or 1 scans on the calling thread, with no extra threads.
+    /// With more, the calling thread walks folders and reports progress, and
+    /// this many workers read and score files. The report is the same either
+    /// way, apart from `reused_results`, which can be lower in parallel when
+    /// two copies of a file are scanned at the same moment, and the counts at a
+    /// findings cap, which can include a few more files than a sequential scan
+    /// (the findings kept are the same).
+    pub workers: usize,
 }
 
 impl ScanOptions {
@@ -86,6 +106,7 @@ impl ScanOptions {
             limits: ScanLimits::default(),
             min_progress_interval: PROGRESS_INTERVAL,
             reuse_identical_results: true,
+            workers: default_workers(),
         }
     }
 
@@ -99,6 +120,7 @@ impl ScanOptions {
             },
             min_progress_interval: PROGRESS_INTERVAL,
             reuse_identical_results: true,
+            workers: default_workers(),
         }
     }
 }
@@ -252,85 +274,349 @@ fn scan_roots_with(
     is_volume_root: &dyn Fn(&Path) -> bool,
     system_dir_names: &[&str]
 ) -> ScanReport {
-    let mut run = Run {
-        opts,
+    let shared = Shared {
         signatures,
         rules,
-        cancel,
-        on_progress,
-        is_volume_root,
-        system_dir_names,
-        started: Instant::now(),
-        cache: ResultCache::new(MAX_REUSABLE_RESULTS),
-        last_progress: None,
-        stop: None,
-        report: ScanReport {
-            findings: Vec::new(),
-            scanned: 0,
-            clean: 0,
-            suspicious: 0,
-            malicious: 0,
-            skipped_excluded: 0,
-            skipped_too_large: 0,
-            skipped_links_or_special: 0,
-            unreadable_files: 0,
-            unreadable_dirs: 0,
-            reused_results: 0,
-            stop_reason: StopReason::Completed,
-            elapsed_ms: 0,
-        },
+        max_file_bytes: opts.limits.max_file_bytes,
+        reuse: opts.reuse_identical_results,
+        cache: Mutex::new(ResultCache::new(MAX_REUSABLE_RESULTS)),
+    };
+    let workers = opts.workers;
+
+    if workers <= 1 {
+        let mut run = Run::new(opts, &shared, cancel, on_progress, is_volume_root, system_dir_names, None);
+        run.walk_roots(roots);
+        return run.finish();
+    }
+
+    // The walker (this thread) lists folders and queues files; workers read and
+    // score them. They share nothing mutable except through the channels and
+    // the result cache's mutex. Everything that reports (progress, counts,
+    // findings, cancel and time checks) stays on this thread.
+    // Declared outside the scope: the worker threads borrow them, so they must
+    // outlive it.
+    let (job_tx, job_rx) = mpsc::sync_channel::<Job>(workers * 2);
+    let job_rx = Mutex::new(job_rx);
+    let stop = AtomicBool::new(false);
+    let budget = ByteBudget::new(IN_FLIGHT_BYTES_LIMIT);
+
+    std::thread::scope(|scope| {
+        let (done_tx, done_rx) = mpsc::channel::<Done>();
+
+        for _ in 0..workers {
+            let done_tx = done_tx.clone();
+            let (shared, job_rx, stop, budget) = (&shared, &job_rx, &stop, &budget);
+            scope.spawn(move || worker_loop(job_rx, &done_tx, shared, stop, budget));
+        }
+        drop(done_tx);
+
+        let pool = Pool { job_tx: Some(job_tx), done_rx, in_flight: 0, stop: &stop };
+        let mut run = Run::new(
+            opts,
+            &shared,
+            cancel,
+            on_progress,
+            is_volume_root,
+            system_dir_names,
+            Some(pool)
+        );
+        run.walk_roots(roots);
+        run.finish()
+    })
+}
+
+/// What every scan thread needs. Read-only except the result cache.
+struct Shared<'a> {
+    signatures: &'a SignatureSet,
+    rules: &'a RuleSet,
+    max_file_bytes: u64,
+    reuse: bool,
+    cache: Mutex<ResultCache>,
+}
+
+// The rules and signatures are shared by reference across scan threads. If a
+// future dependency version makes either type non-Sync, this fails to compile
+// here instead of somewhere less obvious.
+const _: fn() = || {
+    fn assert_sync<T: Sync>() {}
+    assert_sync::<RuleSet>();
+    assert_sync::<SignatureSet>();
+};
+
+/// One file for a worker: everything but its bytes, which the worker reads.
+struct Job {
+    seq: u64,
+    path: PathBuf,
+    name: String,
+    dir_score: i32,
+    size: u64,
+}
+
+enum Outcome {
+    Clean { reused: bool },
+    Flagged { result: ScanResult, reused: bool },
+    /// Grew past the size limit after the walker checked it.
+    TooLarge,
+    Unreadable,
+    /// Queued but dropped because the scan was stopping.
+    Skipped,
+}
+
+struct Done {
+    seq: u64,
+    path: PathBuf,
+    outcome: Outcome,
+}
+
+/// Reads, hashes and scores one file. Runs on the calling thread when
+/// `workers` is 1, on a worker thread otherwise.
+fn scan_job(job: &Job, ctx: &Shared) -> Outcome {
+    let content = match read_bounded(&job.path, ctx.max_file_bytes) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return Outcome::TooLarge;
+        }
+        Err(_) => {
+            return Outcome::Unreadable;
+        }
     };
 
-    for root in roots {
-        // Absolute, but links are not resolved: the paths stay as the user
-        // would write them (no `\\?\` prefix in the UI).
-        let root = std::path::absolute(root).unwrap_or_else(|_| root.clone());
-        run.walk_root(&root);
-        if run.stop.is_some() {
-            break;
+    let sha256 = sha256_hex(&content);
+    let key = ctx.reuse.then(||
+        result_key(&sha256, &job.name, rootkit::in_rootkit_location(&job.path), job.dir_score)
+    );
+
+    if let Some(key) = key {
+        let cached = ctx.cache.lock().expect("result cache lock poisoned").get(key);
+        match cached {
+            Some(Cached::Clean) => {
+                return Outcome::Clean { reused: true };
+            }
+            Some(Cached::Flagged(result)) => {
+                return Outcome::Flagged { result, reused: true };
+            }
+            None => {}
         }
     }
 
-    run.report.stop_reason = run.stop.unwrap_or(StopReason::Completed);
-    run.report.elapsed_ms = run.started.elapsed().as_millis() as u64;
-    run.report
+    let result = scoring::score_file_in_directory_with_hash(
+        &job.name,
+        &content,
+        ctx.signatures,
+        ctx.rules,
+        &job.path,
+        job.dir_score,
+        &sha256
+    );
+
+    if let Some(key) = key {
+        let outcome = if result.verdict == Verdict::Clean {
+            Cached::Clean
+        } else {
+            Cached::Flagged(result.clone())
+        };
+        ctx.cache.lock().expect("result cache lock poisoned").put(key, outcome);
+    }
+
+    if result.verdict == Verdict::Clean {
+        Outcome::Clean { reused: false }
+    } else {
+        Outcome::Flagged { result, reused: false }
+    }
+}
+
+/// Caps the bytes of file content held in memory by all workers at once: each
+/// worker reads a whole file, up to 100 MB, so without this eight workers could
+/// hold 800 MB. A file larger than the limit still runs, alone.
+struct ByteBudget {
+    used: Mutex<u64>,
+    freed: Condvar,
+    limit: u64,
+}
+
+impl ByteBudget {
+    fn new(limit: u64) -> Self {
+        Self { used: Mutex::new(0), freed: Condvar::new(), limit }
+    }
+
+    fn acquire(&self, bytes: u64) {
+        let mut used = self.used.lock().expect("byte budget lock poisoned");
+        while *used > 0 && *used + bytes > self.limit {
+            used = self.freed.wait(used).expect("byte budget lock poisoned");
+        }
+        *used += bytes;
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut used = self.used.lock().expect("byte budget lock poisoned");
+        *used -= bytes;
+        self.freed.notify_all();
+    }
+}
+
+fn worker_loop(
+    jobs: &Mutex<Receiver<Job>>,
+    done: &Sender<Done>,
+    shared: &Shared,
+    stop: &AtomicBool,
+    budget: &ByteBudget
+) {
+    loop {
+        // The lock is held only while waiting for the next job.
+        let job = match jobs.lock().expect("job queue lock poisoned").recv() {
+            Ok(job) => job,
+            Err(_) => {
+                return;
+            }
+        };
+        let outcome = if stop.load(Ordering::Relaxed) {
+            Outcome::Skipped
+        } else {
+            budget.acquire(job.size);
+            let outcome = scan_job(&job, shared);
+            budget.release(job.size);
+            outcome
+        };
+        // Every job gets exactly one reply, so the walker's count of jobs in
+        // flight is exact and it can never wait for a result that will not come.
+        if done.send(Done { seq: job.seq, path: job.path, outcome }).is_err() {
+            return;
+        }
+    }
+}
+
+/// The walker's side of the worker pool.
+struct Pool<'a> {
+    /// None once the walk is over: closing it lets workers finish and exit.
+    job_tx: Option<SyncSender<Job>>,
+    done_rx: Receiver<Done>,
+    in_flight: usize,
+    stop: &'a AtomicBool,
 }
 
 struct Run<'a> {
     opts: &'a ScanOptions,
-    signatures: &'a SignatureSet,
-    rules: &'a RuleSet,
+    shared: &'a Shared<'a>,
     cancel: &'a AtomicBool,
     on_progress: &'a mut dyn FnMut(&Progress),
     is_volume_root: &'a dyn Fn(&Path) -> bool,
     system_dir_names: &'a [&'a str],
+    pool: Option<Pool<'a>>,
     started: Instant,
-    cache: ResultCache,
     last_progress: Option<Instant>,
+    current_dir: PathBuf,
+    next_seq: u64,
+    /// Findings with the order their file was queued in. Workers can finish out
+    /// of order; sorting by this at the end makes the report the same however
+    /// many workers there were.
+    found: Vec<(u64, FileFinding)>,
     stop: Option<StopReason>,
     report: ScanReport,
 }
 
-impl Run<'_> {
-    /// True once the scan must end. The first reason found is kept.
+impl<'a> Run<'a> {
+    fn new(
+        opts: &'a ScanOptions,
+        shared: &'a Shared<'a>,
+        cancel: &'a AtomicBool,
+        on_progress: &'a mut dyn FnMut(&Progress),
+        is_volume_root: &'a dyn Fn(&Path) -> bool,
+        system_dir_names: &'a [&'a str],
+        pool: Option<Pool<'a>>
+    ) -> Self {
+        Self {
+            opts,
+            shared,
+            cancel,
+            on_progress,
+            is_volume_root,
+            system_dir_names,
+            pool,
+            started: Instant::now(),
+            last_progress: None,
+            current_dir: PathBuf::new(),
+            next_seq: 0,
+            found: Vec::new(),
+            stop: None,
+            report: ScanReport {
+                findings: Vec::new(),
+                scanned: 0,
+                clean: 0,
+                suspicious: 0,
+                malicious: 0,
+                skipped_excluded: 0,
+                skipped_too_large: 0,
+                skipped_links_or_special: 0,
+                unreadable_files: 0,
+                unreadable_dirs: 0,
+                reused_results: 0,
+                stop_reason: StopReason::Completed,
+                elapsed_ms: 0,
+            },
+        }
+    }
+
+    fn walk_roots(&mut self, roots: &[PathBuf]) {
+        for root in roots {
+            // Absolute, but links are not resolved: the paths stay as the user
+            // would write them (no `\\?\` prefix in the UI).
+            let root = std::path::absolute(root).unwrap_or_else(|_| root.clone());
+            self.walk_root(&root);
+            if self.stop.is_some() {
+                break;
+            }
+        }
+    }
+
+    fn finish(mut self) -> ScanReport {
+        self.finish_pool();
+
+        self.found.sort_by_key(|(seq, _)| *seq);
+        self.found.truncate(self.opts.limits.max_findings.max(1));
+        self.report.findings = self.found.into_iter().map(|(_, finding)| finding).collect();
+        self.report.stop_reason = self.stop.unwrap_or(StopReason::Completed);
+        self.report.elapsed_ms = self.started.elapsed().as_millis() as u64;
+        self.report
+    }
+
+    /// Records the first stop reason found, and stops queuing files.
+    ///
+    /// Cancel and the time limit also tell workers to skip what is already
+    /// queued, so the scan ends promptly. The findings cap does not: the files
+    /// already queued finish, so every file before the last one queued has been
+    /// scanned and the first findings by walk order are the same as a
+    /// sequential scan would keep. The cost is at most a few more files
+    /// scanned than the cap alone would need.
+    fn raise_stop(&mut self, reason: StopReason) {
+        if self.stop.is_none() {
+            self.stop = Some(reason);
+        }
+        if reason != StopReason::FindingsCap {
+            if let Some(pool) = &self.pool {
+                pool.stop.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// True once the scan must end.
     fn should_stop(&mut self) -> bool {
         if self.stop.is_some() {
             return true;
         }
         if self.cancel.load(Ordering::Relaxed) {
-            self.stop = Some(StopReason::Cancelled);
+            self.raise_stop(StopReason::Cancelled);
             return true;
         }
         if let Some(max) = self.opts.limits.max_duration {
             if self.started.elapsed() >= max {
-                self.stop = Some(StopReason::TimeBudget);
+                self.raise_stop(StopReason::TimeBudget);
                 return true;
             }
         }
         false
     }
 
-    fn progress(&mut self, dir: &Path) {
+    fn progress(&mut self) {
         let now = Instant::now();
         let due = self.last_progress.is_none_or(|t| {
             now.duration_since(t) >= self.opts.min_progress_interval
@@ -339,9 +625,9 @@ impl Run<'_> {
             self.last_progress = Some(now);
             (self.on_progress)(
                 &(Progress {
-                    current_dir: dir.to_string_lossy().into_owned(),
+                    current_dir: self.current_dir.to_string_lossy().into_owned(),
                     scanned: self.report.scanned,
-                    findings: self.report.findings.len() as u64,
+                    findings: self.found.len() as u64,
                 })
             );
         }
@@ -354,7 +640,8 @@ impl Run<'_> {
             if self.should_stop() {
                 return;
             }
-            self.progress(&dir);
+            self.current_dir = dir.clone();
+            self.progress();
 
             let listing = match fs::read_dir(&dir) {
                 Ok(listing) => listing,
@@ -405,7 +692,7 @@ impl Run<'_> {
                         subdirs.push(entry.path());
                     }
                 } else if file_type.is_file() {
-                    self.scan_file(entry, &name, dir_score, &dir);
+                    self.submit_file(entry, &name, dir_score);
                 } else {
                     self.report.skipped_links_or_special += 1;
                 }
@@ -416,97 +703,139 @@ impl Run<'_> {
         }
     }
 
-    fn scan_file(&mut self, entry: &fs::DirEntry, name: &str, dir_score: i32, dir: &Path) {
+    /// The cheap checks, done by the walker; the expensive part is `scan_job`.
+    fn submit_file(&mut self, entry: &fs::DirEntry, name: &str, dir_score: i32) {
         if is_file_excluded(name) {
             self.report.skipped_excluded += 1;
             return;
         }
 
         let max = self.opts.limits.max_file_bytes;
-        match entry.metadata() {
+        let size = match entry.metadata() {
             Ok(meta) if meta.len() > max => {
                 self.report.skipped_too_large += 1;
                 return;
             }
-            Ok(_) => {}
-            Err(_) => {
-                self.report.unreadable_files += 1;
-                return;
-            }
-        }
-
-        let path = entry.path();
-        let content = match read_bounded(&path, max) {
-            Ok(Some(content)) => content,
-            // Grew past the limit after the size check above.
-            Ok(None) => {
-                self.report.skipped_too_large += 1;
-                return;
-            }
+            Ok(meta) => meta.len(),
             Err(_) => {
                 self.report.unreadable_files += 1;
                 return;
             }
         };
 
-        let sha256 = sha256_hex(&content);
-        let key = self.opts.reuse_identical_results.then(||
-            result_key(&sha256, name, rootkit::in_rootkit_location(&path), dir_score)
-        );
+        let job = Job {
+            seq: self.next_seq,
+            path: entry.path(),
+            name: name.to_string(),
+            dir_score,
+            size,
+        };
+        self.next_seq += 1;
+        self.dispatch(job);
+    }
 
-        if let Some(cached) = key.and_then(|k| self.cache.get(k)) {
-            self.report.reused_results += 1;
-            match cached {
-                Cached::Clean => self.record_clean(),
-                Cached::Flagged(result) => self.record(&path, result),
-            }
-            self.progress(dir);
+    fn dispatch(&mut self, mut job: Job) {
+        if self.pool.is_none() {
+            let outcome = scan_job(&job, self.shared);
+            self.apply(Done { seq: job.seq, path: job.path, outcome });
             return;
         }
 
-        let result = scoring::score_file_in_directory_with_hash(
-            name,
-            &content,
-            self.signatures,
-            self.rules,
-            &path,
-            dir_score,
-            &sha256
-        );
-        if let Some(key) = key {
-            let outcome = if result.verdict == Verdict::Clean {
-                Cached::Clean
-            } else {
-                Cached::Flagged(result.clone())
+        loop {
+            let sent = {
+                let pool = self.pool.as_mut().expect("pool checked above");
+                match pool.job_tx.as_ref() {
+                    Some(tx) => tx.try_send(job),
+                    None => {
+                        return;
+                    }
+                }
             };
-            self.cache.put(key, outcome);
+            match sent {
+                Ok(()) => {
+                    if let Some(pool) = self.pool.as_mut() {
+                        pool.in_flight += 1;
+                    }
+                    break;
+                }
+                // Queue full: collect finished results while waiting for room.
+                Err(TrySendError::Full(returned)) => {
+                    job = returned;
+                    self.drain_results(Duration::from_millis(10));
+                    if self.should_stop() {
+                        return;
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return;
+                }
+            }
         }
-        self.record(&path, result);
-        self.progress(dir);
+        self.drain_results(Duration::ZERO);
     }
 
-    fn record_clean(&mut self) {
-        self.report.scanned += 1;
-        self.report.clean += 1;
+    /// Takes finished results from the workers, waiting up to `wait` for the first.
+    fn drain_results(&mut self, wait: Duration) {
+        let mut finished = Vec::new();
+        if let Some(pool) = self.pool.as_mut() {
+            if let Ok(done) = pool.done_rx.recv_timeout(wait) {
+                finished.push(done);
+            }
+            while let Ok(done) = pool.done_rx.try_recv() {
+                finished.push(done);
+            }
+            pool.in_flight -= finished.len();
+        }
+        for done in finished {
+            self.apply(done);
+        }
     }
 
-    fn record(&mut self, path: &Path, result: ScanResult) {
+    /// After the walk: stop accepting files and wait for the queued ones.
+    fn finish_pool(&mut self) {
+        if let Some(pool) = self.pool.as_mut() {
+            pool.job_tx = None;
+        }
+        while self.pool.as_ref().is_some_and(|pool| pool.in_flight > 0) {
+            self.drain_results(Duration::from_millis(50));
+            // Cancel and the time budget still apply while waiting; this makes
+            // workers skip whatever is still queued.
+            self.should_stop();
+        }
+    }
+
+    fn apply(&mut self, done: Done) {
+        match done.outcome {
+            Outcome::Clean { reused } => {
+                self.report.reused_results += u64::from(reused);
+                self.report.scanned += 1;
+                self.report.clean += 1;
+            }
+            Outcome::Flagged { result, reused } => {
+                self.report.reused_results += u64::from(reused);
+                self.record(done.seq, &done.path, result);
+            }
+            Outcome::TooLarge => self.report.skipped_too_large += 1,
+            Outcome::Unreadable => self.report.unreadable_files += 1,
+            Outcome::Skipped => {}
+        }
+        self.progress();
+    }
+
+    fn record(&mut self, seq: u64, path: &Path, result: ScanResult) {
         self.report.scanned += 1;
         match result.verdict {
+            Verdict::Suspicious => self.report.suspicious += 1,
+            Verdict::Malicious => self.report.malicious += 1,
             Verdict::Clean => {
                 self.report.clean += 1;
                 return;
             }
-            Verdict::Suspicious => self.report.suspicious += 1,
-            Verdict::Malicious => self.report.malicious += 1,
         }
 
-        self.report.findings.push(FileFinding {
-            path: path.to_string_lossy().into_owned(),
-            result,
-        });
-        if self.report.findings.len() >= self.opts.limits.max_findings.max(1) {
-            self.stop = Some(StopReason::FindingsCap);
+        self.found.push((seq, FileFinding { path: path.to_string_lossy().into_owned(), result }));
+        if self.found.len() >= self.opts.limits.max_findings.max(1) {
+            self.raise_stop(StopReason::FindingsCap);
         }
     }
 }
@@ -585,8 +914,18 @@ mod tests {
         SignatureSet::from_hashes(vec![sha256_hex(BAD)])
     }
 
+    /// One worker: the walker scans on the calling thread, so tests that count
+    /// exactly (cancel after the second file, the cap) are deterministic.
     fn opts(recursive: bool) -> ScanOptions {
-        ScanOptions { min_progress_interval: Duration::ZERO, ..ScanOptions::directory(recursive) }
+        ScanOptions {
+            min_progress_interval: Duration::ZERO,
+            workers: 1,
+            ..ScanOptions::directory(recursive)
+        }
+    }
+
+    fn parallel(workers: usize) -> ScanOptions {
+        ScanOptions { workers, ..opts(true) }
     }
 
     fn scan(root: &Path, opts: &ScanOptions, signatures: &SignatureSet) -> ScanReport {
@@ -1091,6 +1430,184 @@ mod tests {
         assert_ne!(base, result_key("abc", "b.bin", false, 0));
         assert_ne!(base, result_key("abc", "a.bin", true, 0));
         assert_ne!(base, result_key("abc", "a.bin", false, 55));
+    }
+
+    // --- parallel scanning ---
+
+    /// A tree with clean files, duplicates, folders and known-bad files.
+    fn mixed_tree(dir: &Path) {
+        for folder in 0..6 {
+            for file in 0..12 {
+                write(dir, &format!("f{folder}/file{file}.txt"), format!("content {folder} {file}").as_bytes());
+            }
+            write(dir, &format!("f{folder}/bad{folder}.bin"), format!("{}-{folder}", "known-bad-bytes").as_bytes());
+            write(dir, &format!("f{folder}/dup.txt"), b"the same everywhere");
+            write(dir, &format!("f{folder}/sub/deep.txt"), b"deeper");
+        }
+    }
+
+    fn signatures_for_mixed_tree() -> SignatureSet {
+        SignatureSet::from_hashes((0..6).map(|i| sha256_hex(format!("known-bad-bytes-{i}").as_bytes())))
+    }
+
+    /// Everything a sequential and a parallel scan must agree on.
+    type ReportSummary = (u64, u64, u64, u64, Vec<(String, Verdict, i32)>);
+
+    fn summary(report: &ScanReport) -> ReportSummary {
+        let findings = report
+            .findings
+            .iter()
+            .map(|f| (f.path.clone(), f.result.verdict, f.result.score))
+            .collect();
+        (report.scanned, report.clean, report.suspicious, report.malicious, findings)
+    }
+
+    #[test]
+    fn a_parallel_scan_reports_exactly_what_a_sequential_one_does() {
+        let dir = tempdir().unwrap();
+        mixed_tree(dir.path());
+        let signatures = signatures_for_mixed_tree();
+
+        let sequential = scan(dir.path(), &opts(true), &signatures);
+        assert_eq!(sequential.malicious, 6);
+        for workers in [2, 4, 8] {
+            let report = scan(dir.path(), &parallel(workers), &signatures);
+            assert_eq!(summary(&report), summary(&sequential), "{workers} workers");
+            assert_eq!(report.stop_reason, StopReason::Completed);
+            assert!(
+                report.reused_results <= sequential.reused_results,
+                "parallel can only reuse less, never more"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parallel_scan_is_repeatable() {
+        let dir = tempdir().unwrap();
+        mixed_tree(dir.path());
+        let signatures = signatures_for_mixed_tree();
+
+        let first = summary(&scan(dir.path(), &parallel(4), &signatures));
+        for _ in 0..5 {
+            assert_eq!(summary(&scan(dir.path(), &parallel(4), &signatures)), first);
+        }
+    }
+
+    #[test]
+    fn a_parallel_scan_stops_when_cancelled() {
+        let dir = tempdir().unwrap();
+        mixed_tree(dir.path());
+
+        let cancel = AtomicBool::new(true);
+        let report = scan_path(dir.path(), &parallel(4), &SignatureSet::new(), &rules(), &cancel, &mut |_| {});
+        assert_eq!(report.stop_reason, StopReason::Cancelled);
+        assert_eq!(report.scanned, 0);
+
+        // Cancelled partway: the scan ends promptly and keeps what finished.
+        let cancel = AtomicBool::new(false);
+        let report = scan_path(
+            dir.path(),
+            &parallel(4),
+            &SignatureSet::new(),
+            &rules(),
+            &cancel,
+            &mut |p| {
+                if p.scanned >= 10 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        );
+        assert_eq!(report.stop_reason, StopReason::Cancelled);
+        assert!(report.scanned >= 10, "scanned {}", report.scanned);
+        assert!(report.scanned < 90, "it should not have finished: {}", report.scanned);
+    }
+
+    #[test]
+    fn a_parallel_scan_keeps_only_the_first_findings_at_the_cap() {
+        let dir = tempdir().unwrap();
+        for i in 0..30 {
+            // Every file is flagged; the names differ so the order is checkable.
+            write(dir.path(), &format!("bad{i:02}.bin"), BAD);
+        }
+        let mut options = parallel(4);
+        options.limits.max_findings = 3;
+        options.reuse_identical_results = false;
+
+        let report = scan(dir.path(), &options, &bad_signatures());
+        assert_eq!(report.stop_reason, StopReason::FindingsCap);
+        assert_eq!(report.findings.len(), 3);
+        let names: Vec<&str> = report.findings.iter().map(|f| f.result.file_name.as_str()).collect();
+        assert_eq!(names, ["bad00.bin", "bad01.bin", "bad02.bin"], "the first three, in order");
+    }
+
+    #[test]
+    fn a_parallel_scan_honors_the_time_budget_and_size_limit() {
+        let dir = tempdir().unwrap();
+        mixed_tree(dir.path());
+        let mut options = parallel(4);
+        options.limits.max_duration = Some(Duration::ZERO);
+        let report = scan(dir.path(), &options, &SignatureSet::new());
+        assert_eq!(report.stop_reason, StopReason::TimeBudget);
+        assert_eq!(report.scanned, 0);
+
+        let mut small = parallel(4);
+        small.limits.max_file_bytes = 8;
+        let report = scan(dir.path(), &small, &SignatureSet::new());
+        assert!(report.skipped_too_large > 0);
+        assert_eq!(report.scanned + report.skipped_too_large, 6 * 15);
+    }
+
+    #[test]
+    fn progress_in_a_parallel_scan_never_goes_backwards() {
+        let dir = tempdir().unwrap();
+        mixed_tree(dir.path());
+
+        let mut last = 0;
+        let mut monotonic = true;
+        scan_path(
+            dir.path(),
+            &parallel(4),
+            &SignatureSet::new(),
+            &rules(),
+            &AtomicBool::new(false),
+            &mut |p| {
+                monotonic &= p.scanned >= last;
+                last = p.scanned;
+            }
+        );
+        assert!(monotonic);
+    }
+
+    #[test]
+    fn the_byte_budget_admits_one_oversized_file_and_blocks_the_next_until_it_is_released() {
+        let budget = std::sync::Arc::new(ByteBudget::new(10));
+        budget.acquire(100); // larger than the limit, allowed because nothing else is in flight
+
+        let waiter = {
+            let budget = std::sync::Arc::clone(&budget);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                budget.acquire(5);
+                tx.send(()).unwrap();
+                budget.release(5);
+            });
+            (handle, rx)
+        };
+        assert!(
+            waiter.1.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the second acquire must wait while 100 bytes are held"
+        );
+        budget.release(100);
+        waiter.1.recv_timeout(Duration::from_secs(5)).expect("it should proceed after the release");
+        waiter.0.join().unwrap();
+    }
+
+    #[test]
+    fn the_default_worker_count_is_between_one_and_the_maximum() {
+        let workers = default_workers();
+        assert!((1..=MAX_DEFAULT_WORKERS).contains(&workers), "{workers}");
+        assert_eq!(ScanOptions::directory(true).workers, workers);
+        assert_eq!(ScanOptions::system().workers, workers);
     }
 }
 

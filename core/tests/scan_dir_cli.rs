@@ -101,3 +101,37 @@ fn a_path_or_system_is_required_but_not_both() {
     assert_eq!(scg(&["scan-dir"]).status.code(), Some(2));
     assert_eq!(scg(&["scan-dir", "somewhere", "--system"]).status.code(), Some(2));
 }
+
+#[test]
+fn the_number_of_workers_does_not_change_the_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let scan_root = dir.path().join("tree");
+    for folder in 0..5 {
+        fs::create_dir_all(scan_root.join(format!("f{folder}"))).unwrap();
+        for file in 0..10 {
+            fs::write(scan_root.join(format!("f{folder}/file{file}.txt")), format!("content {folder} {file}")).unwrap();
+        }
+        fs::write(scan_root.join(format!("f{folder}/bad{folder}.bin")), format!("bad-{folder}")).unwrap();
+    }
+    let db = dir.path().join("test.db");
+    for folder in 0..5 {
+        seed_signature(&db, format!("bad-{folder}").as_bytes());
+    }
+
+    let run = |workers: &str| {
+        let out = scg(&[
+            "scan-dir", &scan_root.to_string_lossy(), "--recursive", "--json",
+            "--workers", workers, "--db", &db.to_string_lossy(),
+        ]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        // Timing and the reuse count legitimately differ.
+        report.as_object_mut().unwrap().remove("elapsed_ms");
+        report.as_object_mut().unwrap().remove("reused_results");
+        report
+    };
+
+    let single = run("1");
+    assert_eq!(single["malicious"], 5);
+    assert_eq!(run("4"), single);
+}
