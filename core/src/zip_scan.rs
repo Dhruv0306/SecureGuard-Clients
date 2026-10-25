@@ -25,6 +25,9 @@ pub enum ZipCheck {
     NotAZip,
 }
 
+// A zip's contents alone must never be enough to flag a file.
+const _: () = assert!(SCORE_ZIP_SUSPICIOUS_ENTRY < crate::scoring::THRESHOLD_SUSPICIOUS);
+
 pub fn scan_zip(data: &[u8]) -> ZipCheck {
     let cursor = std::io::Cursor::new(data);
     let mut archive = match ZipArchive::new(cursor) {
@@ -36,7 +39,7 @@ pub fn scan_zip(data: &[u8]) -> ZipCheck {
 
     let compressed_size = data.len() as u64;
     let mut total_uncompressed: u64 = 0;
-    let mut score = 0;
+    let mut found_suspicious_entry = false;
 
     for i in 0..archive.len() {
         let entry = match archive.by_index(i) {
@@ -66,11 +69,23 @@ pub fn scan_zip(data: &[u8]) -> ZipCheck {
             Err(_) => String::from_utf8_lossy(entry.name_raw()),
         };
         if entry_is_suspicious(&name) {
-            score += SCORE_ZIP_SUSPICIOUS_ENTRY;
+            found_suspicious_entry = true;
         }
     }
 
-    ZipCheck::Scored(score)
+    // Once, however many entries match, as in SecurityServiceImpl
+    // (`if (zipEval.suspiciousEntries() > 0) score += SCORE_ZIP_SUSPICIOUS_ENTRY`).
+    // An earlier version of this port added the points per entry, so a vendor
+    // driver archive with 29 .dll entries scored 435 and was convicted.
+    ZipCheck::Scored(if found_suspicious_entry { SCORE_ZIP_SUSPICIOUS_ENTRY } else { 0 })
+}
+
+/// Which files get zip analysis. Matches SecurityServiceImpl.isZipFile: by
+/// name, not by content, so an .xlsx, .docx or .apk (all zip containers) is
+/// not run through the zip-bomb and suspicious-entry checks. `file_name_lower`
+/// is the lowercased name.
+pub fn is_zip_name(file_name_lower: &str) -> bool {
+    file_name_lower.ends_with(".zip") || file_name_lower.ends_with(".jar") || file_name_lower.ends_with(".war")
 }
 
 fn entry_is_suspicious(name: &str) -> bool {
@@ -79,12 +94,12 @@ fn entry_is_suspicious(name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
     use zip::write::FileOptions;
 
-    fn build_test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn build_test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut buf = Vec::new();
         {
             let cursor = std::io::Cursor::new(&mut buf);
@@ -123,17 +138,14 @@ mod tests {
     }
 
     #[test]
-    fn multiple_suspicious_entries_accumulate_score() {
-        let data = build_test_zip(
-            &[
-                ("a.exe", b"one"),
-                ("b.dll", b"two"),
-                ("c.txt", b"clean"),
-            ]
-        );
-        match scan_zip(&data) {
-            ZipCheck::Scored(score) => assert_eq!(score, SCORE_ZIP_SUSPICIOUS_ENTRY * 2),
-            other => panic!("expected accumulated score, got {other:?}"),
+    fn any_number_of_suspicious_entries_scores_once() {
+        for count in [1usize, 2, 3, 60] {
+            let names: Vec<String> = (0..count).map(|i| format!("driver{i}.dll")).collect();
+            let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+            match scan_zip(&build_test_zip(&entries)) {
+                ZipCheck::Scored(score) => assert_eq!(score, SCORE_ZIP_SUSPICIOUS_ENTRY, "{count} entries"),
+                other => panic!("expected Scored for {count} entries, got {other:?}"),
+            }
         }
     }
 
@@ -159,5 +171,22 @@ mod tests {
             ZipCheck::Scored(score) => assert_eq!(score, SCORE_ZIP_SUSPICIOUS_ENTRY),
             other => panic!("expected Scored({SCORE_ZIP_SUSPICIOUS_ENTRY}), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn zip_analysis_is_chosen_by_file_name_like_the_java_engine() {
+        for name in ["a.zip", "A.ZIP", "lib.jar", "app.war"] {
+            assert!(is_zip_name(&name.to_lowercase()), "{name}");
+        }
+        for name in ["report.docx", "sheet.xlsx", "app.apk", "archive.tar.gz", "zip", "a.zip.txt"] {
+            assert!(!is_zip_name(&name.to_lowercase()), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_highly_compressible_archive_is_a_likely_zip_bomb() {
+        let zeros = vec![0u8; 400_000];
+        let data = build_test_zip(&[("zeros.bin", &zeros)]);
+        assert!(matches!(scan_zip(&data), ZipCheck::LikelyZipBomb));
     }
 }

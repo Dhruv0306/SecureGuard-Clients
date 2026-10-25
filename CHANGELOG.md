@@ -30,6 +30,14 @@ project uses [Semantic Versioning](https://semver.org/).
   floor again fails CI instead of silently breaking older toolchains.
 
 ### Fixed
+- Detection: a system scan of a developer machine flagged about 4.6% of files, nearly all
+  legitimate. Four fixes (details and the Java follow-up in
+  `docs/java-engine-false-positive-fixes.md`): `.jar` and `.msi` are no longer penalized for
+  entropy because they are compressed by design; weak text patterns alone can no longer produce a
+  verdict (cap 32 to 24); an ELF `.so`/`.ko`/`.node` or a Windows `.pyd`/`.node` with a matching
+  header is no longer "extension masquerade"; and zip suspicious-entry points are added once, only
+  for `.zip`, `.jar` and `.war` names, as in the Java engine (the port added them per entry for
+  any zip-shaped file, so a driver archive scored 435 and was convicted).
 - Desktop: every Tauri command was a plain `fn`, so it ran on the main thread and
   blocked all other commands until it returned (including `sync_signatures_cmd`, which
   does network I/O). All six commands are now `async fn` and run on Tauri's blocking
