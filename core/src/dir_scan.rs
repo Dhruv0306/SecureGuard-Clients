@@ -1,0 +1,900 @@
+//! Directory and system scan engine.
+//!
+//! Walks a folder (or every fixed drive) and scores each regular file with the
+//! same engine `scan_file` uses. It is a plain library function: it takes a
+//! cancel flag and a progress callback and returns a [`ScanReport`], so the
+//! desktop app, the CLI and the tests all drive the same code.
+//!
+//! Ported from `SecurityServiceImpl.scanDirectory` / `performSystemScan`, with
+//! these deliberate differences (docs/phase5-2-5-3-design-plan.md):
+//!
+//! - The 2,000 cap applies to findings kept, not files scanned (Java counts
+//!   clean files too, so its system scan effectively stops after 2,000 files).
+//! - System folders are skipped by whole name, and only directly under a
+//!   filesystem root. Java matches a substring of the full path, so a project
+//!   folder named `windows` anywhere would be skipped.
+//! - A folder the caller chose explicitly is never skipped, even if it is
+//!   named like a system folder. (An exclusion that silently emptied a scan
+//!   has bitten this project before.)
+//! - Symlinks and junctions are not followed, and only regular files are
+//!   read, so a link loop cannot hang a scan and a device file cannot block it.
+//! - Each folder is listed once and its ransomware-behavior score is computed
+//!   once, not once per file.
+//!
+//! Only non-clean results are kept; counts cover everything. Paths in the
+//! report are `String`s (lossy), because serde refuses to serialize a path that
+//! is not valid Unicode and one odd filename must not lose a whole report.
+
+use crate::dir_behavior;
+use crate::hash_match::SignatureSet;
+use crate::scoring;
+use crate::types::{ ScanResult, Verdict };
+use crate::yara_scan::RuleSet;
+use serde::{ Deserialize, Serialize };
+use std::fs;
+use std::io::Read;
+use std::path::{ Path, PathBuf };
+use std::sync::atomic::{ AtomicBool, Ordering };
+use std::time::{ Duration, Instant };
+
+/// Files larger than this are counted, not scanned. Matches the Java engine.
+pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+/// How long a system scan may run. Matches the Java engine.
+pub const SYSTEM_SCAN_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
+/// Most findings kept in a report.
+pub const MAX_FINDINGS: usize = 2_000;
+/// Progress callbacks are at most this often unless the caller asks otherwise.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone)]
+pub struct ScanLimits {
+    pub max_file_bytes: u64,
+    /// None means no time limit (a folder the user chose; they can cancel).
+    pub max_duration: Option<Duration>,
+    /// At least 1. The scan stops once this many findings are kept.
+    pub max_findings: usize,
+}
+
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self { max_file_bytes: MAX_FILE_BYTES, max_duration: None, max_findings: MAX_FINDINGS }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanOptions {
+    pub recursive: bool,
+    pub limits: ScanLimits,
+    pub min_progress_interval: Duration,
+}
+
+impl ScanOptions {
+    /// A folder the user chose.
+    pub fn directory(recursive: bool) -> Self {
+        Self { recursive, limits: ScanLimits::default(), min_progress_interval: PROGRESS_INTERVAL }
+    }
+
+    /// Every fixed drive, with the 5-minute budget.
+    pub fn system() -> Self {
+        Self {
+            recursive: true,
+            limits: ScanLimits {
+                max_duration: Some(SYSTEM_SCAN_MAX_DURATION),
+                ..ScanLimits::default()
+            },
+            min_progress_interval: PROGRESS_INTERVAL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    Completed,
+    Cancelled,
+    TimeBudget,
+    FindingsCap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileFinding {
+    pub path: String,
+    pub result: ScanResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanReport {
+    /// Suspicious and malicious files only, in the order they were found.
+    pub findings: Vec<FileFinding>,
+    pub scanned: u64,
+    pub clean: u64,
+    pub suspicious: u64,
+    pub malicious: u64,
+    /// Files skipped by name, and system folders skipped whole. A skipped
+    /// folder counts once; what is inside it is not counted.
+    pub skipped_excluded: u64,
+    pub skipped_too_large: u64,
+    /// Symlinks, junctions and anything that is not a regular file or folder.
+    pub skipped_links_or_special: u64,
+    pub unreadable_files: u64,
+    pub unreadable_dirs: u64,
+    pub stop_reason: StopReason,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Progress {
+    pub current_dir: String,
+    pub scanned: u64,
+    pub findings: u64,
+}
+
+#[cfg(windows)]
+const SYSTEM_DIR_NAMES: &[&str] = &[
+    "windows",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "$recycle.bin",
+    "system volume information",
+    "recovery",
+    "config.msi",
+    "documents and settings",
+];
+#[cfg(not(windows))]
+const SYSTEM_DIR_NAMES: &[&str] = &["proc", "sys", "dev", "run"];
+
+/// Hidden files and a short list of known noise. Names only: folders are
+/// handled by the system-folder rule.
+fn is_file_excluded(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.starts_with('.') || lower == "thumbs.db" || lower == "desktop.ini"
+}
+
+fn is_volume_root(path: &Path) -> bool {
+    path.parent().is_none()
+}
+
+fn is_system_dir_name(name: &str, names: &[&str]) -> bool {
+    let lower = name.to_lowercase();
+    names.iter().any(|n| *n == lower)
+}
+
+/// The roots a system scan covers. Windows: fixed drives only, because probing
+/// a disconnected network drive can hang. Elsewhere: `/`.
+pub fn system_roots() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        windows_fixed_drives()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![PathBuf::from("/")]
+    }
+}
+
+#[cfg(windows)]
+fn windows_fixed_drives() -> Vec<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::{ GetDriveTypeW, GetLogicalDrives };
+
+    // Documented value of DRIVE_FIXED (it lives in a different windows-sys
+    // feature, not worth enabling for one constant).
+    const DRIVE_FIXED: u32 = 3;
+
+    // SAFETY: GetLogicalDrives takes no arguments and only returns a bit mask.
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u32)
+        .filter(|bit| mask & (1 << bit) != 0)
+        .filter_map(|bit| {
+            let root = format!("{}:\\", (b'A' + (bit as u8)) as char);
+            let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call.
+            let kind = unsafe { GetDriveTypeW(wide.as_ptr()) };
+            (kind == DRIVE_FIXED).then(|| PathBuf::from(root))
+        })
+        .collect()
+}
+
+/// Scans one folder, or one file's folder tree, as the user chose it.
+pub fn scan_path(
+    root: &Path,
+    opts: &ScanOptions,
+    signatures: &SignatureSet,
+    rules: &RuleSet,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(&Progress)
+) -> ScanReport {
+    scan_roots(&[root.to_path_buf()], opts, signatures, rules, cancel, on_progress)
+}
+
+/// Scans several roots as one run: one time budget, one findings cap, one report.
+pub fn scan_roots(
+    roots: &[PathBuf],
+    opts: &ScanOptions,
+    signatures: &SignatureSet,
+    rules: &RuleSet,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(&Progress)
+) -> ScanReport {
+    scan_roots_with(roots, opts, signatures, rules, cancel, on_progress, &is_volume_root, SYSTEM_DIR_NAMES)
+}
+
+/// The walker, with the two platform rules injectable so tests can exercise
+/// them inside a temporary folder instead of a real drive root.
+#[allow(clippy::too_many_arguments)]
+fn scan_roots_with(
+    roots: &[PathBuf],
+    opts: &ScanOptions,
+    signatures: &SignatureSet,
+    rules: &RuleSet,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(&Progress),
+    is_volume_root: &dyn Fn(&Path) -> bool,
+    system_dir_names: &[&str]
+) -> ScanReport {
+    let mut run = Run {
+        opts,
+        signatures,
+        rules,
+        cancel,
+        on_progress,
+        is_volume_root,
+        system_dir_names,
+        started: Instant::now(),
+        last_progress: None,
+        stop: None,
+        report: ScanReport {
+            findings: Vec::new(),
+            scanned: 0,
+            clean: 0,
+            suspicious: 0,
+            malicious: 0,
+            skipped_excluded: 0,
+            skipped_too_large: 0,
+            skipped_links_or_special: 0,
+            unreadable_files: 0,
+            unreadable_dirs: 0,
+            stop_reason: StopReason::Completed,
+            elapsed_ms: 0,
+        },
+    };
+
+    for root in roots {
+        // Absolute, but links are not resolved: the paths stay as the user
+        // would write them (no `\\?\` prefix in the UI).
+        let root = std::path::absolute(root).unwrap_or_else(|_| root.clone());
+        run.walk_root(&root);
+        if run.stop.is_some() {
+            break;
+        }
+    }
+
+    run.report.stop_reason = run.stop.unwrap_or(StopReason::Completed);
+    run.report.elapsed_ms = run.started.elapsed().as_millis() as u64;
+    run.report
+}
+
+struct Run<'a> {
+    opts: &'a ScanOptions,
+    signatures: &'a SignatureSet,
+    rules: &'a RuleSet,
+    cancel: &'a AtomicBool,
+    on_progress: &'a mut dyn FnMut(&Progress),
+    is_volume_root: &'a dyn Fn(&Path) -> bool,
+    system_dir_names: &'a [&'a str],
+    started: Instant,
+    last_progress: Option<Instant>,
+    stop: Option<StopReason>,
+    report: ScanReport,
+}
+
+impl Run<'_> {
+    /// True once the scan must end. The first reason found is kept.
+    fn should_stop(&mut self) -> bool {
+        if self.stop.is_some() {
+            return true;
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            self.stop = Some(StopReason::Cancelled);
+            return true;
+        }
+        if let Some(max) = self.opts.limits.max_duration {
+            if self.started.elapsed() >= max {
+                self.stop = Some(StopReason::TimeBudget);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn progress(&mut self, dir: &Path) {
+        let now = Instant::now();
+        let due = self.last_progress.is_none_or(|t| {
+            now.duration_since(t) >= self.opts.min_progress_interval
+        });
+        if due {
+            self.last_progress = Some(now);
+            (self.on_progress)(
+                &(Progress {
+                    current_dir: dir.to_string_lossy().into_owned(),
+                    scanned: self.report.scanned,
+                    findings: self.report.findings.len() as u64,
+                })
+            );
+        }
+    }
+
+    fn walk_root(&mut self, root: &Path) {
+        let mut stack = vec![root.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            if self.should_stop() {
+                return;
+            }
+            self.progress(&dir);
+
+            let listing = match fs::read_dir(&dir) {
+                Ok(listing) => listing,
+                Err(_) => {
+                    self.report.unreadable_dirs += 1;
+                    continue;
+                }
+            };
+            let mut entries = Vec::new();
+            for entry in listing {
+                match entry {
+                    Ok(entry) => entries.push(entry),
+                    Err(_) => self.report.unreadable_dirs += 1,
+                }
+            }
+            // Stable order: reproducible reports, and progress that reads sensibly.
+            entries.sort_by_key(|entry| entry.file_name());
+
+            // One listing per folder, and the ransomware-behavior score for the
+            // whole folder is computed once from it.
+            let names: Vec<String> = entries
+                .iter()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let dir_score = dir_behavior::score_from_names(&names);
+            let dir_is_volume_root = (self.is_volume_root)(&dir);
+
+            let mut subdirs = Vec::new();
+            for entry in &entries {
+                if self.should_stop() {
+                    return;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Ok(file_type) = entry.file_type() else {
+                    self.report.unreadable_files += 1;
+                    continue;
+                };
+
+                if file_type.is_symlink() {
+                    self.report.skipped_links_or_special += 1;
+                } else if file_type.is_dir() {
+                    if !self.opts.recursive {
+                        continue;
+                    }
+                    if dir_is_volume_root && is_system_dir_name(&name, self.system_dir_names) {
+                        self.report.skipped_excluded += 1;
+                    } else {
+                        subdirs.push(entry.path());
+                    }
+                } else if file_type.is_file() {
+                    self.scan_file(entry, &name, dir_score, &dir);
+                } else {
+                    self.report.skipped_links_or_special += 1;
+                }
+            }
+
+            // Pushed in reverse so folders are visited in name order.
+            stack.extend(subdirs.into_iter().rev());
+        }
+    }
+
+    fn scan_file(&mut self, entry: &fs::DirEntry, name: &str, dir_score: i32, dir: &Path) {
+        if is_file_excluded(name) {
+            self.report.skipped_excluded += 1;
+            return;
+        }
+
+        let max = self.opts.limits.max_file_bytes;
+        match entry.metadata() {
+            Ok(meta) if meta.len() > max => {
+                self.report.skipped_too_large += 1;
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                self.report.unreadable_files += 1;
+                return;
+            }
+        }
+
+        let path = entry.path();
+        let content = match read_bounded(&path, max) {
+            Ok(Some(content)) => content,
+            // Grew past the limit after the size check above.
+            Ok(None) => {
+                self.report.skipped_too_large += 1;
+                return;
+            }
+            Err(_) => {
+                self.report.unreadable_files += 1;
+                return;
+            }
+        };
+
+        let result = scoring::score_file_in_directory(
+            name,
+            &content,
+            self.signatures,
+            self.rules,
+            &path,
+            dir_score
+        );
+        self.record(&path, result);
+        self.progress(dir);
+    }
+
+    fn record(&mut self, path: &Path, result: ScanResult) {
+        self.report.scanned += 1;
+        match result.verdict {
+            Verdict::Clean => {
+                self.report.clean += 1;
+                return;
+            }
+            Verdict::Suspicious => self.report.suspicious += 1,
+            Verdict::Malicious => self.report.malicious += 1,
+        }
+
+        self.report.findings.push(FileFinding {
+            path: path.to_string_lossy().into_owned(),
+            result,
+        });
+        if self.report.findings.len() >= self.opts.limits.max_findings.max(1) {
+            self.stop = Some(StopReason::FindingsCap);
+        }
+    }
+}
+
+/// Reads at most `max` bytes. Returns None if the file is longer, without ever
+/// holding more than `max + 1` bytes: a file that grows after its size was
+/// checked cannot exhaust memory.
+fn read_bounded(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let file = fs::File::open(path)?;
+    let mut content = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut content)?;
+    if (content.len() as u64) > max { Ok(None) } else { Ok(Some(content)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hash_match::sha256_hex;
+    use crate::DEFAULT_RULES;
+    use tempfile::tempdir;
+
+    const BAD: &[u8] = b"known-bad-bytes";
+
+    fn rules() -> RuleSet {
+        RuleSet::compile(DEFAULT_RULES).unwrap()
+    }
+
+    /// Known-bad content by hash, never raw EICAR on disk (Defender blocks it).
+    fn bad_signatures() -> SignatureSet {
+        SignatureSet::from_hashes(vec![sha256_hex(BAD)])
+    }
+
+    fn opts(recursive: bool) -> ScanOptions {
+        ScanOptions { min_progress_interval: Duration::ZERO, ..ScanOptions::directory(recursive) }
+    }
+
+    fn scan(root: &Path, opts: &ScanOptions, signatures: &SignatureSet) -> ScanReport {
+        scan_path(root, opts, signatures, &rules(), &AtomicBool::new(false), &mut |_| {})
+    }
+
+    fn write(root: &Path, relative: &str, content: &[u8]) -> PathBuf {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    // --- walking ---
+
+    #[test]
+    fn scans_only_the_top_folder_when_not_recursive() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.txt", b"one");
+        write(dir.path(), "sub/b.txt", b"two");
+
+        let report = scan(dir.path(), &opts(false), &SignatureSet::new());
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.stop_reason, StopReason::Completed);
+    }
+
+    #[test]
+    fn descends_into_subfolders_when_recursive() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.txt", b"one");
+        write(dir.path(), "sub/b.txt", b"two");
+        write(dir.path(), "sub/deeper/c.txt", b"three");
+
+        let report = scan(dir.path(), &opts(true), &SignatureSet::new());
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.clean, 3);
+    }
+
+    #[test]
+    fn a_folder_with_nothing_in_it_completes_with_an_empty_report() {
+        let dir = tempdir().unwrap();
+        let report = scan(dir.path(), &opts(true), &SignatureSet::new());
+        assert_eq!(report.scanned, 0);
+        assert!(report.findings.is_empty());
+        assert_eq!(report.stop_reason, StopReason::Completed);
+    }
+
+    #[test]
+    fn a_missing_root_is_one_unreadable_folder_not_a_panic() {
+        let dir = tempdir().unwrap();
+        let report = scan(&dir.path().join("does-not-exist"), &opts(true), &SignatureSet::new());
+        assert_eq!(report.unreadable_dirs, 1);
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.stop_reason, StopReason::Completed);
+    }
+
+    #[test]
+    fn findings_are_non_clean_only_and_the_counts_add_up() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "ok1.txt", b"fine");
+        write(dir.path(), "ok2.txt", b"also fine");
+        write(dir.path(), "nested/bad.bin", BAD);
+
+        let report = scan(dir.path(), &opts(true), &bad_signatures());
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.clean + report.suspicious + report.malicious, report.scanned);
+        assert_eq!(report.malicious, 1);
+        assert_eq!(report.findings.len(), 1);
+        assert!(report.findings[0].path.ends_with("bad.bin"), "{}", report.findings[0].path);
+        assert_eq!(report.findings[0].result.verdict, Verdict::Malicious);
+    }
+
+    // --- exclusions ---
+
+    #[test]
+    fn hidden_and_noise_files_are_skipped_and_counted() {
+        let dir = tempdir().unwrap();
+        for name in [".hidden", "Thumbs.db", "desktop.ini", ".DS_Store"] {
+            write(dir.path(), name, b"noise");
+        }
+        write(dir.path(), "real.txt", b"content");
+
+        let report = scan(dir.path(), &opts(true), &SignatureSet::new());
+        assert_eq!(report.skipped_excluded, 4);
+        assert_eq!(report.scanned, 1);
+    }
+
+    #[test]
+    fn the_file_exclusion_list_matches_the_java_engine() {
+        for name in [".git", ".hidden", "thumbs.db", "THUMBS.DB", "Desktop.ini", ".ds_store"] {
+            assert!(is_file_excluded(name), "{name} should be excluded");
+        }
+        for name in ["thumbs.db.txt", "readme.txt", "my.desktop.ini.bak", "a.exe"] {
+            assert!(!is_file_excluded(name), "{name} should not be excluded");
+        }
+    }
+
+    #[test]
+    fn system_named_folders_under_a_volume_root_are_skipped_whole() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "Windows/x.txt", b"x");
+        write(dir.path(), "ProgramData/y.txt", b"y");
+        write(dir.path(), "keep/z.txt", b"z");
+
+        let root = dir.path().to_path_buf();
+        let report = scan_roots_with(
+            std::slice::from_ref(&root),
+            &opts(true),
+            &SignatureSet::new(),
+            &rules(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &|p: &Path| p == root,
+            &["windows", "programdata"]
+        );
+        assert_eq!(report.scanned, 1, "only keep/z.txt should be scanned");
+        assert_eq!(report.skipped_excluded, 2);
+    }
+
+    #[test]
+    fn the_same_folder_names_deeper_in_the_tree_are_scanned() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "src/windows/a.txt", b"a");
+        write(dir.path(), "src/programdata/b.txt", b"b");
+
+        let root = dir.path().to_path_buf();
+        let report = scan_roots_with(
+            std::slice::from_ref(&root),
+            &opts(true),
+            &SignatureSet::new(),
+            &rules(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &|p: &Path| p == root,
+            &["windows", "programdata"]
+        );
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.skipped_excluded, 0);
+    }
+
+    #[test]
+    fn a_folder_chosen_explicitly_is_scanned_even_if_named_like_a_system_folder() {
+        let dir = tempdir().unwrap();
+        let chosen = dir.path().join("Windows");
+        write(&chosen, "inside.txt", b"inside");
+
+        let parent = dir.path().to_path_buf();
+        let report = scan_roots_with(
+            &[chosen],
+            &opts(true),
+            &SignatureSet::new(),
+            &rules(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &|p: &Path| p == parent,
+            &["windows"]
+        );
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.skipped_excluded, 0);
+    }
+
+    #[test]
+    fn the_platform_rules_name_the_right_folders() {
+        #[cfg(windows)]
+        {
+            assert!(SYSTEM_DIR_NAMES.contains(&"windows"));
+            assert!(SYSTEM_DIR_NAMES.contains(&"$recycle.bin"));
+            // A developer's C:\dev must not be treated as a system folder.
+            assert!(!SYSTEM_DIR_NAMES.contains(&"dev"));
+            assert!(is_volume_root(Path::new("C:\\")));
+            assert!(!is_volume_root(Path::new("C:\\Users")));
+        }
+        #[cfg(not(windows))]
+        {
+            for name in ["proc", "sys", "dev", "run"] {
+                assert!(SYSTEM_DIR_NAMES.contains(&name));
+            }
+            assert!(!SYSTEM_DIR_NAMES.contains(&"windows"));
+            assert!(is_volume_root(Path::new("/")));
+            assert!(!is_volume_root(Path::new("/tmp")));
+        }
+        assert!(is_system_dir_name("WINDOWS", &["windows"]));
+        assert!(!is_system_dir_name("windows-notes", &["windows"]));
+    }
+
+    #[test]
+    fn system_roots_are_not_empty() {
+        let roots = system_roots();
+        assert!(!roots.is_empty());
+        #[cfg(windows)]
+        assert!(roots.iter().all(|r| r.to_string_lossy().ends_with(":\\")));
+        #[cfg(not(windows))]
+        assert_eq!(roots, vec![PathBuf::from("/")]);
+    }
+
+    // --- limits ---
+
+    #[test]
+    fn a_file_over_the_size_limit_is_counted_not_scanned() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "big.bin", b"0123456789");
+        let mut options = opts(true);
+        options.limits.max_file_bytes = 5;
+
+        let report = scan(dir.path(), &options, &SignatureSet::new());
+        assert_eq!(report.skipped_too_large, 1);
+        assert_eq!(report.scanned, 0);
+    }
+
+    #[test]
+    fn read_bounded_never_returns_more_than_the_limit() {
+        let dir = tempdir().unwrap();
+        let path = write(dir.path(), "f.bin", b"0123456789");
+        assert_eq!(read_bounded(&path, 10).unwrap(), Some(b"0123456789".to_vec()));
+        assert_eq!(read_bounded(&path, 11).unwrap().map(|c| c.len()), Some(10));
+        assert_eq!(read_bounded(&path, 9).unwrap(), None);
+        assert_eq!(read_bounded(&path, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_zero_time_budget_stops_before_the_first_file() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.txt", b"a");
+        let mut options = opts(true);
+        options.limits.max_duration = Some(Duration::ZERO);
+
+        let report = scan(dir.path(), &options, &SignatureSet::new());
+        assert_eq!(report.stop_reason, StopReason::TimeBudget);
+        assert_eq!(report.scanned, 0);
+    }
+
+    #[test]
+    fn cancel_set_before_the_start_stops_immediately() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.txt", b"a");
+
+        let cancel = AtomicBool::new(true);
+        let report = scan_path(dir.path(), &opts(true), &SignatureSet::new(), &rules(), &cancel, &mut |_| {});
+        assert_eq!(report.stop_reason, StopReason::Cancelled);
+        assert_eq!(report.scanned, 0);
+    }
+
+    #[test]
+    fn cancel_during_the_scan_keeps_what_was_found_so_far() {
+        let dir = tempdir().unwrap();
+        for i in 0..6 {
+            write(dir.path(), &format!("f{i}.txt"), b"x");
+        }
+
+        let cancel = AtomicBool::new(false);
+        let report = scan_path(
+            dir.path(),
+            &opts(true),
+            &SignatureSet::new(),
+            &rules(),
+            &cancel,
+            &mut |p| {
+                if p.scanned >= 2 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        );
+        assert_eq!(report.stop_reason, StopReason::Cancelled);
+        assert_eq!(report.scanned, 2);
+    }
+
+    #[test]
+    fn the_findings_cap_stops_the_scan() {
+        let dir = tempdir().unwrap();
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            write(dir.path(), name, BAD);
+        }
+        let mut options = opts(true);
+        options.limits.max_findings = 1;
+
+        let report = scan(dir.path(), &options, &bad_signatures());
+        assert_eq!(report.stop_reason, StopReason::FindingsCap);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.scanned, 1);
+    }
+
+    #[test]
+    fn progress_is_throttled_by_the_interval() {
+        let dir = tempdir().unwrap();
+        for i in 0..5 {
+            write(dir.path(), &format!("f{i}.txt"), b"x");
+        }
+
+        let mut quiet_calls = 0;
+        let mut slow = opts(true);
+        slow.min_progress_interval = Duration::from_secs(3600);
+        scan_path(dir.path(), &slow, &SignatureSet::new(), &rules(), &AtomicBool::new(false), &mut |_| {
+            quiet_calls += 1;
+        });
+        assert_eq!(quiet_calls, 1, "only the first call is due within an hour");
+
+        let mut every_call = 0;
+        scan_path(dir.path(), &opts(true), &SignatureSet::new(), &rules(), &AtomicBool::new(false), &mut |_| {
+            every_call += 1;
+        });
+        assert!(every_call >= 5, "expected a call per file, got {every_call}");
+    }
+
+    #[test]
+    fn option_presets_match_the_agreed_limits() {
+        let directory = ScanOptions::directory(true);
+        assert_eq!(directory.limits.max_duration, None);
+        assert_eq!(directory.limits.max_file_bytes, 100 * 1024 * 1024);
+        assert_eq!(directory.limits.max_findings, 2_000);
+
+        let system = ScanOptions::system();
+        assert!(system.recursive);
+        assert_eq!(system.limits.max_duration, Some(Duration::from_secs(300)));
+    }
+
+    // --- the folder score ---
+
+    #[test]
+    fn a_ransomware_style_folder_flags_its_files_through_the_folder_score() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "locked/README.txt", b"pay us");
+        for i in 0..5 {
+            write(dir.path(), &format!("locked/doc{i}.xyz123"), b"x");
+        }
+        write(dir.path(), "calm/notes.txt", b"hello");
+
+        let report = scan(dir.path(), &opts(true), &SignatureSet::new());
+        assert_eq!(report.findings.len(), 6, "every file in the locked folder is flagged");
+        assert!(
+            report.findings.iter().all(|f|
+                f.result.contributions.iter().any(|c| c.reason == "RANSOMWARE_DIRECTORY_BEHAVIOR")
+            )
+        );
+        assert!(report.findings.iter().all(|f| f.path.contains("locked")));
+    }
+
+    // --- the report ---
+
+    #[test]
+    fn the_report_serializes_with_readable_names_and_survives_a_round_trip() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "bad.bin", BAD);
+        let report = scan(dir.path(), &opts(true), &bad_signatures());
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["stop_reason"], "completed");
+        assert!(json["elapsed_ms"].is_u64());
+        assert!(json["findings"][0]["path"].is_string());
+
+        let back: ScanReport = serde_json::from_value(json).unwrap();
+        assert_eq!(back.findings.len(), 1);
+        assert_eq!(back.stop_reason, StopReason::Completed);
+    }
+
+    // --- Unix-only: links, odd names, permissions ---
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_does_not_hang_and_links_are_counted() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a/file.txt", b"x");
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("a/loop")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("a/file.txt"), dir.path().join("a/link-to-file")).unwrap();
+
+        let report = scan(dir.path(), &opts(true), &SignatureSet::new());
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.skipped_links_or_special, 2);
+        assert_eq!(report.stop_reason, StopReason::Completed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_valid_unicode_does_not_break_the_report() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir().unwrap();
+        let odd = dir.path().join(OsStr::from_bytes(b"b\xffd.bin"));
+        fs::write(&odd, BAD).unwrap();
+
+        let report = scan(dir.path(), &opts(true), &bad_signatures());
+        assert_eq!(report.findings.len(), 1);
+        assert!(report.findings[0].path.contains('\u{FFFD}'));
+        serde_json::to_string(&report).expect("the report must still serialize");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_folder_is_counted_and_the_scan_continues() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        write(dir.path(), "ok.txt", b"fine");
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        write(&locked, "hidden.txt", b"never read");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Running as root ignores permissions; nothing to prove then.
+        let enforced = fs::read_dir(&locked).is_err();
+        let report = scan(dir.path(), &opts(true), &SignatureSet::new());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if enforced {
+            assert_eq!(report.unreadable_dirs, 1);
+            assert_eq!(report.scanned, 1);
+        }
+    }
+}

@@ -1,5 +1,6 @@
 pub mod blocked_domain;
 pub mod dir_behavior;
+pub mod dir_scan;
 pub mod entropy;
 pub mod extension;
 pub mod hash_match;
