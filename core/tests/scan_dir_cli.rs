@@ -1,0 +1,103 @@
+//! End-to-end checks of `scg-scan scan-dir`: real process, real folder, real
+//! database. Known-bad content is recognized through a seeded signature hash,
+//! never a raw EICAR file (Windows Defender blocks those).
+
+use secureguard_core::hash_match::sha256_hex;
+use secureguard_core::{ rusqlite, storage };
+use std::fs;
+use std::path::Path;
+use std::process::{ Command, Output };
+
+const BAD: &[u8] = b"known-bad-bytes-for-the-cli-test";
+
+fn scg(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_scg-scan"))
+        .args(args)
+        .output()
+        .expect("failed to run scg-scan")
+}
+
+fn seed_signature(db: &Path, content: &[u8]) {
+    let conn = storage::open(&db.to_string_lossy()).unwrap();
+    conn.execute(
+        "INSERT INTO signature_cache (sha256, source, added_at) VALUES (?1, 'test', 0)",
+        rusqlite::params![sha256_hex(content)]
+    ).unwrap();
+}
+
+#[test]
+fn reports_json_and_exits_zero_for_a_clean_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let scan_root = dir.path().join("tree");
+    fs::create_dir_all(scan_root.join("sub")).unwrap();
+    fs::write(scan_root.join("a.txt"), b"hello").unwrap();
+    fs::write(scan_root.join("sub/b.txt"), b"world").unwrap();
+    let db = dir.path().join("test.db");
+
+    let out = scg(&["scan-dir", &scan_root.to_string_lossy(), "--recursive", "--json", "--db", &db.to_string_lossy()]);
+
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["scanned"], 2);
+    assert_eq!(report["stop_reason"], "completed");
+    assert!(report["findings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn flags_a_known_bad_file_and_records_it_to_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let scan_root = dir.path().join("tree");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::write(scan_root.join("bad.bin"), BAD).unwrap();
+    fs::write(scan_root.join("ok.txt"), b"fine").unwrap();
+    let db = dir.path().join("test.db");
+    seed_signature(&db, BAD);
+
+    let out = scg(&["scan-dir", &scan_root.to_string_lossy(), "--json", "--db", &db.to_string_lossy()]);
+
+    assert!(out.status.success(), "a finding is not an error: {}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["malicious"], 1);
+    assert_eq!(report["findings"][0]["result"]["verdict"], "Malicious");
+
+    let conn = storage::open(&db.to_string_lossy()).unwrap();
+    let history = storage::recent_scans(&conn, 10).unwrap();
+    assert_eq!(history.len(), 1, "only the non-clean result is recorded");
+    assert_eq!(history[0].file_name, "bad.bin");
+}
+
+#[test]
+fn prints_a_readable_summary_without_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let scan_root = dir.path().join("tree");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::write(scan_root.join("bad.bin"), BAD).unwrap();
+    let db = dir.path().join("test.db");
+    seed_signature(&db, BAD);
+
+    let out = scg(&["scan-dir", &scan_root.to_string_lossy(), "--db", &db.to_string_lossy()]);
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(text.contains("Scanned 1 files"), "{text}");
+    assert!(text.contains("Findings:"), "{text}");
+    assert!(text.contains("bad.bin"), "{text}");
+}
+
+#[test]
+fn a_missing_folder_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope");
+    let db = dir.path().join("test.db");
+
+    let out = scg(&["scan-dir", &missing.to_string_lossy(), "--db", &db.to_string_lossy()]);
+
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not a folder"));
+}
+
+#[test]
+fn a_path_or_system_is_required_but_not_both() {
+    assert_eq!(scg(&["scan-dir"]).status.code(), Some(2));
+    assert_eq!(scg(&["scan-dir", "somewhere", "--system"]).status.code(), Some(2));
+}
