@@ -26,11 +26,14 @@
 //! is not valid Unicode and one odd filename must not lose a whole report.
 
 use crate::dir_behavior;
-use crate::hash_match::SignatureSet;
+use crate::hash_match::{ sha256_hex, SignatureSet };
+use crate::rootkit;
 use crate::scoring;
 use crate::types::{ ScanResult, Verdict };
 use crate::yara_scan::RuleSet;
 use serde::{ Deserialize, Serialize };
+use sha2::{ Digest, Sha256 };
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{ Path, PathBuf };
@@ -45,6 +48,8 @@ pub const SYSTEM_SCAN_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 pub const MAX_FINDINGS: usize = 2_000;
 /// Progress callbacks are at most this often unless the caller asks otherwise.
 pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// Most results remembered for reuse in one scan (about 50 bytes each).
+pub const MAX_REUSABLE_RESULTS: usize = 500_000;
 
 #[derive(Debug, Clone)]
 pub struct ScanLimits {
@@ -66,12 +71,22 @@ pub struct ScanOptions {
     pub recursive: bool,
     pub limits: ScanLimits,
     pub min_progress_interval: Duration,
+    /// Reuse the verdict for a file that is identical (same bytes, same name,
+    /// same folder score) to one already scanned in this run, instead of
+    /// running every check again. Copies of the same library, extension or
+    /// package are common; this skips the expensive part of scanning them.
+    pub reuse_identical_results: bool,
 }
 
 impl ScanOptions {
     /// A folder the user chose.
     pub fn directory(recursive: bool) -> Self {
-        Self { recursive, limits: ScanLimits::default(), min_progress_interval: PROGRESS_INTERVAL }
+        Self {
+            recursive,
+            limits: ScanLimits::default(),
+            min_progress_interval: PROGRESS_INTERVAL,
+            reuse_identical_results: true,
+        }
     }
 
     /// Every fixed drive, with the 5-minute budget.
@@ -83,6 +98,7 @@ impl ScanOptions {
                 ..ScanLimits::default()
             },
             min_progress_interval: PROGRESS_INTERVAL,
+            reuse_identical_results: true,
         }
     }
 }
@@ -118,6 +134,10 @@ pub struct ScanReport {
     pub skipped_links_or_special: u64,
     pub unreadable_files: u64,
     pub unreadable_dirs: u64,
+    /// Files whose result was reused from an identical file scanned earlier in
+    /// this run. They are included in `scanned` and the verdict counts.
+    #[serde(default)]
+    pub reused_results: u64,
     pub stop_reason: StopReason,
     pub elapsed_ms: u64,
 }
@@ -241,6 +261,7 @@ fn scan_roots_with(
         is_volume_root,
         system_dir_names,
         started: Instant::now(),
+        cache: ResultCache::new(MAX_REUSABLE_RESULTS),
         last_progress: None,
         stop: None,
         report: ScanReport {
@@ -254,6 +275,7 @@ fn scan_roots_with(
             skipped_links_or_special: 0,
             unreadable_files: 0,
             unreadable_dirs: 0,
+            reused_results: 0,
             stop_reason: StopReason::Completed,
             elapsed_ms: 0,
         },
@@ -283,6 +305,7 @@ struct Run<'a> {
     is_volume_root: &'a dyn Fn(&Path) -> bool,
     system_dir_names: &'a [&'a str],
     started: Instant,
+    cache: ResultCache,
     last_progress: Option<Instant>,
     stop: Option<StopReason>,
     report: ScanReport,
@@ -426,16 +449,45 @@ impl Run<'_> {
             }
         };
 
-        let result = scoring::score_file_in_directory(
+        let sha256 = sha256_hex(&content);
+        let key = self.opts.reuse_identical_results.then(||
+            result_key(&sha256, name, rootkit::in_rootkit_location(&path), dir_score)
+        );
+
+        if let Some(cached) = key.and_then(|k| self.cache.get(k)) {
+            self.report.reused_results += 1;
+            match cached {
+                Cached::Clean => self.record_clean(),
+                Cached::Flagged(result) => self.record(&path, result),
+            }
+            self.progress(dir);
+            return;
+        }
+
+        let result = scoring::score_file_in_directory_with_hash(
             name,
             &content,
             self.signatures,
             self.rules,
             &path,
-            dir_score
+            dir_score,
+            &sha256
         );
+        if let Some(key) = key {
+            let outcome = if result.verdict == Verdict::Clean {
+                Cached::Clean
+            } else {
+                Cached::Flagged(result.clone())
+            };
+            self.cache.put(key, outcome);
+        }
         self.record(&path, result);
         self.progress(dir);
+    }
+
+    fn record_clean(&mut self) {
+        self.report.scanned += 1;
+        self.report.clean += 1;
     }
 
     fn record(&mut self, path: &Path, result: ScanResult) {
@@ -455,6 +507,52 @@ impl Run<'_> {
         });
         if self.report.findings.len() >= self.opts.limits.max_findings.max(1) {
             self.stop = Some(StopReason::FindingsCap);
+        }
+    }
+}
+
+/// What a file's score depends on besides the signature set and rules, which are
+/// fixed for a run: its bytes (the hash), its exact name, whether its path is in
+/// a place kernel drivers live, and its folder's ransomware-behavior score. Two
+/// files with equal keys get equal results. The key is a 128-bit digest, so the
+/// map stays small (clean files are remembered as a marker only).
+fn result_key(sha256_hex: &str, file_name: &str, in_rootkit_location: bool, dir_score: i32) -> u128 {
+    let mut hasher = Sha256::new();
+    hasher.update(sha256_hex.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(file_name.as_bytes());
+    hasher.update([0u8, u8::from(in_rootkit_location)]);
+    hasher.update(dir_score.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    u128::from_le_bytes(bytes)
+}
+
+#[derive(Clone)]
+enum Cached {
+    Clean,
+    Flagged(ScanResult),
+}
+
+/// Bounded: once full it stops remembering new results (existing ones stay).
+struct ResultCache {
+    entries: HashMap<u128, Cached>,
+    max: usize,
+}
+
+impl ResultCache {
+    fn new(max: usize) -> Self {
+        Self { entries: HashMap::new(), max }
+    }
+
+    fn get(&self, key: u128) -> Option<Cached> {
+        self.entries.get(&key).cloned()
+    }
+
+    fn put(&mut self, key: u128, outcome: Cached) {
+        if self.entries.len() < self.max {
+            self.entries.insert(key, outcome);
         }
     }
 }
@@ -897,4 +995,102 @@ mod tests {
             assert_eq!(report.scanned, 1);
         }
     }
+
+    // --- reusing the result for an identical file ---
+
+    #[test]
+    fn identical_files_with_the_same_name_reuse_the_first_result() {
+        let dir = tempdir().unwrap();
+        for folder in ["one", "two"] {
+            write(dir.path(), &format!("{folder}/lib.bin"), BAD);
+            write(dir.path(), &format!("{folder}/notes.txt"), b"hello");
+        }
+
+        let report = scan(dir.path(), &opts(true), &bad_signatures());
+        assert_eq!(report.scanned, 4);
+        assert_eq!(report.reused_results, 2, "one clean and one flagged file were repeats");
+        assert_eq!((report.malicious, report.clean), (2, 2));
+        let paths: Vec<&str> = report.findings.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1], "each copy is reported at its own path");
+        assert!(report.findings.iter().all(|f| f.result.file_name == "lib.bin"));
+    }
+
+    #[test]
+    fn the_same_bytes_under_a_different_name_are_scored_separately() {
+        // 4,096 bytes of every value: entropy of 8. Flagged as .bin, ignored as .jar.
+        let packed: Vec<u8> = (0..16).flat_map(|_| 0u8..=255).collect();
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a/payload.bin", &packed);
+        write(dir.path(), "b/payload.jar", &packed);
+
+        let report = scan(dir.path(), &opts(true), &SignatureSet::new());
+        assert_eq!(report.reused_results, 0);
+        assert_eq!(report.findings.len(), 1);
+        assert!(report.findings[0].path.ends_with("payload.bin"));
+    }
+
+    #[test]
+    fn the_folder_score_is_part_of_the_key() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "locked/README.txt", b"pay us");
+        for i in 0..5 {
+            write(dir.path(), &format!("locked/doc{i}.xyz123"), b"x");
+        }
+        write(dir.path(), "calm/doc0.xyz123", b"x");
+
+        let report = scan(dir.path(), &opts(true), &SignatureSet::new());
+        // Same name and bytes as locked/doc0.xyz123, but not in a ransomware-style
+        // folder, so it must not inherit that verdict.
+        assert_eq!(report.findings.len(), 6);
+        assert!(report.findings.iter().all(|f| f.path.contains("locked")));
+        assert_eq!(report.reused_results, 0);
+    }
+
+    #[test]
+    fn reusing_results_changes_nothing_but_the_count() {
+        let dir = tempdir().unwrap();
+        for folder in ["a", "b", "c"] {
+            write(dir.path(), &format!("{folder}/bad.bin"), BAD);
+            write(dir.path(), &format!("{folder}/ok.txt"), b"fine");
+            write(dir.path(), &format!("{folder}/unique-{folder}.txt"), folder.as_bytes());
+        }
+
+        let reused = scan(dir.path(), &opts(true), &bad_signatures());
+        let mut options = opts(true);
+        options.reuse_identical_results = false;
+        let fresh = scan(dir.path(), &options, &bad_signatures());
+
+        assert_eq!(fresh.reused_results, 0);
+        assert_eq!(reused.reused_results, 4);
+        let summary = |r: &ScanReport| {
+            let findings: Vec<(String, Verdict, i32)> = r
+                .findings
+                .iter()
+                .map(|f| (f.path.clone(), f.result.verdict, f.result.score))
+                .collect();
+            (r.scanned, r.clean, r.suspicious, r.malicious, findings)
+        };
+        assert_eq!(summary(&reused), summary(&fresh));
+    }
+
+    #[test]
+    fn the_result_cache_stops_remembering_when_full_but_keeps_what_it_has() {
+        let mut cache = ResultCache::new(1);
+        cache.put(1, Cached::Clean);
+        cache.put(2, Cached::Clean);
+        assert!(cache.get(1).is_some());
+        assert!(cache.get(2).is_none());
+    }
+
+    #[test]
+    fn the_result_key_separates_every_input() {
+        let base = result_key("abc", "a.bin", false, 0);
+        assert_eq!(base, result_key("abc", "a.bin", false, 0));
+        assert_ne!(base, result_key("abd", "a.bin", false, 0));
+        assert_ne!(base, result_key("abc", "b.bin", false, 0));
+        assert_ne!(base, result_key("abc", "a.bin", true, 0));
+        assert_ne!(base, result_key("abc", "a.bin", false, 55));
+    }
 }
+

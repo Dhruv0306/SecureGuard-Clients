@@ -117,6 +117,9 @@ fn print_report(report: &ScanReport) {
         "  clean {}, suspicious {}, malicious {}",
         report.clean, report.suspicious, report.malicious
     );
+    if report.reused_results > 0 {
+        println!("  {} results reused from identical files", report.reused_results);
+    }
     println!(
         "  skipped: {} excluded, {} too large, {} links or special files, {} unreadable files, {} unreadable folders",
         report.skipped_excluded,

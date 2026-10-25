@@ -24,7 +24,9 @@ fn contains_sequence(content: &[u8], sequence: &[u8]) -> bool {
     content.windows(sequence.len()).any(|window| window == sequence)
 }
 
-fn in_rootkit_location(path: &Path) -> bool {
+/// Whether `path` is somewhere a kernel driver or module lives. The only way a
+/// file's path (as opposed to its name and bytes) can change its score.
+pub fn in_rootkit_location(path: &Path) -> bool {
     let path_str = path.to_string_lossy().to_lowercase();
     path_str.contains("/lib/modules/") ||
         path_str.contains("/boot/") ||

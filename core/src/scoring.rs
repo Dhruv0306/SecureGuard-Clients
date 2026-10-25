@@ -66,7 +66,7 @@ pub fn score_file(
     rules: &RuleSet,
     path: Option<&Path>
 ) -> ScanResult {
-    score_impl(file_name, content, signatures, rules, path, None)
+    score_impl(file_name, content, signatures, rules, path, None, None)
 }
 
 /// Same as [`score_file`] for a file on disk, but with the folder's
@@ -82,7 +82,21 @@ pub fn score_file_in_directory(
     path: &Path,
     directory_score: i32
 ) -> ScanResult {
-    score_impl(file_name, content, signatures, rules, Some(path), Some(directory_score))
+    score_impl(file_name, content, signatures, rules, Some(path), Some(directory_score), None)
+}
+
+/// Like [`score_file_in_directory`], for a caller that has already computed the
+/// content's SHA-256 (lowercase hex) and does not want it computed again.
+pub fn score_file_in_directory_with_hash(
+    file_name: &str,
+    content: &[u8],
+    signatures: &SignatureSet,
+    rules: &RuleSet,
+    path: &Path,
+    directory_score: i32,
+    sha256: &str
+) -> ScanResult {
+    score_impl(file_name, content, signatures, rules, Some(path), Some(directory_score), Some(sha256))
 }
 
 fn score_impl(
@@ -91,9 +105,13 @@ fn score_impl(
     signatures: &SignatureSet,
     rules: &RuleSet,
     path: Option<&Path>,
-    directory_score: Option<i32>
+    directory_score: Option<i32>,
+    sha256: Option<&str>
 ) -> ScanResult {
-    let sha256 = crate::hash_match::sha256_hex(content);
+    let sha256 = match sha256 {
+        Some(hash) => hash.to_string(),
+        None => crate::hash_match::sha256_hex(content),
+    };
 
     // Fast path: an exact known-malware hash match or the EICAR test file
     // short-circuits everything else, matching the Java engine's ordering.
