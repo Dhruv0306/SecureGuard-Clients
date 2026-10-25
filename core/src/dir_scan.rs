@@ -311,11 +311,18 @@ fn quick_roots_from(
     roots
 }
 
-/// Path equality for "have we scanned this already": case-insensitive on
-/// Windows, where the file system is.
+/// Path equality for "have we scanned this already". Compared component by
+/// component, so the separator style (slash or backslash) and a trailing separator
+/// do not matter. On Windows the comparison is also case-insensitive, like the file
+/// system.
 fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
-        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+        let lowered = |path: &Path| -> Vec<String> {
+            path.components()
+                .map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase())
+                .collect()
+        };
+        lowered(a) == lowered(b)
     } else {
         a == b
     }
@@ -1759,18 +1766,20 @@ mod tests {
     fn the_unix_quick_list_uses_home_and_the_temp_dir() {
         let env = env_of(&[("HOME", "/home/pat"), ("TMPDIR", "/var/tmp")]);
         let roots = quick_roots_from(false, &env, &|_| true);
-        let as_text: Vec<String> = roots.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        assert_eq!(
-            as_text,
-            [
-                "/home/pat/Downloads",
-                "/home/pat/Desktop",
-                "/home/pat/Documents",
-                "/var/tmp",
-                "/home/pat/.config/autostart",
-                "/home/pat/Library/LaunchAgents",
-            ]
-        );
+        // Compared as paths, not text: `join` uses the separator of the machine
+        // running the test, so on Windows the text is "/home/pat\\Downloads".
+        let expected: Vec<PathBuf> = [
+            "/home/pat/Downloads",
+            "/home/pat/Desktop",
+            "/home/pat/Documents",
+            "/var/tmp",
+            "/home/pat/.config/autostart",
+            "/home/pat/Library/LaunchAgents",
+        ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(roots, expected);
 
         let no_tmpdir = env_of(&[("HOME", "/home/pat")]);
         let roots = quick_roots_from(false, &no_tmpdir, &|_| true);
@@ -1790,6 +1799,16 @@ mod tests {
         let same = env_of(&[("HOME", "/h"), ("TMPDIR", "/h/Downloads")]);
         let roots = quick_roots_from(false, &same, &|_| true);
         assert_eq!(roots.iter().filter(|p| p.as_path() == Path::new("/h/Downloads")).count(), 1);
+    }
+
+    #[test]
+    fn same_path_ignores_a_trailing_separator_and_the_separator_style() {
+        assert!(same_path(Path::new("/h/Downloads/"), Path::new("/h/Downloads")));
+        assert!(!same_path(Path::new("/h/Downloads"), Path::new("/h/Desktop")));
+        if cfg!(windows) {
+            assert!(same_path(Path::new("/h\\Downloads"), Path::new("/h/Downloads")));
+            assert!(same_path(Path::new(r"C:\Users\Pat"), Path::new(r"c:\users\pat\")));
+        }
     }
 
     #[test]
