@@ -1420,7 +1420,10 @@ mod tests {
         assert_eq!(report.stop_reason, StopReason::Completed);
     }
 
-    #[cfg(unix)]
+    // Not macOS: its file systems (APFS, HFS+) refuse to create a file whose name
+    // is not valid UTF-8 (error 92, "Illegal byte sequence"), so there is no such
+    // name to scan there. Linux file systems accept any bytes but "/" and NUL.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_name_that_is_not_valid_unicode_does_not_break_the_report() {
         use std::ffi::OsStr;
