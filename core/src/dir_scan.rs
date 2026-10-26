@@ -782,13 +782,15 @@ impl<'a> Run<'a> {
             // Stable order: reproducible reports, and progress that reads sensibly.
             entries.sort_by_key(|entry| entry.file_name());
 
-            // One listing per folder, and the ransomware-behavior score for the
-            // whole folder is computed once from it.
-            let names: Vec<String> = entries
+            // One listing per folder, and what its files say about ransomware
+            // behavior is worked out once from it. Only regular files count;
+            // subfolder names are not evidence.
+            let file_names: Vec<String> = entries
                 .iter()
+                .filter(|e| e.file_type().is_ok_and(|kind| kind.is_file()))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect();
-            let dir_score = dir_behavior::score_from_names(&names);
+            let behavior = dir_behavior::FolderBehavior::from_names(&file_names);
             let dir_is_volume_root = (self.is_volume_root)(&dir);
 
             let mut subdirs = Vec::new();
@@ -816,7 +818,7 @@ impl<'a> Run<'a> {
                         subdirs.push(entry.path());
                     }
                 } else if file_type.is_file() {
-                    self.submit_file(entry, &name, dir_score);
+                    self.submit_file(entry, &name, behavior.score_for(&name));
                 } else {
                     self.report.skipped_links_or_special += 1;
                 }
@@ -1384,6 +1386,35 @@ mod tests {
             )
         );
         assert!(report.findings.iter().all(|f| f.path.contains("locked")));
+    }
+
+    #[test]
+    fn a_python_package_folder_is_not_scored_as_ransomware_aftermath() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "README.txt", b"This directory exists so that third party packages can be installed here.");
+        for i in 0..5 {
+            fs::create_dir_all(dir.path().join(format!("pkg{i}-1.0.dist-info"))).unwrap();
+        }
+        write(dir.path(), "six.py", b"eval(x)");
+
+        let report = scan(dir.path(), &opts(false), &SignatureSet::new());
+        let flagged: Vec<&str> = report.findings.iter().map(|f| f.path.as_str()).collect();
+        assert!(flagged.is_empty(), "wrongly flagged: {flagged:?}");
+        assert_eq!(report.scanned, 2);
+    }
+
+    #[test]
+    fn a_clean_file_next_to_a_ransomware_cluster_is_not_flagged() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "locked/README.txt", b"pay us");
+        for i in 0..5 {
+            write(dir.path(), &format!("locked/doc{i}.xyz123"), b"x");
+        }
+        write(dir.path(), "locked/main.py", b"print(1)");
+
+        let report = scan(dir.path(), &opts(true), &SignatureSet::new());
+        assert_eq!(report.findings.len(), 6, "the note and the five cluster files");
+        assert!(report.findings.iter().all(|f| !f.path.ends_with("main.py")));
     }
 
     // --- the report ---

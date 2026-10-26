@@ -79,11 +79,11 @@ pub fn score_file(
     score_impl(file_name, content, signatures, rules, path, None, None)
 }
 
-/// Same as [`score_file`] for a file on disk, but with the folder's
-/// ransomware-behavior score supplied by the caller (see
-/// `dir_behavior::score_from_names`). A scanner walking a folder computes it
-/// once per folder; without this, every file triggers a fresh read of its whole
-/// folder, which is quadratic in the number of files per folder.
+/// Same as [`score_file`] for a file on disk, but with the ransomware-behavior
+/// score for this file supplied by the caller (see
+/// `dir_behavior::FolderBehavior::score_for`). A scanner walking a folder
+/// analyses the folder once; without this, every file triggers a fresh read of
+/// its whole folder, which is quadratic in the number of files per folder.
 pub fn score_file_in_directory(
     file_name: &str,
     content: &[u8],
