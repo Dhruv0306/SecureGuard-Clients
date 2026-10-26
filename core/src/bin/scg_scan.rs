@@ -1,9 +1,12 @@
 use clap::{ Parser, Subcommand };
+use secureguard_core::dir_scan::{ self, Progress, ScanOptions, ScanReport, StopReason };
 use secureguard_core::hash_match::SignatureSet;
 use secureguard_core::yara_scan::RuleSet;
 use secureguard_core::{ scan_file, signature_sync, storage, DEFAULT_RULES };
+use std::io::IsTerminal;
 use std::path::{ Path, PathBuf };
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 
 /// SecureGuard detection core CLI. Used both for manual testing and as the
 /// harness the corpus/cross-engine validation jobs invoke.
@@ -38,6 +41,53 @@ enum Command {
         #[arg(long, default_value = "secureguard.db")]
         db: PathBuf,
     },
+    /// Scan a folder, the quick-scan places (--quick), or everything (--full or
+    /// --system), and print a report.
+    ///
+    /// A developer and diagnostic tool: the desktop app has the same scan
+    /// built in. Exit code 0 means the scan ran, not that nothing was found;
+    /// 1 means it could not run (bad path, unreadable database).
+    #[command(
+        group(
+            clap::ArgGroup::new("target").required(true).args(["path", "system", "quick", "full"])
+        )
+    )]
+    ScanDir {
+        /// Folder to scan. Give exactly one of this, --quick, --full or --system.
+        path: Option<PathBuf>,
+
+        /// Include subfolders.
+        #[arg(long)]
+        recursive: bool,
+
+        /// Scan every fixed drive (Windows) or `/`, stopping after 5 minutes.
+        /// Always includes subfolders.
+        #[arg(long)]
+        system: bool,
+
+        /// Scan the places malware usually lands (Downloads, Desktop, Documents,
+        /// the temp folder, startup folders), stopping after 5 minutes.
+        #[arg(long)]
+        quick: bool,
+
+        /// Scan the quick-scan places first and then every fixed drive, with no
+        /// time limit.
+        #[arg(long)]
+        full: bool,
+
+        /// Print the whole report as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+
+        /// Scan threads (1 scans on the main thread). Default: half the cores, 1 to 8.
+        #[arg(long)]
+        workers: Option<usize>,
+
+        /// Path to the local signature database; non-clean results are
+        /// recorded to its history.
+        #[arg(long, default_value = "secureguard.db")]
+        db: PathBuf,
+    },
     /// Fetch and persist known-malware signatures from the configured feed(s).
     /// Meant to be invoked periodically by the OS's own scheduler (cron,
     /// Task Scheduler), not run continuously, see
@@ -60,8 +110,148 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Scan { path, json, db } => run_scan(&path, json, &db),
+        Command::ScanDir { path, recursive, system, quick, full, json, workers, db } =>
+            run_scan_dir(path.as_deref(), recursive, system, quick, full, json, workers, &db),
         Command::Sync { db, feed_url } => run_sync(&db, &feed_url),
     }
+}
+
+fn stop_reason_text(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::Completed => "completed",
+        StopReason::Cancelled => "cancelled",
+        StopReason::TimeBudget => "stopped at the time limit",
+        StopReason::FindingsCap => "stopped at the findings limit",
+    }
+}
+
+fn print_report(report: &ScanReport) {
+    println!(
+        "Scanned {} files in {:.1} s ({})",
+        report.scanned,
+        (report.elapsed_ms as f64) / 1000.0,
+        stop_reason_text(report.stop_reason)
+    );
+    println!(
+        "  clean {}, suspicious {}, malicious {}",
+        report.clean, report.suspicious, report.malicious
+    );
+    if report.reused_results > 0 {
+        println!("  {} results reused from identical files", report.reused_results);
+    }
+    println!(
+        "  skipped: {} excluded, {} too large, {} links or special files, {} unreadable files, {} unreadable folders",
+        report.skipped_excluded,
+        report.skipped_too_large,
+        report.skipped_links_or_special,
+        report.unreadable_files,
+        report.unreadable_dirs
+    );
+    if !report.findings.is_empty() {
+        println!("Findings:");
+        for finding in &report.findings {
+            let threat = finding.result.threat_type.as_deref().unwrap_or("-");
+            println!(
+                "  {} ({}) {} [{}]",
+                finding.result.verdict,
+                finding.result.score,
+                finding.path,
+                threat
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scan_dir(
+    path: Option<&Path>,
+    recursive: bool,
+    system: bool,
+    quick: bool,
+    full: bool,
+    json: bool,
+    workers: Option<usize>,
+    db: &Path
+) -> ExitCode {
+    if let Some(path) = path {
+        if !path.is_dir() {
+            eprintln!("{} is not a folder", path.display());
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let rules = match RuleSet::compile(DEFAULT_RULES) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("failed to compile rule set: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let conn = match storage::open(&db.to_string_lossy()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("failed to open signature database at {}: {e}", db.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let signatures = match SignatureSet::load_from_cache(&conn) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to load signatures from {}: {e}", db.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (roots, mut options) = if quick {
+        (dir_scan::quick_scan_roots(), ScanOptions::quick())
+    } else if full {
+        (dir_scan::full_scan_roots(), ScanOptions::full())
+    } else if system {
+        (dir_scan::system_roots(), ScanOptions::system())
+    } else {
+        (vec![path.expect("clap requires a target").to_path_buf()], ScanOptions::directory(recursive))
+    };
+    if roots.is_empty() {
+        eprintln!("none of the standard folders to scan were found on this machine");
+        return ExitCode::FAILURE;
+    }
+    if let Some(workers) = workers {
+        options.workers = workers;
+    }
+
+    // Progress is for a person watching: only on a terminal, never mixed into
+    // --json output. Ctrl+C simply ends the process; the desktop app is where
+    // cancel is wired up.
+    let show_progress = !json && std::io::stderr().is_terminal();
+    let cancel = AtomicBool::new(false);
+    let mut on_progress = |p: &Progress| {
+        if show_progress {
+            eprint!("\r{} files scanned, {} flagged        ", p.scanned, p.findings);
+        }
+    };
+    let report = dir_scan::scan_roots(&roots, &options, &signatures, &rules, &cancel, &mut on_progress);
+    if show_progress {
+        eprintln!();
+    }
+
+    // History gets the non-clean results only, in one transaction.
+    let flagged: Vec<_> = report.findings.iter().map(|f| f.result.clone()).collect();
+    if let Err(e) = storage::record_scans(&conn, &flagged) {
+        eprintln!("warning: failed to record scan history: {e}");
+    }
+
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                eprintln!("failed to serialize report: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        print_report(&report);
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_scan(path: &Path, json: bool, db: &Path) -> ExitCode {

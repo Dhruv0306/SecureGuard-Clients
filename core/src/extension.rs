@@ -169,12 +169,44 @@ pub fn check_extension_masquerade(extension: &str, header: &[u8]) -> i32 {
     }
 }
 
-/// Ported verbatim from SecurityServiceImpl.isExecutableLikeForEntropy: gates
-/// entropy scoring to files that already look executable (by extension or
-/// real header bytes), so an ordinary .zip/.jpg/encrypted backup isn't
-/// penalized just for being naturally high-entropy.
+/// Formats that are compressed by design, so their entropy says nothing about
+/// packing. Both are on SUSPICIOUS_EXTENSIONS (a .jar can be run, an .msi
+/// installs software), which in the Java engine switched entropy scoring on
+/// and flagged every jar and installer package on a machine. Deliberate
+/// departure from the Java engine; see docs/java-engine-false-positive-fixes.md.
+pub const COMPRESSED_CONTAINER_EXTENSIONS: &[&str] = &[".jar", ".msi"];
+
+/// Adapted from SecurityServiceImpl.isExecutableLikeForEntropy: gates entropy
+/// scoring to files that already look executable (by extension or real header
+/// bytes), so an ordinary .zip/.jpg/encrypted backup isn't penalized just for
+/// being naturally high-entropy. Unlike the Java engine, a compressed
+/// container (.jar, .msi) is not "executable-like" by extension alone: it is
+/// still checked if its header is really a Windows or Linux executable.
 pub fn is_executable_like_for_entropy(extension: &str, header: &[u8]) -> bool {
-    SUSPICIOUS_EXTENSIONS.contains(&extension) || contains_suspicious_bytes(header)
+    if contains_suspicious_bytes(header) {
+        return true;
+    }
+    SUSPICIOUS_EXTENSIONS.contains(&extension) && !COMPRESSED_CONTAINER_EXTENSIONS.contains(&extension)
+}
+
+/// True for a native library whose header is exactly what its name promises:
+/// an ELF file named .so, .ko, .o or .node (or a versioned .so.1.2), or a
+/// Windows executable named .pyd or .node. These are not disguised; flagging
+/// them as extension masquerade made every Linux library bundled inside a
+/// Windows program (debugpy ships several) look malicious. Deliberate
+/// departure from the Java engine. `file_name_lower` is the lowercased name.
+pub fn is_expected_native_library(file_name_lower: &str, header: &[u8]) -> bool {
+    let is_elf = header.len() >= 4 && header[..4] == [0x7f, b'E', b'L', b'F'];
+    let is_pe = header.len() >= 2 && header[..2] == *b"MZ";
+    let extension = get_file_extension(file_name_lower);
+    let elf_name =
+        extension == ".so" ||
+        extension == ".ko" ||
+        extension == ".o" ||
+        extension == ".node" ||
+        file_name_lower.contains(".so.");
+    let pe_name = extension == ".pyd" || extension == ".node";
+    (is_elf && elf_name) || (is_pe && pe_name)
 }
 
 #[cfg(test)]
@@ -211,5 +243,40 @@ mod tests {
         assert!(is_executable_like_for_entropy(".bin", b"anything"));
         assert!(is_executable_like_for_entropy(".txt", b"MZ\x90\x00"));
         assert!(!is_executable_like_for_entropy(".txt", b"just text"));
+    }
+
+    #[test]
+    fn compressed_containers_are_not_executable_like_unless_the_header_says_so() {
+        let text = b"PK\x03\x04 not an exe";
+        assert!(!is_executable_like_for_entropy(".jar", text));
+        assert!(!is_executable_like_for_entropy(".msi", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"));
+        // Still gated on when the bytes really are a Windows or Linux executable.
+        assert!(is_executable_like_for_entropy(".jar", b"MZ\x90\x00"));
+        assert!(is_executable_like_for_entropy(".jar", b"\x7fELF\x02\x01\x01\x00"));
+        // Other executable-looking extensions are unchanged.
+        assert!(is_executable_like_for_entropy(".exe", b"anything"));
+        assert!(is_executable_like_for_entropy(".dll", b"anything"));
+        assert!(!is_executable_like_for_entropy(".dat", b"anything"));
+    }
+
+    #[test]
+    fn native_libraries_with_a_matching_header_are_expected() {
+        let elf = b"\x7fELF\x02\x01\x01\x00";
+        for name in ["libfoo.so", "libfoo.so.1", "libfoo.so.1.2.3", "mod.ko", "x.o", "addon.node"] {
+            assert!(is_expected_native_library(name, elf), "{name} with an ELF header");
+        }
+        assert!(is_expected_native_library("module.pyd", b"MZ\x90\x00"));
+        assert!(is_expected_native_library("addon.node", b"MZ\x90\x00"));
+    }
+
+    #[test]
+    fn a_disguised_executable_is_still_not_expected() {
+        let elf = b"\x7fELF\x02\x01\x01\x00";
+        let pe = b"MZ\x90\x00\x03\x00\x00\x00";
+        assert!(!is_expected_native_library("report.pdf", elf));
+        assert!(!is_expected_native_library("photo.jpg", pe));
+        assert!(!is_expected_native_library("libfoo.so", pe), "a Windows executable named .so");
+        assert!(!is_expected_native_library("module.pyd", elf), "a Linux executable named .pyd");
+        assert!(!is_expected_native_library("libfoo.so", b"plain text"));
     }
 }

@@ -29,10 +29,27 @@ cargo run --bin scg-scan -- scan path/to/file
 cargo run --bin scg-scan -- scan --json path/to/file      # machine-readable output
 cargo run --bin scg-scan -- scan --db mydb.db path/to/file  # custom signature DB location
 
+cargo run --bin scg-scan -- scan-dir path/to/folder --recursive           # scan a folder, summary on stdout
+cargo run --bin scg-scan -- scan-dir path/to/folder --recursive --json    # the full report as JSON
+cargo run --bin scg-scan -- scan-dir --system                             # every fixed drive, stops at 5 minutes
+cargo run --release --bin scg-scan -- scan-dir --quick                    # Downloads, Desktop, Documents, temp and startup folders, stops at 5 minutes
+cargo run --release --bin scg-scan -- scan-dir --full                     # those first, then every fixed drive, no time limit
+cargo run --release --bin scg-scan -- scan-dir path --recursive --workers 4   # number of scan threads
+
 cargo run --bin scg-scan -- sync                          # fetch from MalwareBazaar, default DB
 cargo run --bin scg-scan -- sync --db mydb.db             # sync into a specific DB
 cargo run --bin scg-scan -- sync --feed-url https://example.com/feed.txt  # override the feed(s)
 ```
+
+`scan-dir` walks a folder with the same engine and prints a report; it records only
+suspicious and malicious results to the history database. Exit code 0 means the scan ran, not
+that nothing was found. It is a developer and diagnostic tool: the desktop app has the same scan
+built in. Use `--release` for real scans: a debug build is about ten times slower. Files are
+scored on a pool of worker threads (default: half the cores, 1 to 8), and a file identical to one
+already scanned in the same run (same bytes, name and folder score) reuses that result.
+Symlinks and junctions are not followed, hidden files and a few system folders
+are skipped and counted, files over 100 MB are counted but not scanned (see
+docs/phase5-2-5-3-design-plan.md).
 
 `sync` is a one-shot fetch-and-persist pass, not a background service. Nothing in this
 crate runs continuously yet, so periodic syncing is left to the OS's own scheduler (cron,

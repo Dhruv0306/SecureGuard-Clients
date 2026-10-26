@@ -18,22 +18,17 @@ fn looks_like_ransom_note(file_name_lowercase: &str) -> bool {
         file_name_lowercase.contains("decrypt_instructions")
 }
 
-/// `path` is the file being scanned; its parent directory's other entries
-/// are listed once per call. Returns the score contribution (0 or
-/// SCORE_RANSOMWARE_DIR_BEHAVIOR).
-pub fn score_ransomware_directory_behavior(path: &Path) -> i32 {
-    let Some(parent) = path.parent() else {
-        return 0;
-    };
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return 0;
-    };
-
+/// The score for a directory, from the names of the entries in it. Pure: no
+/// filesystem access. The result depends only on the directory, never on which
+/// file in it is being scanned, so a scanner that walks a folder can compute it
+/// once from the listing it already has instead of re-reading the folder for
+/// every file. Returns 0 or SCORE_RANSOMWARE_DIR_BEHAVIOR.
+pub fn score_from_names<I, S>(names: I) -> i32 where I: IntoIterator<Item = S>, S: AsRef<str> {
     let mut has_ransom_note = false;
     let mut unknown_ext_counts: HashMap<String, i32> = HashMap::new();
 
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_lowercase();
+    for name in names {
+        let name = name.as_ref().to_lowercase();
 
         if looks_like_ransom_note(&name) {
             has_ransom_note = true;
@@ -58,6 +53,31 @@ pub fn score_ransomware_directory_behavior(path: &Path) -> i32 {
         crate::scoring::SCORE_RANSOMWARE_DIR_BEHAVIOR
     } else {
         0
+    }
+}
+
+/// Lists `dir` and scores it with [`score_from_names`]. An unreadable
+/// directory scores 0.
+pub fn directory_behavior_score(dir: &Path) -> i32 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    score_from_names(names)
+}
+
+/// `path` is the file being scanned; its parent directory's other entries
+/// are listed once per call. Returns the score contribution (0 or
+/// SCORE_RANSOMWARE_DIR_BEHAVIOR). Scanners that visit many files in the same
+/// folder should use [`directory_behavior_score`] or [`score_from_names`]
+/// once per folder instead.
+pub fn score_ransomware_directory_behavior(path: &Path) -> i32 {
+    match path.parent() {
+        Some(parent) => directory_behavior_score(parent),
+        None => 0,
     }
 }
 
@@ -113,5 +133,37 @@ mod tests {
         // with no cluster of 5+ shared unknown extensions, this must still
         // score zero, an ordinary project directory is not ransomware.
         assert_eq!(score_ransomware_directory_behavior(&target), 0);
+    }
+
+    #[test]
+    fn score_from_names_matches_the_directory_reading_version() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("README.txt"), b"pay us").unwrap();
+        for i in 0..5 {
+            fs::write(dir.path().join(format!("doc{i}.xyz123")), b"x").unwrap();
+        }
+
+        let from_names = score_from_names([
+            "README.txt", "doc0.xyz123", "doc1.xyz123", "doc2.xyz123", "doc3.xyz123", "doc4.xyz123",
+        ]);
+        assert_eq!(from_names, crate::scoring::SCORE_RANSOMWARE_DIR_BEHAVIOR);
+        assert_eq!(directory_behavior_score(dir.path()), from_names);
+        assert_eq!(score_ransomware_directory_behavior(&dir.path().join("doc0.xyz123")), from_names);
+    }
+
+    #[test]
+    fn score_from_names_is_case_insensitive_and_needs_five_matching_extensions() {
+        assert_eq!(score_from_names(["HOW_TO_DECRYPT.TXT", "A.XYZ123", "B.xyz123", "c.Xyz123", "d.xyz123"]), 0);
+        assert_eq!(
+            score_from_names(["HOW_TO_DECRYPT.TXT", "A.XYZ123", "B.xyz123", "c.Xyz123", "d.xyz123", "e.xyz123"]),
+            crate::scoring::SCORE_RANSOMWARE_DIR_BEHAVIOR
+        );
+        assert_eq!(score_from_names(Vec::<String>::new()), 0);
+    }
+
+    #[test]
+    fn an_unreadable_or_missing_directory_scores_zero() {
+        let dir = tempdir().unwrap();
+        assert_eq!(directory_behavior_score(&dir.path().join("does-not-exist")), 0);
     }
 }

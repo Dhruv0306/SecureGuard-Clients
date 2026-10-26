@@ -3,6 +3,7 @@ use crate::extension::{
     check_extension_masquerade,
     get_file_extension,
     is_executable_like_for_entropy,
+    is_expected_native_library,
     RANSOMWARE_EXTENSIONS,
     TROJAN_NAME_SIGNATURES,
 };
@@ -11,7 +12,7 @@ use crate::rootkit::score_rootkit;
 use crate::text_patterns::{ contains_ransomware_pattern, score_text_patterns };
 use crate::types::{ ScanResult, ScoreContribution, Verdict };
 use crate::yara_scan::RuleSet;
-use crate::zip_scan::{ scan_zip, ZipCheck };
+use crate::zip_scan::{ is_zip_name, scan_zip, ZipCheck };
 use std::path::Path;
 
 /// Ported from SecurityServiceImpl. An exact known-malware hash match or
@@ -28,7 +29,14 @@ pub const SCORE_ROOTKIT_TEXT: i32 = 20;
 pub const SCORE_TROJAN_NAME: i32 = 35;
 pub const SCORE_STRONG_PATTERN: i32 = 30;
 pub const SCORE_WEAK_PATTERN: i32 = 8;
-pub const MAX_WEAK_PATTERN_SCORE: i32 = 32;
+/// Weak text patterns (eval, fromCharCode, document.write and similar) appear in
+/// ordinary bundled JavaScript, build scripts and installers. Capped just below
+/// THRESHOLD_SUSPICIOUS so they can add to a verdict but never produce one on
+/// their own. The Java engine caps at 32, which is enough to flag any bundled
+/// script by itself; see docs/java-engine-false-positive-fixes.md.
+pub const MAX_WEAK_PATTERN_SCORE: i32 = THRESHOLD_SUSPICIOUS - 1;
+// Weak patterns alone must never be enough to flag a file.
+const _: () = assert!(MAX_WEAK_PATTERN_SCORE < THRESHOLD_SUSPICIOUS);
 pub const SCORE_HIGH_ENTROPY: i32 = 30;
 
 /// Ported from SecurityServiceImpl. A file crossing this total is convicted
@@ -58,7 +66,52 @@ pub fn score_file(
     rules: &RuleSet,
     path: Option<&Path>
 ) -> ScanResult {
-    let sha256 = crate::hash_match::sha256_hex(content);
+    score_impl(file_name, content, signatures, rules, path, None, None)
+}
+
+/// Same as [`score_file`] for a file on disk, but with the folder's
+/// ransomware-behavior score supplied by the caller (see
+/// `dir_behavior::score_from_names`). A scanner walking a folder computes it
+/// once per folder; without this, every file triggers a fresh read of its whole
+/// folder, which is quadratic in the number of files per folder.
+pub fn score_file_in_directory(
+    file_name: &str,
+    content: &[u8],
+    signatures: &SignatureSet,
+    rules: &RuleSet,
+    path: &Path,
+    directory_score: i32
+) -> ScanResult {
+    score_impl(file_name, content, signatures, rules, Some(path), Some(directory_score), None)
+}
+
+/// Like [`score_file_in_directory`], for a caller that has already computed the
+/// content's SHA-256 (lowercase hex) and does not want it computed again.
+pub fn score_file_in_directory_with_hash(
+    file_name: &str,
+    content: &[u8],
+    signatures: &SignatureSet,
+    rules: &RuleSet,
+    path: &Path,
+    directory_score: i32,
+    sha256: &str
+) -> ScanResult {
+    score_impl(file_name, content, signatures, rules, Some(path), Some(directory_score), Some(sha256))
+}
+
+fn score_impl(
+    file_name: &str,
+    content: &[u8],
+    signatures: &SignatureSet,
+    rules: &RuleSet,
+    path: Option<&Path>,
+    directory_score: Option<i32>,
+    sha256: Option<&str>
+) -> ScanResult {
+    let sha256 = match sha256 {
+        Some(hash) => hash.to_string(),
+        None => crate::hash_match::sha256_hex(content),
+    };
 
     // Fast path: an exact known-malware hash match or the EICAR test file
     // short-circuits everything else, matching the Java engine's ordering.
@@ -96,7 +149,11 @@ pub fn score_file(
     // analysis of the archive contents, matching the Java engine's early
     // return for this case. Only computed once, reused below for the
     // suspicious-entry contribution if it's not a bomb.
-    let zip_check = scan_zip(content);
+    let zip_check = if is_zip_name(&file_name.to_lowercase()) {
+        scan_zip(content)
+    } else {
+        ZipCheck::NotAZip
+    };
     if let ZipCheck::LikelyZipBomb = zip_check {
         return ScanResult {
             file_name: file_name.to_string(),
@@ -119,7 +176,11 @@ pub fn score_file(
 
     // 1. Extension masquerade: executable header behind a non-executable,
     // non-suspicious extension.
-    let masquerade_score = check_extension_masquerade(&extension, header);
+    let masquerade_score = if is_expected_native_library(&file_name.to_lowercase(), header) {
+        0
+    } else {
+        check_extension_masquerade(&extension, header)
+    };
     if masquerade_score > 0 {
         score += masquerade_score;
         contributions.push(ScoreContribution {
@@ -165,7 +226,9 @@ pub fn score_file(
 
     // 5. Ransomware directory behavior, only meaningful with a real path.
     if let Some(p) = path {
-        let dir_score = crate::dir_behavior::score_ransomware_directory_behavior(p);
+        let dir_score = directory_score.unwrap_or_else(||
+            crate::dir_behavior::score_ransomware_directory_behavior(p)
+        );
         if dir_score > 0 {
             score += dir_score;
             contributions.push(ScoreContribution {
@@ -464,5 +527,131 @@ mod tests {
         let result = score_file("suspect.bin", content, &SignatureSet::new(), &rules, None);
         assert!(result.score >= SCORE_STRONG_PATTERN);
         assert_ne!(result.verdict, Verdict::Clean);
+    }
+
+    #[test]
+    fn a_supplied_directory_score_replaces_reading_the_folder() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("README.txt"), b"pay us").unwrap();
+        for i in 0..5 {
+            fs::write(dir.path().join(format!("doc{i}.xyz123")), b"x").unwrap();
+        }
+        let path = dir.path().join("doc0.xyz123");
+        let signatures = SignatureSet::new();
+        let rules = empty_rules();
+
+        let read_it = score_file("doc0.xyz123", b"x", &signatures, &rules, Some(&path));
+        let supplied = score_file_in_directory(
+            "doc0.xyz123", b"x", &signatures, &rules, &path, SCORE_RANSOMWARE_DIR_BEHAVIOR
+        );
+        assert!(read_it.contributions.iter().any(|c| c.reason == "RANSOMWARE_DIRECTORY_BEHAVIOR"));
+        assert_eq!(read_it.score, supplied.score);
+
+        // Proof the supplied value is what is used: 0 wins even though the
+        // folder on disk would score.
+        let overridden = score_file_in_directory("doc0.xyz123", b"x", &signatures, &rules, &path, 0);
+        assert!(!overridden.contributions.iter().any(|c| c.reason == "RANSOMWARE_DIRECTORY_BEHAVIOR"));
+    }
+
+    // --- false-positive fixes (docs/java-engine-false-positive-fixes.md) ---
+
+    fn all_byte_values(copies: usize) -> Vec<u8> {
+        // Entropy of exactly 8 bits per byte.
+        (0..copies).flat_map(|_| 0u8..=255).collect()
+    }
+
+    fn masquerade_flagged(result: &ScanResult) -> bool {
+        result.contributions.iter().any(|c| c.reason.starts_with("EXTENSION_MASQUERADE"))
+    }
+
+    #[test]
+    fn a_jar_or_msi_is_not_flagged_just_for_being_compressed() {
+        let content = all_byte_values(16);
+        for name in ["library.jar", "Setup.msi", "LIBRARY.JAR"] {
+            let result = score_file(name, &content, &SignatureSet::new(), &empty_rules(), None);
+            assert_eq!(result.verdict, Verdict::Clean, "{name}: score {}", result.score);
+        }
+        // The same bytes under an executable-looking extension are still flagged.
+        let result = score_file("packed.bin", &content, &SignatureSet::new(), &empty_rules(), None);
+        assert_eq!(result.verdict, Verdict::Suspicious);
+    }
+
+    #[test]
+    fn a_real_executable_named_jar_is_still_checked_for_entropy() {
+        let mut content = b"MZ".to_vec();
+        content.extend(all_byte_values(16));
+        let result = score_file("fake.jar", &content, &SignatureSet::new(), &empty_rules(), None);
+        assert_eq!(result.verdict, Verdict::Suspicious);
+        assert!(result.contributions.iter().any(|c| c.reason.starts_with("HIGH_ENTROPY")));
+    }
+
+    #[test]
+    fn an_archive_full_of_executables_is_not_flagged_by_its_contents_alone() {
+        let names: Vec<String> = (0..30).map(|i| format!("driver{i}.dll")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        let zip = crate::zip_scan::tests::build_test_zip(&entries);
+
+        let result = score_file("drivers.zip", &zip, &SignatureSet::new(), &empty_rules(), None);
+        assert_eq!(result.verdict, Verdict::Clean, "score was {}", result.score);
+        let zip_points: Vec<i32> = result
+            .contributions
+            .iter()
+            .filter(|c| c.reason == "ZIP_CONTAINS_EXECUTABLE_ENTRY")
+            .map(|c| c.points)
+            .collect();
+        assert_eq!(zip_points, vec![crate::zip_scan::SCORE_ZIP_SUSPICIOUS_ENTRY], "scored once, not per entry");
+    }
+
+    #[test]
+    fn zip_analysis_follows_the_file_name_like_the_java_engine() {
+        let bomb = crate::zip_scan::tests::build_test_zip(&[("zeros.bin", &vec![0u8; 400_000])]);
+        let with_exe = crate::zip_scan::tests::build_test_zip(&[("setup.exe", b"x")]);
+        let has = |r: &ScanResult, reason: &str| r.contributions.iter().any(|c| c.reason == reason);
+
+        let as_zip = score_file("x.zip", &bomb, &SignatureSet::new(), &empty_rules(), None);
+        assert!(has(&as_zip, "ZIP_BOMB_LIMIT_EXCEEDED"));
+        let as_docx = score_file("report.docx", &bomb, &SignatureSet::new(), &empty_rules(), None);
+        assert!(!has(&as_docx, "ZIP_BOMB_LIMIT_EXCEEDED"), "a zip container that is not named .zip/.jar/.war is not analyzed");
+
+        let as_jar = score_file("x.jar", &with_exe, &SignatureSet::new(), &empty_rules(), None);
+        assert!(has(&as_jar, "ZIP_CONTAINS_EXECUTABLE_ENTRY"));
+        let as_docx = score_file("x.docx", &with_exe, &SignatureSet::new(), &empty_rules(), None);
+        assert!(!has(&as_docx, "ZIP_CONTAINS_EXECUTABLE_ENTRY"));
+    }
+
+    #[test]
+    fn weak_patterns_alone_never_flag_a_file_but_a_strong_one_still_does() {
+        let weak = b"eval(x); document.write(y); shell_exec(z); system(w); \
+                     passthru(v); base64_decode(u); runtime.exec(t);";
+        let result = score_file("bundle.js", weak, &SignatureSet::new(), &empty_rules(), None);
+        assert_eq!(result.verdict, Verdict::Clean, "weak patterns alone scored {}", result.score);
+        assert!(result.score > 0, "they should still count for something");
+
+        let mut with_strong = weak.to_vec();
+        with_strong.extend_from_slice(b" powershell -w hidden -Command whatever");
+        let result = score_file("bundle.js", &with_strong, &SignatureSet::new(), &empty_rules(), None);
+        assert_eq!(result.verdict, Verdict::Suspicious, "score was {}", result.score);
+    }
+
+    #[test]
+    fn an_elf_shared_library_is_not_extension_masquerade_but_a_disguised_one_is() {
+        let mut elf = b"\x7fELF\x02\x01\x01\x00".to_vec();
+        elf.extend(std::iter::repeat_n(0u8, 64));
+
+        for name in ["libfoo.so", "libfoo.so.1.2.3", "mod.ko", "addon.node"] {
+            let result = score_file(name, &elf, &SignatureSet::new(), &empty_rules(), None);
+            assert!(!masquerade_flagged(&result), "{name} wrongly flagged");
+            assert_eq!(result.verdict, Verdict::Clean, "{name}");
+        }
+
+        let disguised = score_file("report.pdf", &elf, &SignatureSet::new(), &empty_rules(), None);
+        assert!(masquerade_flagged(&disguised));
+        assert_eq!(disguised.verdict, Verdict::Malicious);
+
+        let mut pe = b"MZ\x90\x00".to_vec();
+        pe.extend(std::iter::repeat_n(0u8, 64));
+        let windows_exe_named_so = score_file("libfoo.so", &pe, &SignatureSet::new(), &empty_rules(), None);
+        assert!(masquerade_flagged(&windows_exe_named_so));
     }
 }

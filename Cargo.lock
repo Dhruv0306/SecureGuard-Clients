@@ -3728,6 +3728,7 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "ureq",
+ "windows-sys 0.61.2",
  "yara-x",
  "zip",
 ]

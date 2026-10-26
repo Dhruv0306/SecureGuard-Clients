@@ -23,6 +23,14 @@ decisions is in [phase5-3-spike-results.md](phase5-3-spike-results.md) and
 | D4 | Windows system scan covers fixed drives only |
 | D5 | Single-threaded scanning first; measure before adding parallelism |
 | D6 | Run core's tests on Windows and macOS in CI |
+| D7 | System folders are skipped by whole name, and only directly under a filesystem root |
+| D8 | One skip list for both scan modes, not Java's two |
+| D9 | Hidden dot-files stay excluded as in Java; an "include hidden" switch can come later |
+| D10 | A small `scg-scan scan-dir` developer command ships with the engine; the user feature is in the app (5.2b) |
+| D11 | Fix false positives in the Rust engine now; document the same changes for the Java engine (docs/java-engine-false-positive-fixes.md) |
+| D12 | In the app: a Quick scan (priority places) and a Full scan (no time limit); the CLI `--system` keeps its 5-minute limit |
+| D13 | Scan on a bounded pool of worker threads |
+| D14 | Reuse the result for an identical file within one scan |
 
 ## What the Java source shows
 
@@ -50,36 +58,49 @@ directory-scan exclusions.
 ### Core: `core/src/dir_scan.rs`
 
 ```rust
-pub struct ScanOptions { pub recursive: bool, pub mode: ScanMode, pub limits: ScanLimits }
-pub enum ScanMode { Directory, System }
+pub struct ScanOptions { pub recursive: bool, pub limits: ScanLimits, pub min_progress_interval: Duration }
+impl ScanOptions {
+    pub fn directory(recursive: bool) -> Self;   // no time limit; the user can cancel
+    pub fn system() -> Self;                     // recursive, 5-minute budget
+}
 pub struct ScanLimits {
     pub max_file_bytes: u64,            // 100 MB
     pub max_duration: Option<Duration>, // system scan: 5 minutes
-    pub max_findings: usize,            // 2,000
+    pub max_findings: usize,            // 2,000, at least 1
 }
-pub struct FileFinding { pub path: PathBuf, pub result: ScanResult }   // non-clean only
+pub struct FileFinding { pub path: String, pub result: ScanResult }   // non-clean only; lossy path
 pub struct ScanReport {
     pub findings: Vec<FileFinding>,
     pub scanned: u64, pub clean: u64, pub suspicious: u64, pub malicious: u64,
-    pub skipped_excluded: u64, pub skipped_too_large: u64,
-    pub unreadable_files: u64, pub unreadable_dirs: u64, pub not_regular: u64,
-    pub stop_reason: StopReason,        // Completed | Cancelled | TimeBudget | FindingsCap
-    pub elapsed: Duration,
+    pub skipped_excluded: u64, pub skipped_too_large: u64, pub skipped_links_or_special: u64,
+    pub unreadable_files: u64, pub unreadable_dirs: u64,
+    pub stop_reason: StopReason,        // completed | cancelled | time_budget | findings_cap
+    pub elapsed_ms: u64,
 }
-pub struct Progress { pub current_dir: PathBuf, pub scanned: u64, pub findings: u64 }
+pub struct Progress { pub current_dir: String, pub scanned: u64, pub findings: u64 }
 
 pub fn scan_path(root: &Path, opts: &ScanOptions, signatures: &SignatureSet, rules: &RuleSet,
                  cancel: &AtomicBool, on_progress: &mut dyn FnMut(&Progress)) -> ScanReport;
+pub fn scan_roots(roots: &[PathBuf], /* same arguments */) -> ScanReport;   // one budget, one report
 pub fn system_roots() -> Vec<PathBuf>;   // Windows: fixed drives; Unix: "/"
 ```
+
+Built in Phase 5.2a (`core/src/dir_scan.rs`). Also added there: `storage::record_scans` (one
+transaction) and a `rowid` tie-break in `recent_scans`.
 
 Behavior:
 
 - **Walk.** Iterative, no recursion, one `read_dir` per folder. Uses
   `DirEntry::file_type()`, which does not follow links, so symlinks (and junctions, to be
   confirmed on Windows) are skipped. Only regular files are scanned.
-- **Skip lists.** Case-insensitive match on a whole folder name. Windows and Unix lists as in
-  Java; Unix adds `/proc`, `/sys`, `/dev` and `/run`.
+- **System folders.** Skipped only when the folder sits directly under a filesystem root and its
+  whole name matches (case-insensitive). Windows: `Windows`, `Program Files`,
+  `Program Files (x86)`, `ProgramData`, `$Recycle.Bin`, `System Volume Information`, `Recovery`,
+  `Config.Msi`, `Documents and Settings`. Elsewhere: `proc`, `sys`, `dev`, `run`. The platform
+  lists are separate, so a developer's `C:\dev` is never skipped. A folder the caller chose
+  explicitly is never skipped. A skipped folder counts once in `skipped_excluded`.
+- **Hidden files.** Names starting with `.`, `thumbs.db` and `desktop.ini` are skipped and counted
+  (files only, as in Java).
 - **Limits.** Checked per file and per folder entry: cancel flag, time budget, findings cap.
   A file over `max_file_bytes` is counted, not scanned.
 - **Per-directory work.** Split the ransomware directory check into "summarize this folder"
@@ -92,8 +113,11 @@ Behavior:
 
 ### CLI
 
-`scg-scan scan-dir <path> [--recursive] [--json]` and `scg-scan scan-dir --system [--json]`.
-Progress goes to stderr, the report to stdout.
+`scg-scan scan-dir <path> [--recursive] [--json] [--db <file>]` and
+`scg-scan scan-dir --system [--json] [--db <file>]`. A developer and diagnostic tool: the user
+feature is in the app. The report goes to stdout; a progress line goes to stderr only on a terminal
+and never with `--json`. Exit code 0 means the scan ran (a finding is not an error), 1 means it
+could not run. Non-clean results are recorded to the history database in one transaction.
 
 ### Desktop
 
@@ -121,6 +145,27 @@ Progress goes to stderr, the report to stdout.
 - Progress throttling with a fake clock.
 - A manual benchmark on a large tree, to confirm the per-folder fix.
 - CI: a Windows and macOS job for `core` (the Windows job already exists once PR 1 lands).
+
+## Phase 5.2 follow-up: detection quality and throughput (built)
+
+Measured in a release build on a developer's Windows machine: a system scan covered 11,508 files in
+301.7 s (about 38 files a second, one thread), flagged 528 files (4.6%), and never got past hidden
+folders in the user profile, so it never reached Desktop, Documents or Downloads. Nearly all
+flagged files were legitimate. The engine work that followed, all in `secureguard-core`:
+
+- **False positives (D11).** `.jar` and `.msi` are no longer entropy-checked by extension alone;
+  weak text patterns are capped below the suspicious threshold; an ELF `.so`/`.ko`/`.node` or a
+  Windows `.pyd`/`.node` with a matching header is not "extension masquerade"; zip suspicious-entry
+  points are added once and only for `.zip`, `.jar` and `.war` names, as in Java (the port added
+  them per entry for any zip-shaped file). See docs/java-engine-false-positive-fixes.md.
+- **Throughput (D13, D14).** A pool of worker threads (default half the cores, 1 to 8) with a
+  256 MB cap on file content held at once, and reuse of the result for an identical file. Re-run
+  the system scan in a release build to see the new rate.
+- **Targets (D12, core part).** `quick_scan_roots()`, `full_scan_roots()`, `ScanOptions::quick()`
+  and `full()`, and CLI `--quick` and `--full`.
+
+Still for 5.2b: the app commands and screens for Quick scan and Full scan, progress, cancel and
+results; running a full scan in the background; and wiring the worker count.
 
 ## Phase 5.3a: local network scan
 

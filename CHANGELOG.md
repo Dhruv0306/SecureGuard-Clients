@@ -7,7 +7,31 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Core: quick and full scan targets. `quick_scan_roots()` lists the places malware usually lands
+  (Downloads, Desktop, Documents, the temp folder, startup folders; only those that exist);
+  `full_scan_roots()` is those followed by every fixed drive, and a folder already scanned as an
+  earlier root is not scanned again. `ScanOptions::quick()` has a 5-minute limit,
+  `ScanOptions::full()` none. CLI: `scg-scan scan-dir --quick` and `--full`.
+- Core: scanning on a pool of worker threads (`ScanOptions::workers`, default half the cores, 1 to
+  8; CLI `--workers N`). The report is the same for any count. A 256 MB byte budget bounds the
+  file content held in memory at once.
+- Core: a file identical to one already scanned in the same run (same SHA-256, name and folder
+  score) reuses its result (`ScanReport::reused_results`, `ScanOptions::reuse_identical_results`).
+- Core: a directory and system scan engine (`secureguard_core::dir_scan`) with a cancel flag,
+  throttled progress, a findings cap, a time budget for system scans, and a report of what was
+  scanned, flagged and skipped. Symlinks and junctions are not followed; system folders are
+  skipped by name directly under a drive root; a folder chosen explicitly is never skipped.
+- CLI: `scg-scan scan-dir <path> [--recursive] [--json]` and `scg-scan scan-dir --system`.
+- Core: `storage::record_scans` records many results in one transaction.
+- CI: a macOS job runs the core tests.
+
 ### Changed
+- The ransomware directory heuristic is computed once per folder instead of re-reading the
+  folder for every file scanned (`dir_behavior::score_from_names`,
+  `scoring::score_file_in_directory`). Existing functions keep their behavior.
+- `recent_scans` breaks ties by insertion order, so newest-first is deterministic for rows
+  written in the same second.
 - Declared `rust-version` raised from 1.74 to 1.93 in `secureguard-core`,
   `secureguard-helper` and `secureguard-desktop`. The old value was never true for the
   committed `Cargo.lock`: `yara-x` and `wasmtime` require 1.93 and several other
@@ -16,6 +40,14 @@ project uses [Semantic Versioning](https://semver.org/).
   floor again fails CI instead of silently breaking older toolchains.
 
 ### Fixed
+- Detection: a system scan of a developer machine flagged about 4.6% of files, nearly all
+  legitimate. Four fixes (details and the Java follow-up in
+  `docs/java-engine-false-positive-fixes.md`): `.jar` and `.msi` are no longer penalized for
+  entropy because they are compressed by design; weak text patterns alone can no longer produce a
+  verdict (cap 32 to 24); an ELF `.so`/`.ko`/`.node` or a Windows `.pyd`/`.node` with a matching
+  header is no longer "extension masquerade"; and zip suspicious-entry points are added once, only
+  for `.zip`, `.jar` and `.war` names, as in the Java engine (the port added them per entry for
+  any zip-shaped file, so a driver archive scored 435 and was convicted).
 - Desktop: every Tauri command was a plain `fn`, so it ran on the main thread and
   blocked all other commands until it returned (including `sync_signatures_cmd`, which
   does network I/O). All six commands are now `async fn` and run on Tauri's blocking
