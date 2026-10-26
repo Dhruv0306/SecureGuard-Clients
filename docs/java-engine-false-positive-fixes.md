@@ -9,7 +9,11 @@ scan engine itself worked; the scoring rules did not hold up at that scale.
 
 The Rust engine (`secureguard-core`) has been fixed. The Java engine
 (`SecurityServiceImpl`, repository `Dhruv0306/Antivirus`) is **not changed yet** and still has
-the first three problems below. Line numbers refer to commit `0348cca` of that repository.
+the problems below. Line numbers refer to commit `0348cca` of that repository.
+
+A second measurement on 26/10/2026 (release build, after the first round) found 5 Malicious files
+in 57,000 scanned, all false positives, which led to fixes 4 and 5. Fixes 4 and 5 describe the
+Rust code; the Java method was not re-read for them, so check it before use.
 
 ## Fixed in Rust and still to do in Java
 
@@ -83,6 +87,48 @@ Windows executable named `.so`, or an ELF named `report.pdf`, must still be flag
 `libfoo.so`, `libfoo.so.1.2.3`, `mod.ko` and `addon.node` with an ELF header are CLEAN;
 `report.pdf` with an ELF header is MALICIOUS.
 
+### 4. The ransomware folder score is given to every file in the folder
+
+The heuristic (`scoreRansomwareDirectoryBehavior` in Java, `dir_behavior.rs` in Rust) adds 55 when
+a folder has a ransom-note-like name (`readme` with `txt`, `recovery`, `how_to_decrypt`, ...) and
+five entries that share an unfamiliar extension. It added the 55 to **every file** in the folder,
+and the Rust walker counted subfolder names as entries. Measured on a developer machine:
+
+| Folder | Why it qualified | Effect |
+|---|---|---|
+| Python `site-packages` | `README.txt` plus many `*.dist-info` folders | `six.py`: folder 55 + one weak pattern 8 = 63, MALICIOUS |
+| `reportlab/fonts` | `00readme.txt` plus 18 `.afm`, 18 `.pfb`, 5 `.ttf` files | every file in the folder scored 55 |
+
+Rust change: count regular files only, and give the score only to the files it is about: the
+note-like files and the files whose extension forms the cluster (`FolderBehavior::score_for`). A
+`.py` file next to them scores 0. Tests to add: a folder with `README.txt`, five `*.dist-info`
+subfolders and `six.py` scores 0; in a folder with a note and five `.xyz123` files, the note and
+the `.xyz123` files score 55 and `main.py` scores 0.
+
+### 5. Text patterns and the folder score can convict a file on their own
+
+Both are circumstantial. They describe a file's wording or surroundings, not the file, and a
+document that talks about malware matches them as well as malware does. Measured: a handoff
+document that mentions a hidden PowerShell window and a "ransom note" scored 30 + 8 + 45 = 83; a
+bundled `app.js` with two strong patterns scored 60 + 24 = 84; a font license with the joke
+"Vera cannot become a ransom note font" scored 45 + 55 = 100. All were MALICIOUS.
+
+Rust change: when no signal about the file itself contributed, the total is held at 59 (Suspicious).
+Signals about the file itself: extension masquerade, high entropy, ransomware extension, trojan
+file name, rootkit binary, YARA match, zip entry score, and a known hash (which returns early).
+
+```java
+private static final int MAX_CIRCUMSTANTIAL_ONLY_SCORE = THRESHOLD_MALICIOUS - 1; // 59
+// Track `directSignal`, set by every signal above; after all signals are added:
+if (!directSignal) {
+    score = Math.min(score, MAX_CIRCUMSTANTIAL_ONLY_SCORE);
+}
+```
+
+Tests to add: two strong patterns plus four weak ones in `bundle.js` is SUSPICIOUS at 59; the
+folder score plus one weak pattern is SUSPICIOUS; a strong pattern in `report.locked` and in
+`backdoor_tool.js` is still MALICIOUS.
+
 ## Rust only: a port bug, Java is already correct
 
 The Rust zip check added `SCORE_ZIP_SUSPICIOUS_ENTRY` (15) **per matching entry** and ran on any
@@ -92,9 +138,10 @@ file whose bytes looked like a zip. Java adds it **once** (line 559) and only fo
 
 ## Until Java catches up
 
-The two engines will disagree on the three cases above. Any cross-engine comparison that includes
-a `.jar`/`.msi` with high entropy, a script with only weak patterns, or a native library with a
-matching header will show Rust as less suspicious than Java. That is intended.
+The two engines will disagree on the five cases above. Any cross-engine comparison that includes
+a `.jar`/`.msi` with high entropy, a script with only weak patterns, a native library with a
+matching header, a file next to a note and a cluster of unfamiliar extensions, or a file whose only
+evidence is text patterns will show Rust as less suspicious than Java. That is intended.
 
 ## Not fixed yet (both engines)
 
@@ -105,6 +152,10 @@ Observed in the same scan and not addressed by these changes:
   contain compressed payloads
 - JSON, log and source-map files that contain weak patterns
 - bundled JavaScript that contains one strong pattern (now SUSPICIOUS instead of MALICIOUS)
+- files whose text really matches a pattern, such as a document about malware or a license that
+  jokes about a "ransom note": now SUSPICIOUS (59), no longer MALICIOUS
+- font and other asset folders with a readme still score 55 for the readme and the files with the
+  clustered extension (`.afm`, `.pfb`); adding those extensions to `COMMON_EXTENSIONS` would stop it
 
 Larger fixes to consider later: trust for signed binaries (Authenticode), known-good hash lists,
 and a per-folder trust list. Re-running the scan after these changes will show how much is left.

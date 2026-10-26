@@ -39,6 +39,16 @@ pub const MAX_WEAK_PATTERN_SCORE: i32 = THRESHOLD_SUSPICIOUS - 1;
 const _: () = assert!(MAX_WEAK_PATTERN_SCORE < THRESHOLD_SUSPICIOUS);
 pub const SCORE_HIGH_ENTROPY: i32 = 30;
 
+/// Text patterns and the folder-behavior score are circumstantial: they say
+/// something about a file's surroundings or wording, not about the file. A
+/// document that merely describes malware, a bundled script and a license that
+/// jokes about a "ransom note" all score high on them. When nothing else
+/// contributed, the total is held just below THRESHOLD_MALICIOUS, so these
+/// signals can make a file Suspicious but never convict it. The Java engine has
+/// no such cap; see docs/java-engine-false-positive-fixes.md.
+pub const MAX_CIRCUMSTANTIAL_ONLY_SCORE: i32 = THRESHOLD_MALICIOUS - 1;
+const _: () = assert!(MAX_CIRCUMSTANTIAL_ONLY_SCORE >= THRESHOLD_SUSPICIOUS);
+
 /// Ported from SecurityServiceImpl. A file crossing this total is convicted
 /// outright.
 pub const THRESHOLD_MALICIOUS: i32 = 60;
@@ -69,11 +79,11 @@ pub fn score_file(
     score_impl(file_name, content, signatures, rules, path, None, None)
 }
 
-/// Same as [`score_file`] for a file on disk, but with the folder's
-/// ransomware-behavior score supplied by the caller (see
-/// `dir_behavior::score_from_names`). A scanner walking a folder computes it
-/// once per folder; without this, every file triggers a fresh read of its whole
-/// folder, which is quadratic in the number of files per folder.
+/// Same as [`score_file`] for a file on disk, but with the ransomware-behavior
+/// score for this file supplied by the caller (see
+/// `dir_behavior::FolderBehavior::score_for`). A scanner walking a folder
+/// analyses the folder once; without this, every file triggers a fresh read of
+/// its whole folder, which is quadratic in the number of files per folder.
 pub fn score_file_in_directory(
     file_name: &str,
     content: &[u8],
@@ -170,6 +180,9 @@ fn score_impl(
 
     let mut score = 0;
     let mut contributions = Vec::new();
+    // Set by every signal about the file itself. Text patterns and the folder
+    // score do not set it; see MAX_CIRCUMSTANTIAL_ONLY_SCORE.
+    let mut direct_signal = false;
 
     let header = &content[..content.len().min(8)];
     let extension = get_file_extension(file_name);
@@ -182,6 +195,7 @@ fn score_impl(
         check_extension_masquerade(&extension, header)
     };
     if masquerade_score > 0 {
+        direct_signal = true;
         score += masquerade_score;
         contributions.push(ScoreContribution {
             reason: "EXTENSION_MASQUERADE: header bytes don't match the file's extension".to_string(),
@@ -196,6 +210,7 @@ fn score_impl(
         let sample = &content[..content.len().min(ENTROPY_SAMPLE_BYTES)];
         let entropy = shannon_entropy(sample);
         if entropy >= THRESHOLD_HIGH_ENTROPY {
+            direct_signal = true;
             score += SCORE_HIGH_ENTROPY;
             contributions.push(ScoreContribution {
                 reason: format!(
@@ -208,6 +223,7 @@ fn score_impl(
 
     // 3. Ransomware extension.
     if RANSOMWARE_EXTENSIONS.contains(&extension.as_str()) {
+        direct_signal = true;
         score += SCORE_RANSOMWARE_EXTENSION;
         contributions.push(ScoreContribution {
             reason: "RANSOMWARE_EXTENSION".to_string(),
@@ -242,6 +258,7 @@ fn score_impl(
     // signatures match, matching Java's break-on-first-match loop.
     let file_name_lower = file_name.to_lowercase();
     if TROJAN_NAME_SIGNATURES.iter().any(|sig| file_name_lower.contains(sig)) {
+        direct_signal = true;
         score += SCORE_TROJAN_NAME;
         contributions.push(ScoreContribution {
             reason: "TROJAN_NAME_SIGNATURE".to_string(),
@@ -269,6 +286,7 @@ fn score_impl(
     // 8. Rootkit signals (binary, location-gated; text, unconditional).
     let rootkit = score_rootkit(path, content);
     if rootkit.binary_flagged {
+        direct_signal = true;
         score += SCORE_ROOTKIT_BINARY;
         contributions.push(ScoreContribution {
             reason: "ROOTKIT_BINARY_IN_DRIVER_LOCATION".to_string(),
@@ -289,6 +307,7 @@ fn score_impl(
     // confidence tier.
     if let Ok(matches) = rules.scan(content) {
         for m in matches {
+            direct_signal = true;
             score += SCORE_STRONG_PATTERN;
             contributions.push(ScoreContribution {
                 reason: format!("YARA-X pattern match: {}", m.identifier),
@@ -303,12 +322,18 @@ fn score_impl(
     // 10. Zip suspicious entries (not a bomb, already handled above).
     if let ZipCheck::Scored(zip_score) = zip_check {
         if zip_score > 0 {
+            direct_signal = true;
             score += zip_score;
             contributions.push(ScoreContribution {
                 reason: "ZIP_CONTAINS_EXECUTABLE_ENTRY".to_string(),
                 points: zip_score,
             });
         }
+    }
+
+    // Wording and surroundings alone never convict.
+    if !direct_signal {
+        score = score.min(MAX_CIRCUMSTANTIAL_ONLY_SCORE);
     }
 
     let score = score.min(MAX_SCORE);
@@ -653,5 +678,68 @@ mod tests {
         pe.extend(std::iter::repeat_n(0u8, 64));
         let windows_exe_named_so = score_file("libfoo.so", &pe, &SignatureSet::new(), &empty_rules(), None);
         assert!(masquerade_flagged(&windows_exe_named_so));
+    }
+
+    // --- circumstantial signals cannot convict (docs/java-engine-false-positive-fixes.md, fix 5) ---
+
+    #[test]
+    fn text_patterns_alone_never_convict_a_file() {
+        // Two strong patterns (60) and four weak ones (capped at 24) add up to 84.
+        let content =
+            b"powershell -w hidden -Command x\n\
+              powershell (New-Object Net.WebClient).DownloadString('u')\n\
+              eval(a); document.write(b); shell_exec(c); system(d);";
+        let result = score_file("bundle.js", content, &SignatureSet::new(), &empty_rules(), None);
+        assert_eq!(result.verdict, Verdict::Suspicious, "score was {}", result.score);
+        assert_eq!(result.score, MAX_CIRCUMSTANTIAL_ONLY_SCORE);
+    }
+
+    #[test]
+    fn a_document_about_malware_is_suspicious_not_malicious() {
+        // 30 (strong) + 8 (weak) + 45 (ransomware note text) = 83 before the cap.
+        let content =
+            b"Launch with powershell -w hidden, then call system(x).\nThe ransom note appears on the desktop.";
+        let result = score_file("handoff.md", content, &SignatureSet::new(), &empty_rules(), None);
+        assert_eq!(result.verdict, Verdict::Suspicious, "score was {}", result.score);
+        assert_eq!(result.score, MAX_CIRCUMSTANTIAL_ONLY_SCORE);
+    }
+
+    #[test]
+    fn the_folder_score_plus_a_weak_pattern_cannot_convict() {
+        // 55 (folder) + 8 (one weak pattern) = 63 before the cap.
+        let result = score_file_in_directory(
+            "six.py",
+            b"eval(x)",
+            &SignatureSet::new(),
+            &empty_rules(),
+            std::path::Path::new("six.py"),
+            SCORE_RANSOMWARE_DIR_BEHAVIOR
+        );
+        assert_eq!(result.verdict, Verdict::Suspicious, "score was {}", result.score);
+        assert_eq!(result.score, MAX_CIRCUMSTANTIAL_ONLY_SCORE);
+    }
+
+    #[test]
+    fn text_patterns_still_convict_next_to_a_direct_signal() {
+        let strong = b"powershell -w hidden -Command x";
+        // Ransomware extension (60) + strong pattern (30).
+        let locked = score_file("report.locked", strong, &SignatureSet::new(), &empty_rules(), None);
+        assert_eq!(locked.verdict, Verdict::Malicious, "score was {}", locked.score);
+        // Trojan file name (35) + strong pattern (30).
+        let named = score_file("backdoor_tool.js", strong, &SignatureSet::new(), &empty_rules(), None);
+        assert_eq!(named.verdict, Verdict::Malicious, "score was {}", named.score);
+    }
+
+    #[test]
+    fn the_folder_score_still_adds_to_a_direct_signal() {
+        let result = score_file_in_directory(
+            "a.locked",
+            b"x",
+            &SignatureSet::new(),
+            &empty_rules(),
+            std::path::Path::new("a.locked"),
+            SCORE_RANSOMWARE_DIR_BEHAVIOR
+        );
+        assert_eq!(result.verdict, Verdict::Malicious, "score was {}", result.score);
     }
 }
