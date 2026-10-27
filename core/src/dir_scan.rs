@@ -328,6 +328,49 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// A root in the spelling the file system gives it, so the same folder is never
+/// walked twice under two names. On Windows `%TEMP%` is often an 8.3 short path
+/// (`C:\Users\DHRUVP~1\...` for a user called "Dhruv Patel") while
+/// `%LOCALAPPDATA%\Temp` is the long one. GetLongPathNameW expands short names
+/// and nothing else: links and mapped drives stay as they are. A path that does
+/// not exist, or any failure, keeps its absolute path.
+fn resolve_root(root: &Path) -> PathBuf {
+    let absolute = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    #[cfg(windows)]
+    {
+        if let Some(long) = windows_long_path(&absolute) {
+            return long;
+        }
+    }
+    absolute
+}
+
+#[cfg(windows)]
+fn windows_long_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{ OsStrExt, OsStringExt };
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut buffer: Vec<u16> = vec![0; 512];
+    // One retry is enough: the first call reports the size needed.
+    for _ in 0..2 {
+        // SAFETY: `wide` is a NUL-terminated UTF-16 string and `buffer` is writable
+        // for `buffer.len()` UTF-16 units; both outlive the call.
+        let written = unsafe {
+            GetLongPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+        } as usize;
+        if written == 0 {
+            return None;
+        }
+        if written < buffer.len() {
+            return Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written])));
+        }
+        // Too small: `written` is the size needed, including the NUL.
+        buffer.resize(written, 0);
+    }
+    None
+}
+
 #[cfg(windows)]
 fn windows_fixed_drives() -> Vec<PathBuf> {
     use windows_sys::Win32::Storage::FileSystem::{ GetDriveTypeW, GetLogicalDrives };
@@ -371,7 +414,17 @@ pub fn scan_roots(
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(&Progress)
 ) -> ScanReport {
-    scan_roots_with(roots, opts, signatures, rules, cancel, on_progress, &is_volume_root, SYSTEM_DIR_NAMES)
+    scan_roots_with(
+        roots,
+        opts,
+        signatures,
+        rules,
+        cancel,
+        on_progress,
+        &is_volume_root,
+        SYSTEM_DIR_NAMES,
+        &resolve_root
+    )
 }
 
 /// The walker, with the two platform rules injectable so tests can exercise
@@ -385,7 +438,8 @@ fn scan_roots_with(
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(&Progress),
     is_volume_root: &dyn Fn(&Path) -> bool,
-    system_dir_names: &[&str]
+    system_dir_names: &[&str],
+    resolve: &dyn Fn(&Path) -> PathBuf
 ) -> ScanReport {
     let shared = Shared {
         signatures,
@@ -397,7 +451,7 @@ fn scan_roots_with(
     let workers = opts.workers;
 
     if workers <= 1 {
-        let mut run = Run::new(opts, &shared, cancel, on_progress, is_volume_root, system_dir_names, None);
+        let mut run = Run::new(opts, &shared, cancel, on_progress, is_volume_root, system_dir_names, resolve, None);
         run.walk_roots(roots);
         return run.finish();
     }
@@ -431,6 +485,7 @@ fn scan_roots_with(
             on_progress,
             is_volume_root,
             system_dir_names,
+            resolve,
             Some(pool)
         );
         run.walk_roots(roots);
@@ -614,6 +669,8 @@ struct Run<'a> {
     on_progress: &'a mut dyn FnMut(&Progress),
     is_volume_root: &'a dyn Fn(&Path) -> bool,
     system_dir_names: &'a [&'a str],
+    /// Gives a root its real spelling; see [`resolve_root`].
+    resolve_root: &'a dyn Fn(&Path) -> PathBuf,
     pool: Option<Pool<'a>>,
     /// Roots already scanned in this run. A folder that is one of them is not
     /// entered again when it turns up under a later root (a full scan walks the
@@ -632,6 +689,7 @@ struct Run<'a> {
 }
 
 impl<'a> Run<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         opts: &'a ScanOptions,
         shared: &'a Shared<'a>,
@@ -639,6 +697,7 @@ impl<'a> Run<'a> {
         on_progress: &'a mut dyn FnMut(&Progress),
         is_volume_root: &'a dyn Fn(&Path) -> bool,
         system_dir_names: &'a [&'a str],
+        resolve_root: &'a dyn Fn(&Path) -> PathBuf,
         pool: Option<Pool<'a>>
     ) -> Self {
         Self {
@@ -648,6 +707,7 @@ impl<'a> Run<'a> {
             on_progress,
             is_volume_root,
             system_dir_names,
+            resolve_root,
             pool,
             scanned_roots: Vec::new(),
             started: Instant::now(),
@@ -676,9 +736,11 @@ impl<'a> Run<'a> {
 
     fn walk_roots(&mut self, roots: &[PathBuf]) {
         for root in roots {
-            // Absolute, but links are not resolved: the paths stay as the user
-            // would write them (no `\\?\` prefix in the UI).
-            let root = std::path::absolute(root).unwrap_or_else(|_| root.clone());
+            // Absolute and in the file system's own spelling (an 8.3 short name
+            // becomes the long one), so two names for one folder are one root.
+            // Links are not resolved: the paths stay as the user would write
+            // them (no `\\?\` prefix in the UI).
+            let root = (self.resolve_root)(root);
             if self.scanned_roots.iter().any(|done| same_path(done, &root)) {
                 continue;
             }
@@ -1165,7 +1227,8 @@ mod tests {
             &AtomicBool::new(false),
             &mut |_| {},
             &|p: &Path| p == root,
-            &["windows", "programdata"]
+            &["windows", "programdata"],
+            &|p: &Path| p.to_path_buf()
         );
         assert_eq!(report.scanned, 1, "only keep/z.txt should be scanned");
         assert_eq!(report.skipped_excluded, 2);
@@ -1186,7 +1249,8 @@ mod tests {
             &AtomicBool::new(false),
             &mut |_| {},
             &|p: &Path| p == root,
-            &["windows", "programdata"]
+            &["windows", "programdata"],
+            &|p: &Path| p.to_path_buf()
         );
         assert_eq!(report.scanned, 2);
         assert_eq!(report.skipped_excluded, 0);
@@ -1207,7 +1271,8 @@ mod tests {
             &AtomicBool::new(false),
             &mut |_| {},
             &|p: &Path| p == parent,
-            &["windows"]
+            &["windows"],
+            &|p: &Path| p.to_path_buf()
         );
         assert_eq!(report.scanned, 1);
         assert_eq!(report.skipped_excluded, 0);
@@ -1861,6 +1926,86 @@ mod tests {
         assert!(ScanOptions::quick().recursive);
         assert_eq!(ScanOptions::full().limits.max_duration, None);
         assert!(ScanOptions::full().recursive);
+    }
+
+    #[test]
+    fn a_root_given_under_two_spellings_is_scanned_once() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "real/a.txt", b"a");
+        write(dir.path(), "real/b.txt", b"b");
+        // `alias` stands in for a second spelling of `real`, such as an 8.3 short
+        // path. It is a different folder here, so it is only skipped if the
+        // resolver is applied before roots are compared.
+        write(dir.path(), "alias/a.txt", b"x");
+        write(dir.path(), "alias/b.txt", b"y");
+        let real = dir.path().join("real");
+        let alias = dir.path().join("alias");
+        let resolver = |p: &Path| if p == alias { real.clone() } else { p.to_path_buf() };
+
+        let report = scan_roots_with(
+            &[real.clone(), alias.clone()],
+            &opts(true),
+            &SignatureSet::new(),
+            &rules(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &is_volume_root,
+            SYSTEM_DIR_NAMES,
+            &resolver
+        );
+        assert_eq!(report.scanned, 2, "the folder once, not once per spelling");
+    }
+
+    #[test]
+    fn a_later_root_does_not_enter_a_folder_already_scanned_under_another_spelling() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "top/top.txt", b"top");
+        write(dir.path(), "top/temp/a.txt", b"a");
+        write(dir.path(), "top/temp/b.txt", b"b");
+        // `short` is an alias of `top/temp`: it is never scanned itself.
+        write(dir.path(), "short/x.txt", b"x");
+        let top = dir.path().join("top");
+        let short = dir.path().join("short");
+        let real = top.join("temp");
+        let resolver = |p: &Path| if p == short { real.clone() } else { p.to_path_buf() };
+
+        let report = scan_roots_with(
+            &[short.clone(), top.clone()],
+            &opts(true),
+            &SignatureSet::new(),
+            &rules(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &is_volume_root,
+            SYSTEM_DIR_NAMES,
+            &resolver
+        );
+        assert_eq!(report.scanned, 3, "a.txt, b.txt and top.txt, each once");
+    }
+
+    #[test]
+    fn a_root_that_does_not_exist_keeps_its_absolute_path() {
+        let missing = Path::new("definitely-not-a-real-folder/inside");
+        assert_eq!(resolve_root(missing), std::path::absolute(missing).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_real_temp_folder_is_scanned_once_under_its_two_spellings() {
+        // TEMP is often an 8.3 short path. Passes whichever spelling this machine
+        // gives; on one with short names it is the case the fix is for.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "a.txt", b"a");
+        let long = resolve_root(dir.path());
+        let report = scan_roots(
+            &[dir.path().to_path_buf(), long],
+            &opts(true),
+            &SignatureSet::new(),
+            &rules(),
+            &AtomicBool::new(false),
+            &mut |_| {}
+        );
+        assert_eq!(report.scanned, 1);
     }
 
     #[test]
