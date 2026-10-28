@@ -187,6 +187,12 @@ pub fn do_scan_full(
     )
 }
 
+/// True while a scan is running: the window must not just close, because the
+/// scan and its results would be lost without the user agreeing to that.
+pub fn close_is_blocked(state: &AppState) -> bool {
+    state.scan.is_running()
+}
+
 pub fn do_recent_scans(state: &AppState, limit: i64) -> Result<Vec<ScanResult>, String> {
     let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
     storage::recent_scans(&conn, limit).map_err(|e| format!("failed to load history: {e}"))
@@ -728,5 +734,16 @@ mod tests {
         ).unwrap_err();
         assert_eq!(error, "No standard folders were found to scan.");
         assert!(!state.scan.is_running());
+    }
+
+    #[test]
+    fn closing_the_window_is_blocked_only_while_a_scan_runs() {
+        let (state, _dir) = test_state();
+        assert!(!close_is_blocked(&state));
+        {
+            let _running = state.scan.start().unwrap();
+            assert!(close_is_blocked(&state));
+        }
+        assert!(!close_is_blocked(&state));
     }
 }

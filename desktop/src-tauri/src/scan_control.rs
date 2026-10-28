@@ -43,8 +43,6 @@ impl ScanControl {
         }
     }
 
-    // Test-only until the close-window handler uses it (next commit).
-    #[cfg(test)]
     pub fn is_running(&self) -> bool {
         self.session.lock().unwrap_or_else(PoisonError::into_inner).is_some()
     }
