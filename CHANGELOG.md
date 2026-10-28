@@ -8,6 +8,10 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Desktop: the scan screen. Scan a folder, run a Quick scan or a Full scan (which asks first), see
+  progress and findings while it runs, and cancel at any time. "Likely malicious" files come first,
+  "Worth a look" files are in a collapsed group, and every finding lists why it was flagged in
+  plain language. The Sync status now shows why a feed failed, not only that one did.
 - Desktop: scan commands for the in-app scan (`scan_folder_cmd`, `scan_quick_cmd`, `scan_full_cmd`,
   `cancel_scan_cmd`, `exit_app_cmd`). One scan runs at a time, a second request is refused, progress
   goes out as `scan-progress` events carrying the new findings, and each finished or cancelled scan

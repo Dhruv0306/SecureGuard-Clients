@@ -179,3 +179,128 @@ button:disabled {
     padding: 4px 10px;
     font-size: 12px;
 }
+
+/* --- Folder, quick and full scan --- */
+
+.scan-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+}
+
+.checkbox {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #cfd3da;
+}
+
+.cancel-btn {
+    background: #6b1f1f;
+}
+
+#scan-progress {
+    margin-top: 12px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    background: #22262e;
+}
+
+#progress-text {
+    font-size: 14px;
+}
+
+#progress-dir {
+    margin-top: 4px;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: #9aa0aa;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+#scan-banner {
+    margin-top: 12px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    background: #4a4120;
+    color: #ffe28a;
+    font-size: 13px;
+}
+
+#scan-banner.banner-error {
+    background: #4a2020;
+    color: #ffb3b3;
+}
+
+#scan-summary {
+    margin-top: 12px;
+    font-size: 14px;
+}
+
+#scan-results h3,
+#suspicious-summary {
+    font-size: 15px;
+    margin: 16px 0 8px;
+}
+
+#suspicious-summary {
+    cursor: pointer;
+}
+
+.finding-list {
+    list-style: none;
+    padding: 0;
+    margin: 8px 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.finding-row {
+    padding: 10px 12px;
+    border-radius: 6px;
+    background: #22262e;
+    border-left: 3px solid #444;
+    font-size: 13px;
+}
+
+.finding-row.verdict-suspicious {
+    border-left-color: #d4af37;
+}
+
+.finding-row.verdict-malicious {
+    border-left-color: #c0392b;
+}
+
+.finding-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.finding-head .verdict-badge {
+    margin-bottom: 0;
+}
+
+.finding-score {
+    color: #9aa0aa;
+    font-size: 12px;
+}
+
+.finding-path {
+    margin-top: 6px;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: #cfd3da;
+    word-break: break-all;
+}
+
+.finding-reasons {
+    margin: 6px 0 0;
+    padding-left: 18px;
+    color: #cfd3da;
+}
