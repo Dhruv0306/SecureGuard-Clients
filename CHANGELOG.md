@@ -8,6 +8,10 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Desktop: scan commands for the in-app scan (`scan_folder_cmd`, `scan_quick_cmd`, `scan_full_cmd`,
+  `cancel_scan_cmd`, `exit_app_cmd`). One scan runs at a time, a second request is refused, progress
+  goes out as `scan-progress` events carrying the new findings, and each finished or cancelled scan
+  records its non-clean results to history in one transaction. The scan screen comes in a later PR.
 - Core: progress reports carry the findings recorded since the previous report
   (`Progress::new_findings`), so an app can show results while a scan runs. The final
   `ScanReport` stays authoritative: it is sorted and capped, and a finding recorded after the last

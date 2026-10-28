@@ -1,8 +1,9 @@
 mod commands;
 mod helper_client;
+mod scan_control;
 
 use commands::AppState;
-use tauri::Manager;
+use tauri::{ Emitter, Manager };
 
 fn main() {
     tauri::Builder
@@ -27,9 +28,26 @@ fn main() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // While a scan runs, closing the window asks first: the page shows
+            // "Cancel the scan and exit?" and calls cancel_scan_cmd and
+            // exit_app_cmd if the user agrees. (macOS Cmd+Q does not go
+            // through this path; the scan ends with the process.)
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if commands::close_is_blocked(&window.state::<AppState>()) {
+                    api.prevent_close();
+                    let _ = window.emit("close-blocked-by-scan", ());
+                }
+            }
+        })
         .invoke_handler(
             tauri::generate_handler![
                 commands::scan_file_cmd,
+                commands::scan_folder_cmd,
+                commands::scan_quick_cmd,
+                commands::scan_full_cmd,
+                commands::cancel_scan_cmd,
+                commands::exit_app_cmd,
                 commands::recent_scans_cmd,
                 commands::sync_signatures_cmd,
                 commands::block_domain_cmd,
