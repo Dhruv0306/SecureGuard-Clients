@@ -12,15 +12,17 @@
 
 use secureguard_core::rusqlite::Connection;
 use secureguard_core::blocked_domain::{ BlockedDomain, MAX_BLOCKED_DOMAINS };
+use secureguard_core::dir_scan::{ self, Progress, ScanOptions, ScanReport };
 use secureguard_core::hash_match::SignatureSet;
 use secureguard_core::signature_sync::{ self, SyncResult };
 use secureguard_core::storage;
 use secureguard_core::types::ScanResult;
+use crate::scan_control::ScanControl;
 use secureguard_core::yara_scan::RuleSet;
 use secureguard_core::DEFAULT_RULES;
 use std::path::PathBuf;
 use std::sync::{ Arc, Mutex };
-use tauri::{ AppHandle, Manager };
+use tauri::{ AppHandle, Emitter, Manager };
 
 /// Shared app state, initialized once at startup, not per command call. The
 /// CLI reopens its DB and recompiles the rule set on every invocation,
@@ -37,6 +39,9 @@ pub struct AppState {
     pub conn: Mutex<Connection>,
     pub rules: RuleSet,
     pub signatures: Mutex<Arc<SignatureSet>>,
+    /// The one running scan, if any. Its lock is never held together with
+    /// `conn` or `signatures`, or across a scan.
+    pub scan: ScanControl,
 }
 
 impl AppState {
@@ -53,6 +58,7 @@ impl AppState {
             conn: Mutex::new(conn),
             rules,
             signatures: Mutex::new(Arc::new(signatures)),
+            scan: ScanControl::new(),
         })
     }
 }
@@ -84,6 +90,101 @@ pub fn do_scan(state: &AppState, path: &str) -> Result<ScanResult, String> {
     }
 
     Ok(result)
+}
+
+/// Scans `roots` as one run, one scan at a time. Takes one signature snapshot
+/// (a momentary lock), scans without holding any lock, then records the
+/// non-clean results in one transaction. A scan that was cancelled or hit the
+/// findings cap records what it found. A failure to record history is logged,
+/// not fatal, as in `do_scan`.
+pub fn do_scan_roots(
+    state: &AppState,
+    roots: Vec<PathBuf>,
+    opts: ScanOptions,
+    on_progress: &mut dyn FnMut(&Progress)
+) -> Result<ScanReport, String> {
+    let guard = state.scan.start()?;
+    let signatures = snapshot_signatures(state)?;
+
+    let report = dir_scan::scan_roots(
+        &roots,
+        &opts,
+        &signatures,
+        &state.rules,
+        guard.cancel_flag(),
+        on_progress
+    );
+
+    let results: Vec<ScanResult> = report.findings
+        .iter()
+        .map(|finding| finding.result.clone())
+        .collect();
+    match state.conn.lock() {
+        Ok(conn) => {
+            if let Err(e) = storage::record_scans(&conn, &results) {
+                eprintln!("warning: failed to record scan to history: {e}");
+            }
+        }
+        Err(_) => eprintln!("warning: database lock poisoned, scan history not recorded"),
+    }
+
+    Ok(report)
+}
+
+/// A folder the user chose. Anything that is not an existing folder is an
+/// error here (the core would otherwise report one unreadable folder).
+pub fn do_scan_folder(
+    state: &AppState,
+    path: &str,
+    recursive: bool,
+    on_progress: &mut dyn FnMut(&Progress)
+) -> Result<ScanReport, String> {
+    let root = PathBuf::from(path);
+    if !root.is_dir() {
+        return Err(format!("Not a folder: {path}"));
+    }
+    do_scan_roots(state, vec![root], ScanOptions::directory(recursive), on_progress)
+}
+
+/// A scan of a computed list of folders. An empty list is an error with the
+/// message the caller gives, as the CLI does, instead of a scan of nothing.
+fn do_scan_listed(
+    state: &AppState,
+    roots: Vec<PathBuf>,
+    opts: ScanOptions,
+    empty_error: &str,
+    on_progress: &mut dyn FnMut(&Progress)
+) -> Result<ScanReport, String> {
+    if roots.is_empty() {
+        return Err(empty_error.to_string());
+    }
+    do_scan_roots(state, roots, opts, on_progress)
+}
+
+pub fn do_scan_quick(
+    state: &AppState,
+    on_progress: &mut dyn FnMut(&Progress)
+) -> Result<ScanReport, String> {
+    do_scan_listed(
+        state,
+        dir_scan::quick_scan_roots(),
+        ScanOptions::quick(),
+        "No standard folders were found to scan.",
+        on_progress
+    )
+}
+
+pub fn do_scan_full(
+    state: &AppState,
+    on_progress: &mut dyn FnMut(&Progress)
+) -> Result<ScanReport, String> {
+    do_scan_listed(
+        state,
+        dir_scan::full_scan_roots(),
+        ScanOptions::full(),
+        "No folders were found to scan.",
+        on_progress
+    )
 }
 
 pub fn do_recent_scans(state: &AppState, limit: i64) -> Result<Vec<ScanResult>, String> {
@@ -204,6 +305,55 @@ pub async fn scan_file_cmd(app: AppHandle, path: String) -> Result<ScanResult, S
     run_blocking(app, "scan", move |state| do_scan(state, &path)).await
 }
 
+/// Runs a scan on the blocking pool and sends each progress report to the
+/// window as a `scan-progress` event. A failed send is ignored: the scan
+/// still finishes and its report is returned to the caller.
+async fn run_scan<F>(app: AppHandle, label: &'static str, scan: F) -> Result<ScanReport, String>
+    where F: FnOnce(&AppState, &mut dyn FnMut(&Progress)) -> Result<ScanReport, String> + Send + 'static
+{
+    let emitter = app.clone();
+    run_blocking(app, label, move |state| {
+        scan(state, &mut |progress| {
+            let _ = emitter.emit("scan-progress", progress);
+        })
+    }).await
+}
+
+#[tauri::command]
+pub async fn scan_folder_cmd(
+    app: AppHandle,
+    path: String,
+    recursive: bool
+) -> Result<ScanReport, String> {
+    run_scan(app, "folder scan", move |state, on_progress| {
+        do_scan_folder(state, &path, recursive, on_progress)
+    }).await
+}
+
+#[tauri::command]
+pub async fn scan_quick_cmd(app: AppHandle) -> Result<ScanReport, String> {
+    run_scan(app, "quick scan", do_scan_quick).await
+}
+
+#[tauri::command]
+pub async fn scan_full_cmd(app: AppHandle) -> Result<ScanReport, String> {
+    run_scan(app, "full scan", do_scan_full).await
+}
+
+/// Asks the running scan to stop. True if a scan was running. Only an atomic
+/// flag and a momentary lock, so a plain command is fine here.
+#[tauri::command]
+pub fn cancel_scan_cmd(state: tauri::State<AppState>) -> bool {
+    state.scan.cancel()
+}
+
+/// Ends the app. The page calls this after the user agrees to cancel a
+/// running scan and exit.
+#[tauri::command]
+pub fn exit_app_cmd(app: AppHandle) {
+    app.exit(0);
+}
+
 #[tauri::command]
 pub async fn recent_scans_cmd(app: AppHandle, limit: i64) -> Result<Vec<ScanResult>, String> {
     run_blocking(app, "history", move |state| do_recent_scans(state, limit)).await
@@ -277,7 +427,9 @@ pub async fn list_blocked_domains_cmd(app: AppHandle) -> Result<Vec<String>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secureguard_core::dir_scan::StopReason;
     use std::io::Write;
+    use std::time::Duration;
 
     /// Builds AppState against a fresh temp-file database, exercising the
     /// exact same open/compile/load path the real app startup uses, not a
@@ -443,5 +595,138 @@ mod tests {
         do_block_domain(&state, "b.example.com", None).unwrap();
         let active = do_list_blocked_domains(&state).unwrap();
         assert_eq!(active, vec!["a.example.com", "b.example.com"]);
+    }
+
+    // --- scans of many files (5.2b) ---
+
+    /// A folder inside the temp directory holding a Malicious file (a
+    /// `.locked` file, because Windows Defender blocks the EICAR string on
+    /// disk) and a clean one.
+    fn folder_with_one_bad_and_one_clean_file(dir: &tempfile::TempDir) -> PathBuf {
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("bad.locked"), b"x").unwrap();
+        std::fs::write(target.join("ok.txt"), b"fine").unwrap();
+        target
+    }
+
+    /// One worker and a progress report on every step, so tests that count
+    /// exactly (cancel after the first finding) are deterministic.
+    fn every_step() -> ScanOptions {
+        ScanOptions {
+            min_progress_interval: Duration::ZERO,
+            workers: 1,
+            ..ScanOptions::directory(true)
+        }
+    }
+
+    #[test]
+    fn a_second_scan_is_refused_while_one_is_running() {
+        let (state, dir) = test_state();
+        let target = folder_with_one_bad_and_one_clean_file(&dir);
+        let _running = state.scan.start().unwrap();
+
+        let error = do_scan_folder(&state, &target.to_string_lossy(), true, &mut |_| {}).unwrap_err();
+        assert!(error.contains("already running"), "{error}");
+    }
+
+    #[test]
+    fn a_folder_scan_records_only_non_clean_results_in_history() {
+        let (state, dir) = test_state();
+        let target = folder_with_one_bad_and_one_clean_file(&dir);
+
+        let report = do_scan_folder(&state, &target.to_string_lossy(), true, &mut |_| {}).unwrap();
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.malicious, 1);
+        assert!(!state.scan.is_running(), "the session must be cleared when the scan ends");
+
+        let history = do_recent_scans(&state, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].file_name, "bad.locked");
+    }
+
+    #[test]
+    fn a_folder_that_does_not_exist_is_an_error() {
+        let (state, dir) = test_state();
+        let missing = dir.path().join("nope");
+        let error = do_scan_folder(&state, &missing.to_string_lossy(), true, &mut |_| {}).unwrap_err();
+        assert!(error.starts_with("Not a folder"), "{error}");
+
+        let file = dir.path().join("a_file.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let error = do_scan_folder(&state, &file.to_string_lossy(), true, &mut |_| {}).unwrap_err();
+        assert!(error.starts_with("Not a folder"), "{error}");
+        assert!(!state.scan.is_running());
+    }
+
+    #[test]
+    fn progress_reaches_the_callback_and_carries_the_findings() {
+        let (state, dir) = test_state();
+        let target = folder_with_one_bad_and_one_clean_file(&dir);
+
+        let mut calls = 0;
+        let mut announced: Vec<String> = Vec::new();
+        let report = do_scan_roots(&state, vec![target], every_step(), &mut |p| {
+            calls += 1;
+            announced.extend(p.new_findings.iter().map(|f| f.path.clone()));
+        }).unwrap();
+
+        let in_report: Vec<String> = report.findings.iter().map(|f| f.path.clone()).collect();
+        assert!(calls > 0);
+        assert_eq!(announced, in_report);
+        assert_eq!(in_report.len(), 1);
+    }
+
+    #[test]
+    fn a_cancelled_scan_ends_with_the_cancelled_reason_and_clears_the_session() {
+        let (state, dir) = test_state();
+        let target = dir.path().join("many");
+        std::fs::create_dir_all(&target).unwrap();
+        for i in 0..5 {
+            std::fs::write(target.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+
+        let report = do_scan_roots(&state, vec![target], every_step(), &mut |_| {
+            state.scan.cancel();
+        }).unwrap();
+
+        assert_eq!(report.stop_reason, StopReason::Cancelled);
+        assert!(report.scanned < 5, "scanned {}", report.scanned);
+        assert!(!state.scan.is_running());
+        assert!(state.scan.start().is_ok(), "a new scan can start after a cancelled one");
+    }
+
+    #[test]
+    fn a_cancelled_scan_still_records_what_it_found() {
+        let (state, dir) = test_state();
+        let target = dir.path().join("many_bad");
+        std::fs::create_dir_all(&target).unwrap();
+        for i in 0..4 {
+            std::fs::write(target.join(format!("bad{i}.locked")), b"x").unwrap();
+        }
+
+        let report = do_scan_roots(&state, vec![target], every_step(), &mut |p| {
+            if p.findings >= 1 {
+                state.scan.cancel();
+            }
+        }).unwrap();
+
+        assert_eq!(report.stop_reason, StopReason::Cancelled);
+        assert!(!report.findings.is_empty());
+        assert_eq!(do_recent_scans(&state, 100).unwrap().len(), report.findings.len());
+    }
+
+    #[test]
+    fn an_empty_list_of_folders_is_an_error_and_starts_no_scan() {
+        let (state, _dir) = test_state();
+        let error = do_scan_listed(
+            &state,
+            Vec::new(),
+            ScanOptions::quick(),
+            "No standard folders were found to scan.",
+            &mut |_| {}
+        ).unwrap_err();
+        assert_eq!(error, "No standard folders were found to scan.");
+        assert!(!state.scan.is_running());
     }
 }

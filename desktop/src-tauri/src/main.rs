@@ -1,5 +1,6 @@
 mod commands;
 mod helper_client;
+mod scan_control;
 
 use commands::AppState;
 use tauri::Manager;
@@ -30,6 +31,11 @@ fn main() {
         .invoke_handler(
             tauri::generate_handler![
                 commands::scan_file_cmd,
+                commands::scan_folder_cmd,
+                commands::scan_quick_cmd,
+                commands::scan_full_cmd,
+                commands::cancel_scan_cmd,
+                commands::exit_app_cmd,
                 commands::recent_scans_cmd,
                 commands::sync_signatures_cmd,
                 commands::block_domain_cmd,
