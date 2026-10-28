@@ -8,11 +8,16 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Core: progress reports carry the findings recorded since the previous report
+  (`Progress::new_findings`), so an app can show results while a scan runs. The final
+  `ScanReport` stays authoritative: it is sorted and capped, and a finding recorded after the last
+  report that was due appears only there.
 - Core: quick and full scan targets. `quick_scan_roots()` lists the places malware usually lands
   (Downloads, Desktop, Documents, the temp folder, startup folders; only those that exist);
   `full_scan_roots()` is those followed by every fixed drive, and a folder already scanned as an
-  earlier root is not scanned again. `ScanOptions::quick()` has a 5-minute limit,
-  `ScanOptions::full()` none. CLI: `scg-scan scan-dir --quick` and `--full`.
+  earlier root is not scanned again. Neither `ScanOptions::quick()` nor
+  `ScanOptions::full()` has a time limit (only `system()` keeps 5 minutes).
+  CLI: `scg-scan scan-dir --quick` and `--full`.
 - Core: scanning on a pool of worker threads (`ScanOptions::workers`, default half the cores, 1 to
   8; CLI `--workers N`). The report is the same for any count. A 256 MB byte budget bounds the
   file content held in memory at once.

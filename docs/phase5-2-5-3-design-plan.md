@@ -28,7 +28,7 @@ decisions is in [phase5-3-spike-results.md](phase5-3-spike-results.md) and
 | D9 | Hidden dot-files stay excluded as in Java; an "include hidden" switch can come later |
 | D10 | A small `scg-scan scan-dir` developer command ships with the engine; the user feature is in the app (5.2b) |
 | D11 | Fix false positives in the Rust engine now; document the same changes for the Java engine (docs/java-engine-false-positive-fixes.md) |
-| D12 | In the app: a Quick scan (priority places) and a Full scan (no time limit); the CLI `--system` keeps its 5-minute limit |
+| D12 | In the app: a Quick scan (priority places, no time limit) and a Full scan (everything, no time limit); the CLI `--system` keeps its 5-minute limit |
 | D13 | Scan on a bounded pool of worker threads |
 | D14 | Reuse the result for an identical file within one scan |
 
