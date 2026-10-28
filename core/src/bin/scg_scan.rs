@@ -66,7 +66,7 @@ enum Command {
         system: bool,
 
         /// Scan the places malware usually lands (Downloads, Desktop, Documents,
-        /// the temp folder, startup folders), stopping after 5 minutes.
+        /// the temp folder, startup folders), with no time limit.
         #[arg(long)]
         quick: bool,
 

@@ -32,7 +32,7 @@ cargo run --bin scg-scan -- scan --db mydb.db path/to/file  # custom signature D
 cargo run --bin scg-scan -- scan-dir path/to/folder --recursive           # scan a folder, summary on stdout
 cargo run --bin scg-scan -- scan-dir path/to/folder --recursive --json    # the full report as JSON
 cargo run --bin scg-scan -- scan-dir --system                             # every fixed drive, stops at 5 minutes
-cargo run --release --bin scg-scan -- scan-dir --quick                    # Downloads, Desktop, Documents, temp and startup folders, stops at 5 minutes
+cargo run --release --bin scg-scan -- scan-dir --quick                    # Downloads, Desktop, Documents, temp and startup folders, no time limit
 cargo run --release --bin scg-scan -- scan-dir --full                     # those first, then every fixed drive, no time limit
 cargo run --release --bin scg-scan -- scan-dir path --recursive --workers 4   # number of scan threads
 

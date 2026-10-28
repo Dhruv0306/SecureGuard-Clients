@@ -47,8 +47,6 @@ use std::time::{ Duration, Instant };
 pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// How long a system scan may run. Matches the Java engine.
 pub const SYSTEM_SCAN_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
-/// How long a quick scan may run.
-pub const QUICK_SCAN_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 /// Most findings kept in a report.
 pub const MAX_FINDINGS: usize = 2_000;
 /// Progress callbacks are at most this often unless the caller asks otherwise.
@@ -113,16 +111,10 @@ impl ScanOptions {
         }
     }
 
-    /// The places malware usually lands first (see [`quick_scan_roots`]), with a
-    /// 5-minute budget.
+    /// The places malware usually lands first (see [`quick_scan_roots`]), with
+    /// no time limit: the short folder list bounds it and the caller can cancel.
     pub fn quick() -> Self {
-        Self {
-            limits: ScanLimits {
-                max_duration: Some(QUICK_SCAN_MAX_DURATION),
-                ..ScanLimits::default()
-            },
-            ..Self::directory(true)
-        }
+        Self::directory(true)
     }
 
     /// Everything, with no time limit: the quick-scan places first, then every
@@ -1973,11 +1965,12 @@ mod tests {
     }
 
     #[test]
-    fn quick_scans_have_a_time_limit_and_full_scans_do_not() {
-        assert_eq!(ScanOptions::quick().limits.max_duration, Some(Duration::from_secs(300)));
+    fn quick_and_full_scans_have_no_time_limit_but_the_system_scan_does() {
+        assert_eq!(ScanOptions::quick().limits.max_duration, None);
         assert!(ScanOptions::quick().recursive);
         assert_eq!(ScanOptions::full().limits.max_duration, None);
         assert!(ScanOptions::full().recursive);
+        assert_eq!(ScanOptions::system().limits.max_duration, Some(SYSTEM_SCAN_MAX_DURATION));
     }
 
     #[test]
