@@ -191,6 +191,12 @@ pub struct Progress {
     pub current_dir: String,
     pub scanned: u64,
     pub findings: u64,
+    /// Findings recorded since the previous report, in the order they were
+    /// found. This is arrival order and, in a parallel scan, not walk order.
+    /// A finding recorded after the last report that was due appears only in
+    /// the final [`ScanReport`], which is sorted, capped and authoritative.
+    #[serde(default)]
+    pub new_findings: Vec<FileFinding>,
 }
 
 #[cfg(windows)]
@@ -684,6 +690,8 @@ struct Run<'a> {
     /// of order; sorting by this at the end makes the report the same however
     /// many workers there were.
     found: Vec<(u64, FileFinding)>,
+    /// How many entries of `found` have already gone out in a progress report.
+    announced: usize,
     stop: Option<StopReason>,
     report: ScanReport,
 }
@@ -715,6 +723,7 @@ impl<'a> Run<'a> {
             current_dir: PathBuf::new(),
             next_seq: 0,
             found: Vec::new(),
+            announced: 0,
             stop: None,
             report: ScanReport {
                 findings: Vec::new(),
@@ -807,11 +816,17 @@ impl<'a> Run<'a> {
         });
         if due {
             self.last_progress = Some(now);
+            let new_findings: Vec<FileFinding> = self.found[self.announced..]
+                .iter()
+                .map(|(_, finding)| finding.clone())
+                .collect();
+            self.announced = self.found.len();
             (self.on_progress)(
                 &(Progress {
                     current_dir: self.current_dir.to_string_lossy().into_owned(),
                     scanned: self.report.scanned,
                     findings: self.found.len() as u64,
+                    new_findings,
                 })
             );
         }
@@ -1418,6 +1433,43 @@ mod tests {
             every_call += 1;
         });
         assert!(every_call >= 5, "expected a call per file, got {every_call}");
+    }
+
+    #[test]
+    fn progress_announces_each_finding_once_and_all_of_them_are_in_the_report() {
+        for workers in [1, 4] {
+            let dir = tempdir().unwrap();
+            for i in 0..6 {
+                write(dir.path(), &format!("bad{i}.locked"), b"x");
+            }
+            write(dir.path(), "ok.txt", b"fine");
+
+            let mut options = opts(true);
+            options.workers = workers;
+            let mut announced: Vec<String> = Vec::new();
+            let report = scan_path(
+                dir.path(),
+                &options,
+                &SignatureSet::new(),
+                &rules(),
+                &AtomicBool::new(false),
+                &mut |p| announced.extend(p.new_findings.iter().map(|f| f.path.clone()))
+            );
+
+            let mut in_report: Vec<String> = report.findings.iter().map(|f| f.path.clone()).collect();
+            announced.sort();
+            in_report.sort();
+            assert_eq!(report.malicious, 6, "workers {workers}");
+            assert_eq!(announced, in_report, "workers {workers}: each finding announced exactly once");
+        }
+    }
+
+    #[test]
+    fn progress_without_new_findings_still_reads_from_older_json() {
+        let old = r#"{"current_dir":"C:\\x","scanned":3,"findings":1}"#;
+        let progress: Progress = serde_json::from_str(old).unwrap();
+        assert_eq!(progress.scanned, 3);
+        assert!(progress.new_findings.is_empty());
     }
 
     #[test]

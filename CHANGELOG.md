@@ -8,6 +8,10 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Core: progress reports carry the findings recorded since the previous report
+  (`Progress::new_findings`), so an app can show results while a scan runs. The final
+  `ScanReport` stays authoritative: it is sorted and capped, and a finding recorded after the last
+  report that was due appears only there.
 - Core: quick and full scan targets. `quick_scan_roots()` lists the places malware usually lands
   (Downloads, Desktop, Documents, the temp folder, startup folders; only those that exist);
   `full_scan_roots()` is those followed by every fixed drive, and a folder already scanned as an
