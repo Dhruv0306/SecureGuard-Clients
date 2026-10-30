@@ -44,7 +44,7 @@ const MALWAREBAZAAR_EXPORT_BASE: &str = "https://mb-api.abuse.ch/v2/files/export
 
 fn missing_key_message() -> String {
     format!(
-        "MalwareBazaar needs a free Auth-Key. Get one at https://auth.abuse.ch/ and set {AUTH_KEY_ENV}."
+        "MalwareBazaar needs a free Auth-Key. Get one at https://auth.abuse.ch/ and set {AUTH_KEY_ENV} (in the environment or a .env file)."
     )
 }
 
@@ -57,6 +57,21 @@ pub fn auth_key_from(value: Option<String>) -> Option<String> {
 
 pub fn auth_key_from_env() -> Option<String> {
     auth_key_from(std::env::var(AUTH_KEY_ENV).ok())
+}
+
+/// Loads a `.env` file from the current folder or the nearest parent that has
+/// one, so a developer can keep the key in the repository's `.env` (which git
+/// ignores). Variables that are already set are left alone, and a missing or
+/// unreadable file is ignored. The error is dropped on purpose: a parse error
+/// can quote the offending line, which may be the key.
+pub fn load_env_file() {
+    let _ = dotenvy::dotenv();
+}
+
+/// [`load_env_file`] for one named file. The error says only that the file
+/// could not be loaded, for the same reason.
+pub fn load_env_file_from(path: &std::path::Path) -> Result<(), String> {
+    dotenvy::from_path(path).map_err(|_| format!("could not load {}", path.display()))
 }
 
 /// Everything except letters, digits and `-._~` is percent-encoded, so a key
@@ -511,6 +526,7 @@ mod tests {
             assert!(message.contains("Auth-Key"), "{message}");
             assert!(message.contains("auth.abuse.ch"), "{message}");
             assert!(message.contains(AUTH_KEY_ENV), "{message}");
+            assert!(message.contains(".env"), "{message}");
         }
     }
 
@@ -570,5 +586,28 @@ mod tests {
         let found = extract_sha256_signatures(&csv);
         assert_eq!(found.len(), 1);
         assert!(found.contains(&sha256));
+    }
+
+    #[test]
+    fn an_env_file_fills_missing_variables_but_never_overrides_existing_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".env");
+        std::fs::write(
+            &file,
+            "# comment\nSCG_TEST_FROM_FILE=\"quoted value\"\nSCG_TEST_ALREADY_SET=from-file\nSCG_TEST_EMPTY=\n"
+        ).unwrap();
+        std::env::set_var("SCG_TEST_ALREADY_SET", "from-environment");
+
+        load_env_file_from(&file).unwrap();
+
+        assert_eq!(std::env::var("SCG_TEST_FROM_FILE").unwrap(), "quoted value");
+        assert_eq!(std::env::var("SCG_TEST_ALREADY_SET").unwrap(), "from-environment");
+        assert_eq!(auth_key_from(std::env::var("SCG_TEST_EMPTY").ok()), None);
+    }
+
+    #[test]
+    fn a_missing_env_file_is_an_error_the_caller_can_ignore() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_env_file_from(&dir.path().join("no-such.env")).is_err());
     }
 }

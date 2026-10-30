@@ -106,6 +106,8 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // The Auth-Key can live in a .env file (see .env.example).
+    signature_sync::load_env_file();
     let cli = Cli::parse();
 
     match cli.command {

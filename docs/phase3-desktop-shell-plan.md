@@ -76,7 +76,7 @@ restarting the app. `conn` is a `Mutex` because `rusqlite::Connection` isn't `Sy
 |---|---|---|
 | `scan_file_cmd(path: String)` | `scan_file` + `storage::record_scan` | Persists the result, closing the gap above |
 | `recent_scans_cmd(limit: i64)` | `storage::recent_scans` | Backs the history view |
-| `sync_signatures_cmd()` | `signature_sync::sync_signatures` | Uses `DEFAULT_FEED_URL`; after success, reloads `state.signatures` via `SignatureSet::load_from_cache` so the change is visible immediately, not just on next restart |
+| `sync_signatures_cmd()` | `signature_sync::sync_signatures` | Uses the default MalwareBazaar feed (`sync_default_feeds`, which needs the Auth-Key from `ABUSE_CH_AUTH_KEY`); after success, reloads `state.signatures` via `SignatureSet::load_from_cache` so the change is visible immediately, not just on next restart |
 
 ## Frontend: plain HTML/CSS/JS, not a framework
 

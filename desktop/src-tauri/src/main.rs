@@ -6,6 +6,11 @@ use commands::AppState;
 use tauri::{ Emitter, Manager };
 
 fn main() {
+    // The abuse.ch Auth-Key can live in a .env file (see .env.example).
+    // `cargo tauri dev` runs in desktop/src-tauri, so the repository's .env
+    // is found in a parent folder.
+    secureguard_core::signature_sync::load_env_file();
+
     tauri::Builder
         ::default()
         .plugin(tauri_plugin_dialog::init())

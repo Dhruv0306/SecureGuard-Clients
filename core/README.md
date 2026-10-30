@@ -51,6 +51,14 @@ Symlinks and junctions are not followed, hidden files and a few system folders
 are skipped and counted, files over 100 MB are counted but not scanned (see
 docs/phase5-2-5-3-design-plan.md).
 
+`sync` needs a free abuse.ch **Auth-Key** (MalwareBazaar's exports no longer work without
+one; the old keyless URL answers HTTP 410). Sign in at <https://auth.abuse.ch/>, create an
+Auth-Key, and set it as `ABUSE_CH_AUTH_KEY` in the environment or in a `.env` file in the
+repository (copy `.env.example`; git ignores `.env`). Without a key, `sync` makes no
+request and says what to do, and the signatures already in the database stay. The key is
+part of the feed URL, so it is hidden (`***`) in every error and in the stored source.
+`--feed-url` URLs are fetched as given.
+
 `sync` is a one-shot fetch-and-persist pass, not a background service. Nothing in this
 crate runs continuously yet, so periodic syncing is left to the OS's own scheduler (cron,
 Task Scheduler) invoking this command, see docs/phase2-threat-intel-sync-plan.md for the
