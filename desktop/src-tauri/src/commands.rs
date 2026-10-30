@@ -198,14 +198,21 @@ pub fn do_recent_scans(state: &AppState, limit: i64) -> Result<Vec<ScanResult>, 
     storage::recent_scans(&conn, limit).map_err(|e| format!("failed to load history: {e}"))
 }
 
+/// Syncs with the Auth-Key from `ABUSE_CH_AUTH_KEY`.
 pub fn do_sync(state: &AppState) -> Result<SyncResult, String> {
+    do_sync_with(state, signature_sync::auth_key_from_env().as_deref())
+}
+
+/// `do_sync` with the key passed in, so tests need neither the environment
+/// nor the network.
+pub fn do_sync_with(state: &AppState, auth_key: Option<&str>) -> Result<SyncResult, String> {
     // The database lock is released at the end of this block, before the
     // signature lock is taken below, so this function never holds both.
     let (result, refreshed) = {
         let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
 
         let result = signature_sync
-            ::sync_signatures(&[signature_sync::DEFAULT_FEED_URL], &conn)
+            ::sync_default_feeds(&conn, auth_key)
             .map_err(|e| format!("sync failed: {e}"))?;
 
         // Reload in-memory signatures so a scan run immediately after this
@@ -745,5 +752,20 @@ mod tests {
             assert!(close_is_blocked(&state));
         }
         assert!(!close_is_blocked(&state));
+    }
+
+    #[test]
+    fn a_sync_without_a_key_makes_no_request_and_leaves_the_state_usable() {
+        let (state, _dir) = test_state();
+
+        let result = do_sync_with(&state, None).unwrap();
+
+        assert_eq!(result.new_signatures, 0);
+        assert_eq!(result.feed_errors.len(), 1);
+        assert!(result.feed_errors[0].contains("Auth-Key"), "{}", result.feed_errors[0]);
+        // Neither lock is left held or poisoned.
+        assert!(state.conn.lock().is_ok());
+        assert!(state.signatures.lock().is_ok());
+        assert!(do_sync_with(&state, Some("  ")).is_ok());
     }
 }

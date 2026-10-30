@@ -321,13 +321,16 @@ fn run_sync(db: &Path, feed_urls: &[String]) -> ExitCode {
         }
     };
 
-    let urls: Vec<&str> = if feed_urls.is_empty() {
-        vec![signature_sync::DEFAULT_FEED_URL]
+    // No --feed: the default feed, which needs the Auth-Key from
+    // ABUSE_CH_AUTH_KEY. Explicit --feed URLs are fetched as given.
+    let synced = if feed_urls.is_empty() {
+        signature_sync::sync_default_feeds(&conn, signature_sync::auth_key_from_env().as_deref())
     } else {
-        feed_urls.iter().map(String::as_str).collect()
+        let urls: Vec<&str> = feed_urls.iter().map(String::as_str).collect();
+        signature_sync::sync_signatures(&urls, &conn)
     };
 
-    match signature_sync::sync_signatures(&urls, &conn) {
+    match synced {
         Ok(result) => {
             println!(
                 "synced {} new signature(s), {} total in database",

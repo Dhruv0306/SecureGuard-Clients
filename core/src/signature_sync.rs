@@ -32,9 +32,76 @@ use std::time::{ Duration, SystemTime, UNIX_EPOCH };
 pub const EICAR_SIGNATURE_SHA256: &str =
     "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f";
 
-/// Ported from ThreatIntelSignatureService's default
-/// app.threat-intel.urls value.
-pub const DEFAULT_FEED_URL: &str = "https://bazaar.abuse.ch/export/txt/sha256/recent/";
+/// Where the abuse.ch Auth-Key is read from: an environment variable, which
+/// the CLI and the desktop app can also fill from a `.env` file.
+pub const AUTH_KEY_ENV: &str = "ABUSE_CH_AUTH_KEY";
+
+/// abuse.ch made its exports require a free Auth-Key (the old keyless
+/// `/export/txt/sha256/recent/` URL now answers 410). The documented form
+/// puts the key in the path of the CSV export, which lists the hashes added
+/// in the last 48 hours and is refreshed every 5 minutes.
+const MALWAREBAZAAR_EXPORT_BASE: &str = "https://mb-api.abuse.ch/v2/files/exports";
+
+fn missing_key_message() -> String {
+    format!(
+        "MalwareBazaar needs a free Auth-Key. Get one at https://auth.abuse.ch/ and set {AUTH_KEY_ENV}."
+    )
+}
+
+/// Trims the key and treats an empty or blank value as no key.
+pub fn auth_key_from(value: Option<String>) -> Option<String> {
+    value
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+}
+
+pub fn auth_key_from_env() -> Option<String> {
+    auth_key_from(std::env::var(AUTH_KEY_ENV).ok())
+}
+
+/// Everything except letters, digits and `-._~` is percent-encoded, so a key
+/// can never add a path segment, a query or a fragment to the URL.
+fn percent_encode_unreserved(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// The MalwareBazaar "recent" export URL for this key. The URL contains the
+/// key, so it must never be shown or stored as it is: see [`redact_feed_url`].
+pub fn malwarebazaar_feed_url(auth_key: &str) -> Result<String, String> {
+    let key = auth_key.trim();
+    if key.is_empty() {
+        return Err("the Auth-Key is empty".to_string());
+    }
+    Ok(format!("{MALWAREBAZAAR_EXPORT_BASE}/{}/recent.csv", percent_encode_unreserved(key)))
+}
+
+/// The URL with any Auth-Key hidden: the path segment after `/exports/` (when
+/// more path follows it) and the value of an `auth-key=` query parameter.
+/// Used for every error and for the `source` stored with each signature.
+pub fn redact_feed_url(url: &str) -> String {
+    let mut out = url.to_string();
+    if let Some(at) = out.find("/exports/") {
+        let start = at + "/exports/".len();
+        if let Some(slash) = out[start..].find('/') {
+            out.replace_range(start..start + slash, "***");
+        }
+    }
+    let lower = out.to_ascii_lowercase();
+    if let Some(at) = lower.find("auth-key=") {
+        let start = at + "auth-key=".len();
+        let end = out[start..].find(['&', '#']).map_or(out.len(), |offset| start + offset);
+        out.replace_range(start..end, "***");
+    }
+    out
+}
 
 fn sha256_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -101,17 +168,24 @@ fn fetch_feed_text_with(url: &str, timeout: Duration) -> Result<String, String> 
         .build();
     let agent: ureq::Agent = config.into();
 
+    // The URL can contain the Auth-Key, so only this form is ever shown.
+    let shown = redact_feed_url(url);
+
     let response = agent
         .get(url)
         .call()
-        .map_err(|e| match e {
-            // abuse.ch has announced mandatory authentication for its APIs;
-            // say so plainly instead of leaving a bare status code.
-            ureq::Error::StatusCode(code @ (401 | 403)) =>
-                format!(
-                    "request to {url} was rejected (HTTP {code}); the feed may now require an Auth-Key"
-                ),
-            other => format!("request to {url} failed: {other}"),
+        .map_err(|e| {
+            let message = match e {
+                // abuse.ch requires an Auth-Key; say so plainly instead of
+                // leaving a bare status code.
+                ureq::Error::StatusCode(code @ (401 | 403)) =>
+                    format!(
+                        "request to {shown} was not accepted (HTTP {code}); check the Auth-Key in {AUTH_KEY_ENV}"
+                    ),
+                other => format!("request to {shown} failed: {other}"),
+            };
+            // Whatever the library put in its own error text.
+            message.replace(url, &shown)
         })?;
 
     let mut text = String::new();
@@ -119,7 +193,7 @@ fn fetch_feed_text_with(url: &str, timeout: Duration) -> Result<String, String> 
         .into_body()
         .into_reader()
         .read_to_string(&mut text)
-        .map_err(|e| format!("failed to read response body from {url}: {e}"))?;
+        .map_err(|e| format!("failed to read response body from {shown}: {e}").replace(url, &shown))?;
     Ok(text)
 }
 
@@ -137,7 +211,7 @@ pub fn sync_signatures(feed_urls: &[&str], conn: &Connection) -> rusqlite::Resul
                     let inserted = conn.execute(
                         "INSERT OR IGNORE INTO signature_cache (sha256, source, added_at) \
                          VALUES (?1, ?2, ?3)",
-                        params![hash, url, added_at]
+                        params![hash, redact_feed_url(url), added_at]
                     )?;
                     if inserted > 0 {
                         result.new_signatures += 1;
@@ -155,6 +229,25 @@ pub fn sync_signatures(feed_urls: &[&str], conn: &Connection) -> rusqlite::Resul
     )? as usize;
 
     Ok(result)
+}
+
+/// The default feed, MalwareBazaar's recent export, which needs an Auth-Key.
+/// With no key it makes no request and says what to do; what was learned
+/// before stays in the cache either way.
+pub fn sync_default_feeds(conn: &Connection, auth_key: Option<&str>) -> rusqlite::Result<SyncResult> {
+    let Some(key) = auth_key_from(auth_key.map(str::to_string)) else {
+        let mut result = sync_signatures(&[], conn)?;
+        result.feed_errors.push(missing_key_message());
+        return Ok(result);
+    };
+    match malwarebazaar_feed_url(&key) {
+        Ok(url) => sync_signatures(&[&url], conn),
+        Err(_) => {
+            let mut result = sync_signatures(&[], conn)?;
+            result.feed_errors.push(missing_key_message());
+            Ok(result)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -349,5 +442,133 @@ mod tests {
         let result = sync_signatures(&["http://127.0.0.1:1/"], &conn).unwrap();
         assert_eq!(result.feed_errors.len(), 1);
         assert_eq!(result.new_signatures, 0);
+    }
+
+    // --- Auth-Key handling (abuse.ch made the export require one) ---
+
+    const KEY: &str = "SECRETKEY123";
+
+    /// A feed URL shaped like abuse.ch's, with the key in the path, but
+    /// served by a local test server.
+    fn keyed_local_url(base: &str) -> String {
+        format!("{base}v2/files/exports/{KEY}/recent.csv")
+    }
+
+    #[test]
+    fn the_feed_url_puts_the_key_where_abuse_ch_documents_it() {
+        assert_eq!(
+            malwarebazaar_feed_url("abc-123_XYZ").unwrap(),
+            "https://mb-api.abuse.ch/v2/files/exports/abc-123_XYZ/recent.csv"
+        );
+    }
+
+    #[test]
+    fn a_key_cannot_change_the_rest_of_the_url() {
+        let url = malwarebazaar_feed_url("a/b?c#d e").unwrap();
+        assert_eq!(
+            url,
+            "https://mb-api.abuse.ch/v2/files/exports/a%2Fb%3Fc%23d%20e/recent.csv"
+        );
+        assert!(malwarebazaar_feed_url("").is_err());
+        assert!(malwarebazaar_feed_url("   ").is_err());
+    }
+
+    #[test]
+    fn redaction_hides_the_key_in_the_path_and_in_a_query_and_leaves_other_urls_alone() {
+        assert_eq!(
+            redact_feed_url("https://mb-api.abuse.ch/v2/files/exports/SECRETKEY123/recent.csv"),
+            "https://mb-api.abuse.ch/v2/files/exports/***/recent.csv"
+        );
+        assert_eq!(
+            redact_feed_url("https://example.org/feed.txt?auth-key=SECRETKEY123&x=1"),
+            "https://example.org/feed.txt?auth-key=***&x=1"
+        );
+        assert_eq!(redact_feed_url("http://127.0.0.1:8080/feed.txt"), "http://127.0.0.1:8080/feed.txt");
+    }
+
+    #[test]
+    fn an_empty_or_blank_key_counts_as_no_key() {
+        assert_eq!(auth_key_from(None), None);
+        assert_eq!(auth_key_from(Some("".to_string())), None);
+        assert_eq!(auth_key_from(Some("  \t".to_string())), None);
+        assert_eq!(auth_key_from(Some("  abc \n".to_string())), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn without_a_key_the_sync_says_what_to_do_and_keeps_what_it_has() {
+        let conn = storage::open_in_memory().unwrap();
+        conn.execute(
+            "INSERT INTO signature_cache (sha256, source, added_at) VALUES (?1, 'seed', 0)",
+            params!["d".repeat(64)]
+        ).unwrap();
+
+        for key in [None, Some("   ")] {
+            let result = sync_default_feeds(&conn, key).unwrap();
+            assert_eq!(result.new_signatures, 0);
+            assert_eq!(result.total_signatures, 1, "what was learned before must stay");
+            assert_eq!(result.feed_errors.len(), 1);
+            let message = &result.feed_errors[0];
+            assert!(message.contains("Auth-Key"), "{message}");
+            assert!(message.contains("auth.abuse.ch"), "{message}");
+            assert!(message.contains(AUTH_KEY_ENV), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_error_never_contains_the_key_whatever_went_wrong() {
+        let rejected = keyed_local_url(&spawn_single_response_server("", "HTTP/1.1 403 Forbidden"));
+        let broken = keyed_local_url(&spawn_single_response_server("", "HTTP/1.1 500 Internal Server Error"));
+        let gone = keyed_local_url(&spawn_single_response_server("", "HTTP/1.1 410 Gone"));
+        let unreachable = format!("http://127.0.0.1:1/v2/files/exports/{KEY}/recent.csv");
+
+        for url in [rejected, broken, gone, unreachable] {
+            let error = fetch_feed_text(&url).unwrap_err();
+            assert!(!error.contains(KEY), "the key leaked into: {error}");
+            assert!(error.contains("***"), "expected the redacted URL in: {error}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_key_is_reported_as_not_accepted() {
+        let url = keyed_local_url(&spawn_single_response_server("", "HTTP/1.1 401 Unauthorized"));
+        let error = fetch_feed_text(&url).unwrap_err();
+        assert!(error.contains("401"), "{error}");
+        assert!(error.contains("not accepted"), "{error}");
+        assert!(error.contains(AUTH_KEY_ENV), "{error}");
+    }
+
+    #[test]
+    fn the_stored_source_and_the_sync_result_never_contain_the_key() {
+        let conn = storage::open_in_memory().unwrap();
+        let hash = "a".repeat(64);
+        let good = keyed_local_url(&spawn_single_response_server(hash.leak(), "HTTP/1.1 200 OK"));
+        let bad = keyed_local_url(&spawn_single_response_server("", "HTTP/1.1 403 Forbidden"));
+
+        let result = sync_signatures(&[&good, &bad], &conn).unwrap();
+
+        assert_eq!(result.new_signatures, 1);
+        let source: String = conn
+            .query_row("SELECT source FROM signature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert!(!source.contains(KEY), "the key was stored in source: {source}");
+        assert!(source.contains("/exports/***/"), "{source}");
+        for error in &result.feed_errors {
+            assert!(!error.contains(KEY), "{error}");
+        }
+    }
+
+    #[test]
+    fn hashes_are_found_in_the_quoted_columns_of_a_csv_and_other_hash_kinds_are_not() {
+        let sha256 = "ab".repeat(32);
+        let md5 = "cd".repeat(16);
+        let sha1 = "ef".repeat(20);
+        let sha3_384 = "12".repeat(48);
+        let csv = format!(
+            "################\n# MalwareBazaar recent malware samples (CSV)\n#\n\
+             \"2026-10-30 08:50:00\",\"{sha256}\",\"{md5}\",\"{sha1}\",\"{sha3_384}\",\"a.exe\"\n"
+        );
+        let found = extract_sha256_signatures(&csv);
+        assert_eq!(found.len(), 1);
+        assert!(found.contains(&sha256));
     }
 }
