@@ -13,7 +13,49 @@
     </header>
 
     <main>
+        <section id="folder-scan-section">
+            <h2>Scan</h2>
+            <div class="scan-controls">
+                <button id="scan-folder-btn">Scan a folder&hellip;</button>
+                <label class="checkbox">
+                    <input type="checkbox" id="recursive-checkbox" checked />
+                    Include subfolders
+                </label>
+                <button id="quick-scan-btn">Quick scan</button>
+                <button id="full-scan-btn">Full scan</button>
+                <button id="cancel-scan-btn" class="cancel-btn hidden">Cancel</button>
+            </div>
+            <p class="hint">
+                SecureGuard reports files. It does not quarantine or delete them yet.
+            </p>
+
+            <div id="scan-progress" class="hidden">
+                <div id="progress-text"></div>
+                <div id="progress-dir"></div>
+            </div>
+            <div id="scan-banner" class="hidden" aria-live="polite"></div>
+            <div id="scan-summary" class="hidden" aria-live="polite">
+                <div id="summary-text"></div>
+                <div id="skipped-text" class="hint"></div>
+            </div>
+
+            <div id="scan-results" class="hidden">
+                <p id="no-findings" class="hint hidden">Nothing was flagged.</p>
+                <h3 id="malicious-heading" class="hidden">Likely malicious (0)</h3>
+                <ul id="malicious-list" class="finding-list"></ul>
+                <details id="suspicious-group" class="hidden">
+                    <summary id="suspicious-summary">Worth a look (0)</summary>
+                    <p class="hint">
+                        These are not confirmed threats. Packed installers and temporary
+                        files often look like this.
+                    </p>
+                    <ul id="suspicious-list" class="finding-list"></ul>
+                </details>
+            </div>
+        </section>
+
         <section id="scan-section">
+            <h2>Scan a single file</h2>
             <button id="pick-file-btn">Choose file to scan…</button>
             <span id="picked-file"></span>
             <div id="verdict-panel" class="hidden">
@@ -47,6 +89,7 @@
         </section>
     </main>
 
+    <script src="scan-view.js"></script>
     <script src="main.js"></script>
 </body>
 </html>
