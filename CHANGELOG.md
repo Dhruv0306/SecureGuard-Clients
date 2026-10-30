@@ -53,6 +53,11 @@ project uses [Semantic Versioning](https://semver.org/).
   floor again fails CI instead of silently breaking older toolchains.
 
 ### Fixed
+- Core, desktop: signature sync works again. abuse.ch now requires a free Auth-Key and the old
+  keyless URL answered HTTP 410, so no new signatures arrived. The default feed is MalwareBazaar's
+  recent CSV export, with the key read from `ABUSE_CH_AUTH_KEY` (environment or a `.env` file, see
+  `.env.example`). Without a key the sync makes no request and says what to do. The key is hidden
+  in every error and in the stored source.
 - Detection: a system scan of a developer machine flagged about 4.6% of files, nearly all
   legitimate. Four fixes (details and the Java follow-up in
   `docs/java-engine-false-positive-fixes.md`): `.jar` and `.msi` are no longer penalized for

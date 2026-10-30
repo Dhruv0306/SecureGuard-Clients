@@ -31,6 +31,14 @@ folders) or every drive (**Full scan**, which asks first). Neither has a time li
 - A scan and a signature sync do not run together. Closing the window during a scan asks
   first.
 
+## Signature sync
+
+**Sync signatures** needs the free abuse.ch Auth-Key (<https://auth.abuse.ch/>) in
+`ABUSE_CH_AUTH_KEY`, in the environment or in a `.env` file (copy `.env.example`). With
+`cargo tauri dev` the repository's `.env` is found. Without a key the status says what to
+do. There is no key field in the app yet, so an installed build needs the variable set in
+the environment.
+
 ## Requirements
 
 Rust toolchain (same as `core/`), plus Tauri's OS-level prerequisites: WebView2 on

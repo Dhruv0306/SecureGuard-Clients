@@ -9,7 +9,11 @@ writing this plan, not assumed from its name. Key behaviors that must carry over
 exactly:
 
 - Feed: `https://bazaar.abuse.ch/export/txt/sha256/recent/` (multi-URL capable,
-  comma/semicolon/whitespace-separated in Java's config string).
+  comma/semicolon/whitespace-separated in Java's config string). **Update 2026-10:**
+  abuse.ch now requires a free Auth-Key and this keyless URL answers 410. The Rust
+  default feed is MalwareBazaar's recent CSV export with the key in the path
+  (`https://mb-api.abuse.ch/v2/files/exports/<key>/recent.csv`); the key comes from
+  `ABUSE_CH_AUTH_KEY`. Hash extraction is unchanged.
 - Hash extraction is regex-based (`\b[a-fA-F0-9]{64}\b`) over raw response text, not
   strict line parsing, tolerant of whatever formatting quirks the feed has.
 - **Persists the full accumulated signature set on every refresh, not just the new

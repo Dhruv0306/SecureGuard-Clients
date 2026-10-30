@@ -25,6 +25,7 @@ zip = "9.0"
 hex = "0.4"
 regex = "1"
 ureq = "3.4"
+dotenvy = "0.15"
 
 # Drive enumeration for the system scan (GetLogicalDrives, GetDriveTypeW). Already
 # in the dependency tree through other crates.
