@@ -20,6 +20,7 @@
 //! schedule. See docs/phase2-threat-intel-sync-plan.md for the full
 //! reasoning.
 
+use crate::storage;
 use regex::Regex;
 use rusqlite::{ params, Connection };
 use std::collections::HashSet;
@@ -146,9 +147,21 @@ pub struct SyncResult {
     /// feeds did not contribute this round, matching Java's
     /// one-bad-feed-never-aborts-the-others behavior.
     pub feed_errors: Vec<String>,
+    /// Set when the fetch was skipped because the last one was under
+    /// [`MIN_FETCH_GAP_SECS`] ago: how many seconds are left to wait. `None`
+    /// means the fetch was not held back.
+    pub retry_after_secs: Option<u64>,
 }
 
-fn now_unix() -> i64 {
+/// The shortest gap allowed between two fetches of the same feed. abuse.ch
+/// asks for no more than one fetch per 5 minutes.
+pub const MIN_FETCH_GAP_SECS: u64 = 300;
+
+/// The id under which the MalwareBazaar fetch time is kept in `feed_sync`.
+pub const FEED_MALWAREBAZAAR: &str = "malwarebazaar";
+
+/// The current time in Unix seconds, or 0 if the clock is before 1970.
+pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -239,11 +252,15 @@ pub fn sync_signatures(feed_urls: &[&str], conn: &Connection) -> rusqlite::Resul
         }
     }
 
-    result.total_signatures = conn.query_row("SELECT COUNT(*) FROM signature_cache", [], |row|
-        row.get::<_, i64>(0)
-    )? as usize;
+    result.total_signatures = total_signatures(conn)?;
 
     Ok(result)
+}
+
+fn total_signatures(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.query_row("SELECT COUNT(*) FROM signature_cache", [], |row| row.get::<_, i64>(0)).map(
+        |count| count as usize
+    )
 }
 
 /// The default feed, MalwareBazaar's recent export, which needs an Auth-Key.
@@ -263,6 +280,47 @@ pub fn sync_default_feeds(conn: &Connection, auth_key: Option<&str>) -> rusqlite
             Ok(result)
         }
     }
+}
+
+/// Runs `fetch` unless this feed was attempted under [`MIN_FETCH_GAP_SECS`] ago.
+/// The attempt time is recorded before the fetch, so a timeout or a crash still
+/// starts the cooldown. When held back, nothing is fetched and the result says
+/// how long to wait; a stored time in the future (a clock moved back) waits at
+/// most one full gap.
+fn run_throttled(
+    conn: &Connection,
+    feed: &str,
+    now: i64,
+    fetch: impl FnOnce() -> rusqlite::Result<SyncResult>
+) -> rusqlite::Result<SyncResult> {
+    let gap = MIN_FETCH_GAP_SECS as i64;
+    if let Some(last) = storage::last_feed_attempt(conn, feed)? {
+        let elapsed = now - last;
+        if elapsed < gap {
+            return Ok(SyncResult {
+                total_signatures: total_signatures(conn)?,
+                retry_after_secs: Some((gap - elapsed).clamp(0, gap) as u64),
+                ..SyncResult::default()
+            });
+        }
+    }
+    storage::record_feed_attempt(conn, feed, now)?;
+    fetch()
+}
+
+/// [`sync_default_feeds`] with the fetch cooldown. With no usable key nothing
+/// is requested, so nothing is read from or written to `feed_sync` either, and
+/// the missing-key message is returned every time. `now` is the current time in
+/// Unix seconds, see [`now_unix`].
+pub fn sync_default_feeds_throttled(
+    conn: &Connection,
+    auth_key: Option<&str>,
+    now: i64
+) -> rusqlite::Result<SyncResult> {
+    if auth_key_from(auth_key.map(str::to_string)).is_none() {
+        return sync_default_feeds(conn, auth_key);
+    }
+    run_throttled(conn, FEED_MALWAREBAZAAR, now, || sync_default_feeds(conn, auth_key))
 }
 
 #[cfg(test)]
@@ -609,5 +667,120 @@ mod tests {
     fn a_missing_env_file_is_an_error_the_caller_can_ignore() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_env_file_from(&dir.path().join("no-such.env")).is_err());
+    }
+
+    /// A fetch stand-in that counts how often it runs and changes nothing.
+    fn counted(calls: &std::cell::Cell<u32>) -> impl FnOnce() -> rusqlite::Result<SyncResult> + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            Ok(SyncResult::default())
+        }
+    }
+
+    #[test]
+    fn the_first_call_runs_the_fetch_and_records_the_attempt() {
+        let conn = storage::open_in_memory().unwrap();
+        let calls = std::cell::Cell::new(0);
+
+        let result = run_throttled(&conn, "f", 1000, counted(&calls)).unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(storage::last_feed_attempt(&conn, "f").unwrap(), Some(1000));
+        assert_eq!(result.retry_after_secs, None);
+    }
+
+    #[test]
+    fn a_second_call_under_300_s_makes_no_fetch() {
+        let conn = storage::open_in_memory().unwrap();
+        let calls = std::cell::Cell::new(0);
+        run_throttled(&conn, "f", 1000, counted(&calls)).unwrap();
+
+        let result = run_throttled(&conn, "f", 1100, counted(&calls)).unwrap();
+
+        assert_eq!(calls.get(), 1, "the throttled call must not fetch");
+        assert_eq!(result.retry_after_secs, Some(200));
+        assert_eq!(result.new_signatures, 0);
+        assert!(result.feed_errors.is_empty());
+        assert_eq!(storage::last_feed_attempt(&conn, "f").unwrap(), Some(1000));
+    }
+
+    #[test]
+    fn a_call_at_exactly_300_s_is_allowed() {
+        let conn = storage::open_in_memory().unwrap();
+        let calls = std::cell::Cell::new(0);
+        run_throttled(&conn, "f", 1000, counted(&calls)).unwrap();
+
+        let result = run_throttled(&conn, "f", 1300, counted(&calls)).unwrap();
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(result.retry_after_secs, None);
+    }
+
+    #[test]
+    fn a_stored_time_in_the_future_waits_at_most_300_s() {
+        let conn = storage::open_in_memory().unwrap();
+        let calls = std::cell::Cell::new(0);
+        storage::record_feed_attempt(&conn, "f", 1000 + 99_999).unwrap();
+
+        let result = run_throttled(&conn, "f", 1000, counted(&calls)).unwrap();
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(result.retry_after_secs, Some(300));
+    }
+
+    #[test]
+    fn a_failed_fetch_still_starts_the_cooldown() {
+        let conn = storage::open_in_memory().unwrap();
+        let url = spawn_single_response_server("", "HTTP/1.1 500 Internal Server Error");
+
+        let result = run_throttled(&conn, "f", 1000, || sync_signatures(&[&url], &conn)).unwrap();
+
+        assert_eq!(result.feed_errors.len(), 1);
+        assert_eq!(storage::last_feed_attempt(&conn, "f").unwrap(), Some(1000));
+    }
+
+    #[test]
+    fn a_throttled_answer_reports_the_real_total() {
+        let conn = storage::open_in_memory().unwrap();
+        for c in ["a", "b", "c"] {
+            conn.execute(
+                "INSERT INTO signature_cache (sha256, source, added_at) VALUES (?1, 'seed', 0)",
+                params![c.repeat(64)]
+            ).unwrap();
+        }
+        storage::record_feed_attempt(&conn, "f", 990).unwrap();
+        let calls = std::cell::Cell::new(0);
+
+        let result = run_throttled(&conn, "f", 1000, counted(&calls)).unwrap();
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(result.total_signatures, 3);
+    }
+
+    #[test]
+    fn no_key_makes_no_request_and_leaves_no_cooldown_row() {
+        let conn = storage::open_in_memory().unwrap();
+        for key in [None, Some("  ")] {
+            for _ in 0..2 {
+                let result = sync_default_feeds_throttled(&conn, key, 5).unwrap();
+
+                assert_eq!(result.retry_after_secs, None);
+                assert!(
+                    result.feed_errors.iter().any(|e| e.contains("Auth-Key")),
+                    "a missing key must be reported every time: {:?}",
+                    result.feed_errors
+                );
+            }
+        }
+        assert_eq!(storage::last_feed_attempt(&conn, FEED_MALWAREBAZAAR).unwrap(), None);
+    }
+
+    #[test]
+    fn retry_after_serializes_as_null_or_a_number() {
+        let none = serde_json::to_value(SyncResult::default()).unwrap();
+        assert!(none["retry_after_secs"].is_null(), "{none}");
+
+        let some = SyncResult { retry_after_secs: Some(42), ..SyncResult::default() };
+        assert_eq!(serde_json::to_value(some).unwrap()["retry_after_secs"], 42);
     }
 }
