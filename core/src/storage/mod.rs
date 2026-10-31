@@ -1,5 +1,5 @@
 use crate::types::{ ScanResult, Verdict };
-use rusqlite::{ params, Connection, Result as SqliteResult };
+use rusqlite::{ params, Connection, OptionalExtension, Result as SqliteResult };
 
 pub fn open(path: &str) -> SqliteResult<Connection> {
     let conn = Connection::open(path)?;
@@ -118,6 +118,32 @@ pub fn list_blocked_domains(conn: &Connection) -> SqliteResult<Vec<String>> {
     rows.collect()
 }
 
+/// When a feed was last fetched (Unix seconds), or `None` if it never was. The
+/// sync cooldown reads this so a restart cannot bypass it.
+pub fn last_feed_attempt(conn: &Connection, feed: &str) -> SqliteResult<Option<i64>> {
+    conn.query_row(
+        "SELECT last_attempt_at FROM feed_sync WHERE feed = ?1",
+        params![feed],
+        |row| row.get(0)
+    ).optional()
+}
+
+/// Records the time of a fetch attempt for a feed, replacing any earlier time.
+pub fn record_feed_attempt(conn: &Connection, feed: &str, at: i64) -> SqliteResult<()> {
+    conn.execute(
+        "INSERT INTO feed_sync (feed, last_attempt_at) VALUES (?1, ?2)
+         ON CONFLICT(feed) DO UPDATE SET last_attempt_at = excluded.last_attempt_at",
+        params![feed, at]
+    )?;
+    Ok(())
+}
+
+/// Forgets a feed's last attempt, so its next fetch is allowed at once.
+pub fn clear_feed_attempt(conn: &Connection, feed: &str) -> SqliteResult<()> {
+    conn.execute("DELETE FROM feed_sync WHERE feed = ?1", params![feed])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +229,54 @@ mod tests {
 
         let domains = list_blocked_domains(&conn).unwrap();
         assert_eq!(domains.len(), 1);
+    }
+
+    #[test]
+    fn feed_attempt_is_none_until_recorded() {
+        let conn = open_in_memory().unwrap();
+        assert_eq!(last_feed_attempt(&conn, "f").unwrap(), None);
+
+        record_feed_attempt(&conn, "f", 100).unwrap();
+
+        assert_eq!(last_feed_attempt(&conn, "f").unwrap(), Some(100));
+    }
+
+    #[test]
+    fn recording_again_replaces_the_time() {
+        let conn = open_in_memory().unwrap();
+        record_feed_attempt(&conn, "f", 100).unwrap();
+        record_feed_attempt(&conn, "f", 250).unwrap();
+
+        assert_eq!(last_feed_attempt(&conn, "f").unwrap(), Some(250));
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feed_sync", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn feeds_are_tracked_separately_and_clear_removes_only_one() {
+        let conn = open_in_memory().unwrap();
+        record_feed_attempt(&conn, "a", 10).unwrap();
+        record_feed_attempt(&conn, "b", 20).unwrap();
+
+        clear_feed_attempt(&conn, "a").unwrap();
+
+        assert_eq!(last_feed_attempt(&conn, "a").unwrap(), None);
+        assert_eq!(last_feed_attempt(&conn, "b").unwrap(), Some(20));
+    }
+
+    #[test]
+    fn an_older_database_gains_the_table_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("older.db").to_string_lossy().into_owned();
+        {
+            let conn = open(&path).unwrap();
+            conn.execute("DROP TABLE feed_sync", []).unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+
+        assert_eq!(last_feed_attempt(&conn, "f").unwrap(), None);
     }
 }

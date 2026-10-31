@@ -24,3 +24,7 @@ CREATE TABLE IF NOT EXISTS blocked_domains (
     reason TEXT,
     added_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS feed_sync (
+    feed TEXT PRIMARY KEY,
+    last_attempt_at INTEGER NOT NULL
+);
