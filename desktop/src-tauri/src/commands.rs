@@ -206,14 +206,29 @@ pub fn do_sync(state: &AppState) -> Result<SyncResult, String> {
 /// `do_sync` with the key passed in, so tests need neither the environment
 /// nor the network.
 pub fn do_sync_with(state: &AppState, auth_key: Option<&str>) -> Result<SyncResult, String> {
+    do_sync_at(state, auth_key, signature_sync::now_unix())
+}
+
+/// `do_sync_with` with the current time passed in (Unix seconds), so tests can
+/// stand inside or outside the fetch cooldown. A sync held back by the
+/// cooldown fetches nothing and leaves the loaded signatures as they are.
+pub fn do_sync_at(
+    state: &AppState,
+    auth_key: Option<&str>,
+    now: i64
+) -> Result<SyncResult, String> {
     // The database lock is released at the end of this block, before the
     // signature lock is taken below, so this function never holds both.
     let (result, refreshed) = {
         let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
 
         let result = signature_sync
-            ::sync_default_feeds(&conn, auth_key)
+            ::sync_default_feeds_throttled(&conn, auth_key, now)
             .map_err(|e| format!("sync failed: {e}"))?;
+        if result.retry_after_secs.is_some() {
+            // Nothing was fetched, so there is nothing new to load.
+            return Ok(result);
+        }
 
         // Reload in-memory signatures so a scan run immediately after this
         // sync sees the newly learned hashes, not just on next app restart.
@@ -767,5 +782,27 @@ mod tests {
         assert!(state.conn.lock().is_ok());
         assert!(state.signatures.lock().is_ok());
         assert!(do_sync_with(&state, Some("  ")).is_ok());
+    }
+
+    #[test]
+    fn a_sync_inside_the_cooldown_makes_no_request_and_keeps_the_signature_set() {
+        let (state, _dir) = test_state();
+        let now = 10_000;
+        {
+            let conn = state.conn.lock().unwrap();
+            storage
+                ::record_feed_attempt(&conn, signature_sync::FEED_MALWAREBAZAAR, now - 10)
+                .unwrap();
+        }
+        let before = Arc::as_ptr(&*state.signatures.lock().unwrap());
+
+        let result = do_sync_at(&state, Some("any-key"), now).unwrap();
+
+        assert_eq!(result.retry_after_secs, Some(290));
+        assert_eq!(result.new_signatures, 0);
+        assert!(result.feed_errors.is_empty(), "{:?}", result.feed_errors);
+        let after = Arc::as_ptr(&*state.signatures.lock().unwrap());
+        assert_eq!(before, after, "a throttled sync must not reload the signature set");
+        assert!(state.conn.lock().is_ok());
     }
 }
