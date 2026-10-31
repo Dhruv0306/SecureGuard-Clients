@@ -16,7 +16,9 @@ docs/       Architecture and phase-by-phase plans
 ## Status
 
 Phases 1-4 complete (detection core, threat-intel sync, desktop shell, privileged
-helper). Phase 5 (release workflow) in progress. Phases 6-8 (Android) not yet started.
+helper). Phase 5 is in progress: the release workflow, the domain blocking screen (5.1) and
+the in-app directory scan (5.2) are built, and the network scan (5.3) is next. Phases 6-8
+(Android) not yet started.
 See `docs/standalone-native-clients-plan.md` for the full phase breakdown and each
 phase's own `docs/phaseN-*-plan.md` for detail.
 

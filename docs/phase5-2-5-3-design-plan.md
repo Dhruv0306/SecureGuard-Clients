@@ -5,13 +5,15 @@ Date: 13/10/2026. Replaces the 5.2 and 5.3 sections of
 decisions is in [phase5-3-spike-results.md](phase5-3-spike-results.md) and
 [helper-security-model.md](helper-security-model.md).
 
+Status table, build notes and decisions D15 to D28 brought up to date on 31/10/2026.
+
 ## Where things stand
 
 | Phase | State |
 |---|---|
-| 5.1 domain blocking | UI and backend done. Works for a normal user only after the helper pipe fix (PR 1 below) |
-| 5.2 directory and system scan | Not started. The lock fix and async command pattern it needs are merged |
-| 5.3 network scan | Not started. Crates, MSRV and feed access are validated |
+| 5.1 domain blocking | Done. UI, backend, the helper pipe fix (PR 26), the lock fix and async commands (PR 25) are merged |
+| 5.2 directory and system scan | Done. Engine, CLI and false-positive rounds (PRs 41 to 43), the in-app scan (PRs 44, 45 and 51) and the sync fix (PR 52) are merged |
+| 5.3 network scan | Not started. Crates and MSRV are validated. Feed access must be checked again before 5.3b (see below) |
 
 ## Decisions (agreed 13/10/2026)
 
@@ -164,8 +166,9 @@ flagged files were legitimate. The engine work that followed, all in `secureguar
 - **Targets (D12, core part).** `quick_scan_roots()`, `full_scan_roots()`, `ScanOptions::quick()`
   and `full()`, and CLI `--quick` and `--full`.
 
-Still for 5.2b: the app commands and screens for Quick scan and Full scan, progress, cancel and
-results; running a full scan in the background; and wiring the worker count.
+Built in 5.2b (PRs 44, 45 and 51): the app commands for a folder, Quick and Full scan, progress
+events, cancel, and the scan screen with live findings. Still not built: running a Full scan in
+the background (no tray yet), and a worker-count setting.
 
 ## Phase 5.3a: local network scan
 
@@ -190,19 +193,22 @@ results; running a full scan in the background; and wiring the worker count.
   lists. Parser: comments, blank lines, IPv4 and IPv6.
 - Matcher: established connections against the set, ignoring private and loopback addresses and
   normalizing IPv4-mapped IPv6. A match is a high-severity finding with the process and address.
-- Keyless by default. An optional abuse.ch key is read from the environment, and a 401 or
-  403 reports that a key may now be required.
+- Check feed access first. The spike found the Feodo list and the MalwareBazaar export
+  answering without a key, and MalwareBazaar has since started requiring a free abuse.ch
+  Auth-Key (the old keyless URL answers HTTP 410). Whether the Feodo list still works without
+  a key has not been checked since. If it needs one, it shares the key the hash sync uses
+  (`ABUSE_CH_AUTH_KEY`), and a 401 or 403 names the variable.
 - The UI shows how old each list is.
 
 ## Pull requests, in order
 
-| # | Branch | Depends on |
-|---|---|---|
-| 1 | `fix/helper-pipe-access-and-validation` (pipe access, hostname validation, Windows CI job) | none |
-| 2 | `phase5.2a-dir-scan-core` (core, CLI, macOS CI job) | none |
-| 3 | `phase5.2b-dir-scan-desktop` | 2 |
-| 4 | `phase5.3a-net-scan` | 3 (shared UI files) |
-| 5 | `phase5.3b-threat-ip-match` | 4 |
+| # | Branch | Depends on | State |
+|---|---|---|---|
+| 1 | `fix/helper-pipe-access-and-validation` (pipe access, hostname validation, Windows CI job) | none | Merged (PR 26) |
+| 2 | `phase5.2-engine` (core, CLI, macOS CI job), then false-positive round 2 and the root alias fix | none | Merged (PRs 41 to 43) |
+| 3 | 5.2b in three PRs: core prep (PR 44), scan commands (PR 45), scan screen (PR 51); then the sync fix (PR 52) | 2 | Merged |
+| 4 | `phase5.3a-net-scan` | 3 (shared UI files) | Not started |
+| 5 | `phase5.3b-threat-ip-match` | 4 | Not started |
 
 Each PR carries its own changelog entry and doc changes, and a manual smoke checklist.
 
@@ -216,6 +222,34 @@ Each PR carries its own changelog entry and doc changes, and a manual smoke chec
 | Progress events flood the UI | Throttle in the core |
 | Helper reachable by any interactive user | Validation in the helper (PR 1); stricter caller checks are a later option |
 | Helper socket permissions on Linux and macOS | Unverified, listed in the helper security doc; fix before shipping there |
+
+## Decisions made while building 5.2 (D15 to D28)
+
+| # | Decision |
+|---|---|
+| D15 | Text patterns and the folder score alone cannot convict: with no signal about the file itself, the total is capped at 59 |
+| D16 | The folder score applies only to the note-like and cluster files it is about, counting regular files only |
+| D17 | Scan roots are resolved to their real spelling before they are compared, so one folder is not scanned under two names |
+| D18 | A Full scan runs only while the window is open. Closing the window asks to cancel it. No tray for now |
+| D19 | Live findings reach the page through `Progress::new_findings` |
+| D20 | Likely malicious files first, Suspicious files in a collapsed "Worth a look" group, reasons in plain words, no `VIRUS` label in the app |
+| D21 | Quick scan covers a few key folders and has no time limit. Only the CLI `--system` keeps 5 minutes |
+| D22 | Incremental scan is not part of 5.2b |
+| D23 | The Java false-positive fixes are a separate small track after 5.2b |
+| D24 | One scan at a time. Sync is disabled during a scan, and scans are disabled during a sync |
+| D25 | History keeps non-clean results only, by file name |
+| D26 | The abuse.ch Auth-Key comes from `ABUSE_CH_AUTH_KEY`, in the environment or a `.env` file. There is no in-app setting yet |
+| D27 | The key is never shown or stored: it is percent-encoded in the URL and hidden in every error and in the stored `source` |
+| D28 | The scan screen's pure logic lives in `desktop/src/scan-view.js`, tested under Node |
+
+The detailed 5.2b plan was kept outside the repository. Where the build differed from it:
+the `ScanKind` enum was dropped because nothing used it and it would be dead code under
+`-D warnings`; two planned commits of the scan-commands PR were folded into one so every commit
+passes clippy; `aria-live` is on the banner and the summary, not on the progress line; and the
+in-app key field and settings file were left out of the sync fix.
+
+Other standing decisions: a folder chosen explicitly is never skipped; report paths are lossy
+strings; domains are validated by type; bulk scan history writes are one transaction.
 
 ## Corrections to the earlier plan
 
