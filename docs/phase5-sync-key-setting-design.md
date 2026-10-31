@@ -63,19 +63,19 @@ pub fn sync_default_feeds_throttled(conn: &Connection, auth_key: Option<&str>, n
 - `sync_signatures(&[urls], conn)` is unchanged and is not throttled. The CLI `--feed-url`
   path uses it, and a feed the user names is their choice.
 
-`SyncResult` gains `retry_after_secs: Option<u64>` with `#[serde(default)]`.
+`SyncResult` gains `retry_after_secs: Option<u64>`. `SyncResult` is only serialized (it has no
+`Deserialize`), so it reaches the page as `null` or a number.
 
 Callers. The CLI default sync and `do_sync_with` switch to the throttled function, each
 reading the real clock. `do_sync_with(state, key)` keeps its shape, and tests call a variant
-that also takes `now`. The CLI prints "synced recently, try again in N s" when throttled.
+that also takes `now`. The CLI prints "fetched recently, try again in N s" when throttled.
 
-Missing-key message. It names only `ABUSE_CH_AUTH_KEY` today. It becomes: "MalwareBazaar
-needs a free Auth-Key. Get one at https://auth.abuse.ch/ and add it in the app, or set
-ABUSE_CH_AUTH_KEY in the environment or a .env file." The test that checks for "Auth-Key"
-still holds.
+The missing-key message is unchanged in PR A. It changes in PR B (see there), because in PR A
+it would point at an app field that does not exist yet.
 
-Frontend. `ScanView.syncText` shows "Synced a moment ago. Next fetch allowed in {time}." when
-`retry_after_secs` is set, using the existing `formatDuration`.
+Frontend. `ScanView.syncText` shows "Fetched recently. Next fetch allowed in {time}." when
+`retry_after_secs` is set, using the existing `formatDuration`. It does not say "Synced",
+because the earlier attempt may have failed.
 
 ## PR B: key setting (desktop)
 
@@ -126,6 +126,14 @@ All run through `run_blocking` because they touch the disk.
 It never contains the key. If both exist, `source` is `environment` and `saved` is true, so
 the page can still offer Remove.
 
+Save also calls `storage::clear_feed_attempt` for the feed (added in PR A), so a corrected key
+is not held back by the cooldown an earlier, rejected key started.
+
+Missing-key message. It names only `ABUSE_CH_AUTH_KEY` today. It becomes: "MalwareBazaar
+needs a free Auth-Key. Get one at https://auth.abuse.ch/ and add it in the app, or set
+ABUSE_CH_AUTH_KEY in the environment or a .env file." The test that checks for "Auth-Key"
+still holds.
+
 Validation (`save_auth_key_cmd`): trim; reject empty; reject any whitespace or control
 character inside the key; reject more than 256 bytes. The real format of an abuse.ch key is
 not documented here, so nothing else is rejected. Error texts are fixed strings and never
@@ -164,8 +172,8 @@ PR A (core): cooldown blocks a second call under 300 s and allows it at 300 s (f
 a throttled call makes no request (a local listener that counts connections, as the existing
 tests do); no key records nothing; a future `last_attempt_at` waits at most 300 s; the
 attempt is recorded even when the request fails; an existing database gains the table;
-`retry_after_secs` round-trips through serde and defaults when absent; the missing-key
-message still contains "Auth-Key".
+`retry_after_secs` serializes as `null` or a number; the missing-key message still contains
+"Auth-Key".
 
 PR B (desktop): save then status reports `settings`; environment wins; blank environment
 falls back to the saved key; `ABUSECH_AUTH_KEY` is accepted; validation cases; clear removes

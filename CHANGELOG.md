@@ -8,6 +8,11 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Sync: no feed fetch starts less than 5 minutes after the previous one, which is the limit
+  abuse.ch asks for. The time of the last fetch is kept in the database, so the limit holds
+  across restarts. It is per database, so the command line tool and the app, which use
+  different databases, do not share it. When a sync is held back, the app and
+  `scg-scan sync` say how long to wait. Fetches from `--feed-url` are not limited.
 - Desktop: the scan screen. Scan a folder, run a Quick scan or a Full scan (which asks first), see
   progress and findings while it runs, and cancel at any time. "Likely malicious" files come first,
   "Worth a look" files are in a collapsed group, and every finding lists why it was flagged in

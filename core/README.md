@@ -57,7 +57,10 @@ Auth-Key, and set it as `ABUSE_CH_AUTH_KEY` in the environment or in a `.env` fi
 repository (copy `.env.example`; git ignores `.env`). Without a key, `sync` makes no
 request and says what to do, and the signatures already in the database stay. The key is
 part of the feed URL, so it is hidden (`***`) in every error and in the stored source.
-`--feed-url` URLs are fetched as given.
+`--feed-url` URLs are fetched as given, with no limit. The default feed is fetched at most
+once every 5 minutes, which is what abuse.ch asks for: a `sync` inside that window prints
+`fetched recently, try again in N s` and fetches nothing. The time of the last fetch is kept
+in the database, so the limit is per database.
 
 `sync` is a one-shot fetch-and-persist pass, not a background service. Nothing in this
 crate runs continuously yet, so periodic syncing is left to the OS's own scheduler (cron,
