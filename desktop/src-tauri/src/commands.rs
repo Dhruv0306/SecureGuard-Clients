@@ -204,18 +204,32 @@ pub fn do_recent_scans(state: &AppState, limit: i64) -> Result<Vec<ScanResult>, 
     storage::recent_scans(&conn, limit).map_err(|e| format!("failed to load history: {e}"))
 }
 
-/// Syncs with the Auth-Key from `ABUSE_CH_AUTH_KEY`.
+/// Syncs with the Auth-Key: the environment variable if there is one,
+/// otherwise the key saved in the settings file.
 pub fn do_sync(state: &AppState) -> Result<SyncResult, String> {
-    do_sync_with(state, signature_sync::auth_key_from_env().as_deref())
+    do_sync_env(state, signature_sync::auth_key_from_env(), signature_sync::now_unix())
 }
 
-/// `do_sync` with the key passed in, so tests need neither the environment
-/// nor the network.
-pub fn do_sync_with(state: &AppState, auth_key: Option<&str>) -> Result<SyncResult, String> {
-    do_sync_at(state, auth_key, signature_sync::now_unix())
+/// The key a sync uses. The environment wins, and then the settings file is
+/// not read at all, so a damaged file cannot break a sync that does not need
+/// it. Otherwise the saved key; a damaged file is an error naming its path.
+fn resolve_sync_key(state: &AppState, env: Option<String>) -> Result<Option<String>, String> {
+    if let Some(key) = signature_sync::auth_key_from(env) {
+        return Ok(Some(key));
+    }
+    let saved = settings::load(&state.settings_path)?.abuse_ch_auth_key;
+    Ok(signature_sync::auth_key_from(saved))
 }
 
-/// `do_sync_with` with the current time passed in (Unix seconds), so tests can
+/// `do_sync` with the environment key and the time passed in, so tests need
+/// neither the process environment nor the network.
+fn do_sync_env(state: &AppState, env: Option<String>, now: i64) -> Result<SyncResult, String> {
+    let key = resolve_sync_key(state, env)?;
+    do_sync_at(state, key.as_deref(), now)
+}
+
+/// Syncs with the key passed in and the current time passed in (Unix
+/// seconds), so tests need neither the environment nor the network and can
 /// stand inside or outside the fetch cooldown. A sync held back by the
 /// cooldown fetches nothing and leaves the loaded signatures as they are.
 pub fn do_sync_at(
@@ -866,7 +880,7 @@ mod tests {
     fn a_sync_without_a_key_makes_no_request_and_leaves_the_state_usable() {
         let (state, _dir) = test_state();
 
-        let result = do_sync_with(&state, None).unwrap();
+        let result = do_sync_at(&state, None, 10_000).unwrap();
 
         assert_eq!(result.new_signatures, 0);
         assert_eq!(result.feed_errors.len(), 1);
@@ -874,7 +888,7 @@ mod tests {
         // Neither lock is left held or poisoned.
         assert!(state.conn.lock().is_ok());
         assert!(state.signatures.lock().is_ok());
-        assert!(do_sync_with(&state, Some("  ")).is_ok());
+        assert!(do_sync_at(&state, Some("  "), 10_000).is_ok());
     }
 
     #[test]
@@ -998,5 +1012,70 @@ mod tests {
             assert!(!error.contains("SECRETLOOKING"), "{error}");
         }
         assert_eq!(std::fs::read(&state.settings_path).unwrap(), corrupt);
+    }
+
+    /// Stands inside the cooldown: a sync that finds a key is held back for
+    /// 290 s without any request, a sync that finds none reports it.
+    fn seed_attempt_10_s_before(state: &AppState, now: i64) {
+        let conn = state.conn.lock().unwrap();
+        storage
+            ::record_feed_attempt(&conn, signature_sync::FEED_MALWAREBAZAAR, now - 10)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_saved_key_is_used_when_there_is_no_environment_key() {
+        let (state, _dir) = test_state();
+        do_save_auth_key(&state, KEY, None).unwrap();
+        let now = 10_000;
+        seed_attempt_10_s_before(&state, now);
+
+        let result = do_sync_env(&state, None, now).unwrap();
+
+        assert_eq!(result.retry_after_secs, Some(290), "{:?}", result.feed_errors);
+    }
+
+    #[test]
+    fn a_blank_environment_value_falls_through_to_the_saved_key() {
+        let (state, _dir) = test_state();
+        do_save_auth_key(&state, KEY, None).unwrap();
+        let now = 10_000;
+        seed_attempt_10_s_before(&state, now);
+
+        let result = do_sync_env(&state, env("   "), now).unwrap();
+
+        assert_eq!(result.retry_after_secs, Some(290));
+    }
+
+    #[test]
+    fn the_environment_key_wins_and_a_corrupt_settings_file_is_ignored() {
+        let (state, _dir) = test_state();
+        std::fs::write(&state.settings_path, b"{ not json").unwrap();
+        let now = 10_000;
+        seed_attempt_10_s_before(&state, now);
+
+        let result = do_sync_env(&state, env("from-env"), now).unwrap();
+
+        assert_eq!(result.retry_after_secs, Some(290));
+    }
+
+    #[test]
+    fn with_no_key_anywhere_sync_says_the_key_is_missing() {
+        let (state, _dir) = test_state();
+
+        let result = do_sync_env(&state, None, 10_000).unwrap();
+
+        assert_eq!(result.retry_after_secs, None);
+        assert!(result.feed_errors.iter().any(|e| e.contains("Auth-Key")), "{:?}", result.feed_errors);
+    }
+
+    #[test]
+    fn a_corrupt_file_with_no_environment_key_is_an_error_naming_the_path() {
+        let (state, _dir) = test_state();
+        std::fs::write(&state.settings_path, b"{ not json").unwrap();
+
+        let error = do_sync_env(&state, None, 10_000).unwrap_err();
+
+        assert!(error.contains("settings.json"), "{error}");
     }
 }
