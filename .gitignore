@@ -32,3 +32,6 @@ desktop/src-tauri/gen/
 # Ignore .patch and .bundle files created by the desktop app
 *.patch
 *.bundle
+
+# feed_sync_tool.py
+feed_sync_tool.py
