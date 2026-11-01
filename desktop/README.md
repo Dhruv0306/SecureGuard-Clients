@@ -37,7 +37,9 @@ folders) or every drive (**Full scan**, which asks first). Neither has a time li
 `ABUSE_CH_AUTH_KEY`, in the environment or in a `.env` file (copy `.env.example`). With
 `cargo tauri dev` the repository's `.env` is found. Without a key the status says what to
 do. There is no key field in the app yet, so an installed build needs the variable set in
-the environment.
+the environment. A sync that starts less than 5 minutes after the last fetch is held back, and
+the status says how long to wait. The time is kept in the app's database, so this holds across
+restarts.
 
 ## Requirements
 

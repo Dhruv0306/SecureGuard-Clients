@@ -133,6 +133,9 @@
     }
 
     function syncText(result) {
+        if (result.retry_after_secs != null) {
+            return `Fetched recently. Next fetch allowed in ${formatDuration(result.retry_after_secs * 1000)}.`;
+        }
         let text = `Synced ${formatCount(result.new_signatures)} new (${formatCount(result.total_signatures)} total)`;
         if (result.feed_errors.length > 0) {
             const reasons = result.feed_errors.map(e => shortenMiddle(e, 120)).join("; ");

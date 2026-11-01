@@ -134,3 +134,15 @@ test("the sync line shows why a feed failed, not only that one did", () => {
     const long = V.syncText({ new_signatures: 0, total_signatures: 1, feed_errors: ["e".repeat(500)] });
     assert.ok(long.length < 300, long.length);
 });
+
+test("the sync line explains a cooldown", () => {
+    assert.equal(
+        V.syncText({ new_signatures: 0, total_signatures: 6661, feed_errors: [], retry_after_secs: 299 }),
+        "Fetched recently. Next fetch allowed in 4 min 59 s."
+    );
+    // A result that was not held back (null from the backend) reads as before.
+    assert.equal(
+        V.syncText({ new_signatures: 5, total_signatures: 6661, feed_errors: [], retry_after_secs: null }),
+        "Synced 5 new (6,661 total)"
+    );
+});

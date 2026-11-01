@@ -324,9 +324,14 @@ fn run_sync(db: &Path, feed_urls: &[String]) -> ExitCode {
     };
 
     // No --feed: the default feed, which needs the Auth-Key from
-    // ABUSE_CH_AUTH_KEY. Explicit --feed URLs are fetched as given.
+    // ABUSE_CH_AUTH_KEY and is fetched at most once per 5 minutes. Explicit
+    // --feed URLs are fetched as given, with no cooldown.
     let synced = if feed_urls.is_empty() {
-        signature_sync::sync_default_feeds(&conn, signature_sync::auth_key_from_env().as_deref())
+        signature_sync::sync_default_feeds_throttled(
+            &conn,
+            signature_sync::auth_key_from_env().as_deref(),
+            signature_sync::now_unix()
+        )
     } else {
         let urls: Vec<&str> = feed_urls.iter().map(String::as_str).collect();
         signature_sync::sync_signatures(&urls, &conn)
@@ -334,6 +339,10 @@ fn run_sync(db: &Path, feed_urls: &[String]) -> ExitCode {
 
     match synced {
         Ok(result) => {
+            if let Some(wait) = result.retry_after_secs {
+                println!("fetched recently, try again in {wait} s");
+                return ExitCode::SUCCESS;
+            }
             println!(
                 "synced {} new signature(s), {} total in database",
                 result.new_signatures,
