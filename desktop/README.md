@@ -33,11 +33,14 @@ folders) or every drive (**Full scan**, which asks first). Neither has a time li
 
 ## Signature sync
 
-**Sync signatures** needs the free abuse.ch Auth-Key (<https://auth.abuse.ch/>) in
-`ABUSE_CH_AUTH_KEY`, in the environment or in a `.env` file (copy `.env.example`). With
-`cargo tauri dev` the repository's `.env` is found. Without a key the status says what to
-do. There is no key field in the app yet, so an installed build needs the variable set in
-the environment. A sync that starts less than 5 minutes after the last fetch is held back, and
+**Sync signatures** needs the free abuse.ch Auth-Key (<https://auth.abuse.ch/>). Paste it
+once in the **abuse.ch Auth-Key** row under the header: it is saved in `settings.json` in the
+app's data folder, next to the database, as plain text (anyone who can read that folder can
+read the key, which is free and can be revoked). The page never shows the key again; **Remove
+saved key** deletes it. A key in the environment wins over the saved one: `ABUSE_CH_AUTH_KEY`,
+or `ABUSECH_AUTH_KEY`. With `cargo tauri dev` (a debug build) a `.env` file in the repository
+is read too (copy `.env.example`); an installed build never reads a `.env`. Without a key the
+status says what to do. A sync that starts less than 5 minutes after the last fetch is held back, and
 the status says how long to wait. The time is kept in the app's database, so this holds across
 restarts.
 

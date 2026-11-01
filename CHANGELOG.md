@@ -8,6 +8,13 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Desktop: a key row under the header where the user pastes the free abuse.ch Auth-Key once,
+  so Sync works in an installed app. The key is saved in `settings.json` in the app's data
+  folder, next to the database. It is stored as plain text there, so anyone who can read that
+  folder can read it; the key is free and can be revoked at auth.abuse.ch. The page never
+  receives the key back, only whether one is saved and where it comes from.
+- `ABUSECH_AUTH_KEY` is accepted as another name for `ABUSE_CH_AUTH_KEY` (the first wins when
+  both are set).
 - Sync: no feed fetch starts less than 5 minutes after the previous one, which is the limit
   abuse.ch asks for. The time of the last fetch is kept in the database, so the limit holds
   across restarts. It is per database, so the command line tool and the app, which use
@@ -45,6 +52,11 @@ project uses [Semantic Versioning](https://semver.org/).
 - CI: a macOS job runs the core tests.
 
 ### Changed
+- Desktop: a `.env` file is now read only in debug builds (`cargo tauri dev`). An installed
+  build never reads a `.env` from its working folder or a parent of it, and uses the key saved
+  in the app or a real environment variable instead.
+- The messages for a missing key and for a key abuse.ch rejects (HTTP 401 or 403) now mention
+  the app's key field as well as `ABUSE_CH_AUTH_KEY`.
 - The ransomware directory heuristic is computed once per folder instead of re-reading the
   folder for every file scanned (`dir_behavior::score_from_names`,
   `scoring::score_file_in_directory`). Existing functions keep their behavior.
