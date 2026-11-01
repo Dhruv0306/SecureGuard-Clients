@@ -144,9 +144,30 @@
         return text;
     }
 
+    // The line under the key field. `status` is what the backend reports
+    // (never the key itself): { configured, saved, source }, where source is
+    // "settings", "environment" or "none".
+    function keyStatusText(status) {
+        if (!status || typeof status !== "object") {
+            return "Key status unknown.";
+        }
+        if (status.source === "settings") {
+            return "Key saved.";
+        }
+        if (status.source === "environment") {
+            return status.saved
+                ? "Using the key from the environment. The saved key is not used."
+                : "Using the key from the environment.";
+        }
+        if (status.source === "none") {
+            return "No key set. Sync needs a free abuse.ch Auth-Key.";
+        }
+        return "Key status unknown.";
+    }
+
     const api = {
         reasonText, shortenMiddle, splitFindings, takeUnseen, formatCount, formatDuration,
-        bannerText, progressText, summaryText, skippedText, syncText,
+        bannerText, progressText, summaryText, skippedText, syncText, keyStatusText,
     };
     root.ScanView = api;
 })(window);
