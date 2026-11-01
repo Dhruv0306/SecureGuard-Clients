@@ -18,6 +18,11 @@ const verdictDetails = document.getElementById("verdict-details");
 const historyList = document.getElementById("history-list");
 const syncBtn = document.getElementById("sync-btn");
 const syncStatus = document.getElementById("sync-status");
+const keySection = document.getElementById("key-section");
+const keyInput = document.getElementById("key-input");
+const keySaveBtn = document.getElementById("key-save-btn");
+const keyRemoveBtn = document.getElementById("key-remove-btn");
+const keyStatusEl = document.getElementById("key-status");
 const domainInput = document.getElementById("domain-input");
 const blockDomainBtn = document.getElementById("block-domain-btn");
 const domainStatus = document.getElementById("domain-status");
@@ -204,6 +209,7 @@ domainInput.addEventListener("keydown", (event) => {
 let scanning = false;
 let cancelling = false;
 let syncing = false;
+let keyBusy = false;
 // Set when the scan command returns, so a progress event that arrives late
 // cannot add rows to, or change, the final report.
 let finished = false;
@@ -217,7 +223,10 @@ function refreshControls() {
     for (const control of [scanFolderBtn, recursiveBox, quickScanBtn, fullScanBtn]) {
         control.disabled = busy;
     }
-    syncBtn.disabled = busy;
+    syncBtn.disabled = busy || keyBusy;
+    for (const control of [keyInput, keySaveBtn, keyRemoveBtn]) {
+        control.disabled = syncing || keyBusy;
+    }
     cancelScanBtn.classList.toggle("hidden", !scanning);
     cancelScanBtn.disabled = cancelling;
     cancelScanBtn.textContent = cancelling ? "Cancelling\u2026" : "Cancel";
@@ -385,6 +394,61 @@ cancelScanBtn.addEventListener("click", async () => {
         console.error("cancel failed:", err);
     }
 });
+
+function showKeyStatus(status) {
+    keyStatusEl.textContent = V.keyStatusText(status);
+    keyRemoveBtn.classList.toggle("hidden", !(status && status.saved));
+}
+
+async function loadKeyStatus() {
+    try {
+        const status = await invoke("auth_key_status_cmd");
+        showKeyStatus(status);
+        keySection.open = !status.configured;
+    } catch (err) {
+        keyStatusEl.textContent = `Key status unavailable: ${err}`;
+        keySection.open = true;
+    }
+}
+
+keySaveBtn.addEventListener("click", async () => {
+    // The text leaves the page at once: it is sent once and not kept here.
+    const key = keyInput.value;
+    keyInput.value = "";
+    keyBusy = true;
+    refreshControls();
+    try {
+        showKeyStatus(await invoke("save_auth_key_cmd", { key }));
+        syncStatus.textContent = "";
+    } catch (err) {
+        keyStatusEl.textContent = `Could not save the key: ${err}`;
+    } finally {
+        keyBusy = false;
+        refreshControls();
+    }
+});
+
+keyInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !keySaveBtn.disabled) {
+        keySaveBtn.click();
+    }
+});
+
+keyRemoveBtn.addEventListener("click", async () => {
+    keyBusy = true;
+    refreshControls();
+    try {
+        showKeyStatus(await invoke("clear_auth_key_cmd"));
+        syncStatus.textContent = "";
+    } catch (err) {
+        keyStatusEl.textContent = `Could not remove the key: ${err}`;
+    } finally {
+        keyBusy = false;
+        refreshControls();
+    }
+});
+
+loadKeyStatus();
 
 // Events from the Rust side. Registered once, at startup.
 (async () => {

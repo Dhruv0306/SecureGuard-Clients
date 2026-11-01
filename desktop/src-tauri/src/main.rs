@@ -1,14 +1,18 @@
 mod commands;
 mod helper_client;
 mod scan_control;
+mod settings;
 
 use commands::AppState;
 use tauri::{ Emitter, Manager };
 
 fn main() {
-    // The abuse.ch Auth-Key can live in a .env file (see .env.example).
-    // `cargo tauri dev` runs in desktop/src-tauri, so the repository's .env
-    // is found in a parent folder.
+    // For development only: the abuse.ch Auth-Key can live in a .env file
+    // (see .env.example). `cargo tauri dev` runs in desktop/src-tauri, so the
+    // repository's .env is found in a parent folder. An installed (release)
+    // build never reads a .env from its working folder or a parent of it; it
+    // uses the key saved in the app, or a real environment variable.
+    #[cfg(debug_assertions)]
     secureguard_core::signature_sync::load_env_file();
 
     tauri::Builder
@@ -55,6 +59,9 @@ fn main() {
                 commands::exit_app_cmd,
                 commands::recent_scans_cmd,
                 commands::sync_signatures_cmd,
+                commands::auth_key_status_cmd,
+                commands::save_auth_key_cmd,
+                commands::clear_auth_key_cmd,
                 commands::block_domain_cmd,
                 commands::unblock_domain_cmd,
                 commands::list_blocked_domains_cmd

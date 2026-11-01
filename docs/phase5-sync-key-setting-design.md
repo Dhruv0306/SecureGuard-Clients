@@ -66,9 +66,9 @@ pub fn sync_default_feeds_throttled(conn: &Connection, auth_key: Option<&str>, n
 `SyncResult` gains `retry_after_secs: Option<u64>`. `SyncResult` is only serialized (it has no
 `Deserialize`), so it reaches the page as `null` or a number.
 
-Callers. The CLI default sync and `do_sync_with` switch to the throttled function, each
-reading the real clock. `do_sync_with(state, key)` keeps its shape, and tests call a variant
-that also takes `now`. The CLI prints "fetched recently, try again in N s" when throttled.
+Callers. The CLI default sync and the desktop `do_sync` switch to the throttled function, each
+reading the real clock. Desktop tests call `do_sync_at(state, key, now)`, which also takes the
+time. The CLI prints "fetched recently, try again in N s" when throttled.
 
 The missing-key message is unchanged in PR A. It changes in PR B (see there), because in PR A
 it would point at an app field that does not exist yet.
@@ -127,21 +127,28 @@ It never contains the key. If both exist, `source` is `environment` and `saved` 
 the page can still offer Remove.
 
 Save also calls `storage::clear_feed_attempt` for the feed (added in PR A), so a corrected key
-is not held back by the cooldown an earlier, rejected key started.
+is not held back by the cooldown an earlier, rejected key started. It does this only when no
+environment key exists, because otherwise the saved key is not the one in use and clearing the
+cooldown would let a fetch through inside 5 minutes. A failure to clear it is logged (without
+the key) and is not an error.
 
-Missing-key message. It names only `ABUSE_CH_AUTH_KEY` today. It becomes: "MalwareBazaar
-needs a free Auth-Key. Get one at https://auth.abuse.ch/ and add it in the app, or set
-ABUSE_CH_AUTH_KEY in the environment or a .env file." The test that checks for "Auth-Key"
-still holds.
+Key messages (done in core). The missing-key message names only `ABUSE_CH_AUTH_KEY` today. It
+becomes: "MalwareBazaar needs a free Auth-Key. Get one at https://auth.abuse.ch/ and add it in
+the app, or set ABUSE_CH_AUTH_KEY in the environment or a .env file." The HTTP 401 and 403
+message becomes "...check the Auth-Key (in the app, or in ABUSE_CH_AUTH_KEY)". Both still name
+`ABUSE_CH_AUTH_KEY`, `Auth-Key` and `auth.abuse.ch`, which existing tests pin.
 
 Validation (`save_auth_key_cmd`): trim; reject empty; reject any whitespace or control
 character inside the key; reject more than 256 bytes. The real format of an abuse.ch key is
 not documented here, so nothing else is rejected. Error texts are fixed strings and never
 contain the input.
 
-`do_sync` resolves the key through `resolve_auth_key`, reading the settings file each time
-(a small file, and a save takes effect at once). `do_sync_with(state, key)` keeps its shape
-for tests.
+`do_sync` finds the key with `resolve_sync_key`: the environment first, and then the settings
+file is not read at all, so a damaged file cannot break a sync that does not need it; otherwise
+the saved key, read each time (a small file, and a save takes effect at once). `resolve_auth_key`
+(the same rule, with both values passed in) serves the status. `do_sync_env(state, env, now)`
+takes the environment key and the time, so tests need neither the process environment nor the
+network. `do_sync_with` was removed: it would have been dead code outside tests.
 
 The settings struct has a hand-written `Debug` that hides the key, and the key is never
 passed to `eprintln!`, `format!` or an error. The existing URL redaction still covers every

@@ -23,6 +23,17 @@ header h1 {
     flex: 1;
 }
 
+#key-section {
+    padding: 12px 24px;
+    border-bottom: 1px solid #2e323b;
+}
+
+#key-section summary {
+    cursor: pointer;
+    font-size: 13px;
+    color: #cfd3da;
+}
+
 main {
     padding: 24px;
     display: flex;
@@ -138,7 +149,8 @@ button:disabled {
     gap: 8px;
 }
 
-#domain-input {
+#domain-input,
+#key-input {
     flex: 1;
     background: #22262e;
     border: 1px solid #3a3f4a;

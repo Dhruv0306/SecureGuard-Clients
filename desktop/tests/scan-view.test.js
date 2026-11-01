@@ -146,3 +146,28 @@ test("the sync line explains a cooldown", () => {
         "Synced 5 new (6,661 total)"
     );
 });
+
+test("the key line says where the key comes from", () => {
+    assert.equal(
+        V.keyStatusText({ configured: false, saved: false, source: "none" }),
+        "No key set. Sync needs a free abuse.ch Auth-Key."
+    );
+    assert.equal(
+        V.keyStatusText({ configured: true, saved: true, source: "settings" }),
+        "Key saved."
+    );
+    assert.equal(
+        V.keyStatusText({ configured: true, saved: false, source: "environment" }),
+        "Using the key from the environment."
+    );
+    assert.equal(
+        V.keyStatusText({ configured: true, saved: true, source: "environment" }),
+        "Using the key from the environment. The saved key is not used."
+    );
+});
+
+test("an unexpected key status reads as unknown and never throws", () => {
+    for (const odd of [undefined, null, {}, { source: "somewhere" }, "text", 5]) {
+        assert.equal(V.keyStatusText(odd), "Key status unknown.");
+    }
+});

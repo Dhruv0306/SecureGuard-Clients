@@ -37,6 +37,10 @@ pub const EICAR_SIGNATURE_SHA256: &str =
 /// the CLI and the desktop app can also fill from a `.env` file.
 pub const AUTH_KEY_ENV: &str = "ABUSE_CH_AUTH_KEY";
 
+/// A second name for the same variable, which the Java repository uses.
+/// `AUTH_KEY_ENV` wins when both are set.
+pub const AUTH_KEY_ENV_ALIAS: &str = "ABUSECH_AUTH_KEY";
+
 /// abuse.ch made its exports require a free Auth-Key (the old keyless
 /// `/export/txt/sha256/recent/` URL now answers 410). The documented form
 /// puts the key in the path of the CSV export, which lists the hashes added
@@ -45,7 +49,7 @@ const MALWAREBAZAAR_EXPORT_BASE: &str = "https://mb-api.abuse.ch/v2/files/export
 
 fn missing_key_message() -> String {
     format!(
-        "MalwareBazaar needs a free Auth-Key. Get one at https://auth.abuse.ch/ and set {AUTH_KEY_ENV} (in the environment or a .env file)."
+        "MalwareBazaar needs a free Auth-Key. Get one at https://auth.abuse.ch/ and add it in the app, or set {AUTH_KEY_ENV} in the environment or a .env file."
     )
 }
 
@@ -56,8 +60,17 @@ pub fn auth_key_from(value: Option<String>) -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
+/// The key from the two variable values: the primary one if it is not blank,
+/// otherwise the alias. Takes the values so tests need no environment.
+pub fn auth_key_from_vars(primary: Option<String>, alias: Option<String>) -> Option<String> {
+    auth_key_from(primary).or_else(|| auth_key_from(alias))
+}
+
 pub fn auth_key_from_env() -> Option<String> {
-    auth_key_from(std::env::var(AUTH_KEY_ENV).ok())
+    auth_key_from_vars(
+        std::env::var(AUTH_KEY_ENV).ok(),
+        std::env::var(AUTH_KEY_ENV_ALIAS).ok()
+    )
 }
 
 /// Loads a `.env` file from the current folder or the nearest parent that has
@@ -208,7 +221,7 @@ fn fetch_feed_text_with(url: &str, timeout: Duration) -> Result<String, String> 
                 // leaving a bare status code.
                 ureq::Error::StatusCode(code @ (401 | 403)) =>
                     format!(
-                        "request to {shown} was not accepted (HTTP {code}); check the Auth-Key in {AUTH_KEY_ENV}"
+                        "request to {shown} was not accepted (HTTP {code}); check the Auth-Key (in the app, or in {AUTH_KEY_ENV})"
                     ),
                 other => format!("request to {shown} failed: {other}"),
             };
@@ -585,6 +598,7 @@ mod tests {
             assert!(message.contains("auth.abuse.ch"), "{message}");
             assert!(message.contains(AUTH_KEY_ENV), "{message}");
             assert!(message.contains(".env"), "{message}");
+            assert!(message.contains("in the app"), "{message}");
         }
     }
 
@@ -609,6 +623,7 @@ mod tests {
         assert!(error.contains("401"), "{error}");
         assert!(error.contains("not accepted"), "{error}");
         assert!(error.contains(AUTH_KEY_ENV), "{error}");
+        assert!(error.contains("in the app"), "{error}");
     }
 
     #[test]
@@ -782,5 +797,31 @@ mod tests {
 
         let some = SyncResult { retry_after_secs: Some(42), ..SyncResult::default() };
         assert_eq!(serde_json::to_value(some).unwrap()["retry_after_secs"], 42);
+    }
+
+    fn some(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn the_primary_variable_wins_over_the_alias() {
+        assert_eq!(auth_key_from_vars(some("primary"), some("alias")), some("primary"));
+    }
+
+    #[test]
+    fn a_blank_primary_falls_through_to_the_alias() {
+        assert_eq!(auth_key_from_vars(some("   "), some("alias")), some("alias"));
+        assert_eq!(auth_key_from_vars(None, some("alias")), some("alias"));
+    }
+
+    #[test]
+    fn both_blank_or_missing_is_no_key() {
+        assert_eq!(auth_key_from_vars(None, None), None);
+        assert_eq!(auth_key_from_vars(some(""), some("  \t")), None);
+    }
+
+    #[test]
+    fn the_alias_alone_is_accepted_and_trimmed() {
+        assert_eq!(auth_key_from_vars(None, some("  alias \n")), some("alias"));
     }
 }

@@ -53,8 +53,8 @@ docs/phase5-2-5-3-design-plan.md).
 
 `sync` needs a free abuse.ch **Auth-Key** (MalwareBazaar's exports no longer work without
 one; the old keyless URL answers HTTP 410). Sign in at <https://auth.abuse.ch/>, create an
-Auth-Key, and set it as `ABUSE_CH_AUTH_KEY` in the environment or in a `.env` file in the
-repository (copy `.env.example`; git ignores `.env`). Without a key, `sync` makes no
+Auth-Key, and set it as `ABUSE_CH_AUTH_KEY` (or `ABUSECH_AUTH_KEY`) in the environment or in a
+`.env` file in the repository (copy `.env.example`; git ignores `.env`). Without a key, `sync` makes no
 request and says what to do, and the signatures already in the database stay. The key is
 part of the feed URL, so it is hidden (`***`) in every error and in the stored source.
 `--feed-url` URLs are fetched as given, with no limit. The default feed is fetched at most

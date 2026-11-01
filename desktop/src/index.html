@@ -12,6 +12,27 @@
         <span id="sync-status"></span>
     </header>
 
+    <details id="key-section">
+        <summary>abuse.ch Auth-Key (needed for Sync)</summary>
+        <p class="hint">
+            The key is free: make an account at auth.abuse.ch and copy the key from there.
+            It is kept on this computer in the app's data folder, not encrypted.
+        </p>
+        <div class="domain-input-row">
+            <input
+                id="key-input"
+                type="password"
+                placeholder="Paste the key"
+                aria-label="abuse.ch Auth-Key"
+                autocomplete="off"
+                spellcheck="false"
+            />
+            <button id="key-save-btn">Save key</button>
+            <button id="key-remove-btn" class="hidden">Remove saved key</button>
+        </div>
+        <div id="key-status" class="hint" aria-live="polite"></div>
+    </details>
+
     <main>
         <section id="folder-scan-section">
             <h2>Scan</h2>
