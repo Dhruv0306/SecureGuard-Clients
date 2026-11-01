@@ -20,7 +20,9 @@ use secureguard_core::types::ScanResult;
 use crate::scan_control::ScanControl;
 use secureguard_core::yara_scan::RuleSet;
 use secureguard_core::DEFAULT_RULES;
-use std::path::PathBuf;
+use crate::settings::{ self, KeySource };
+use serde::Serialize;
+use std::path::{ Path, PathBuf };
 use std::sync::{ Arc, Mutex };
 use tauri::{ AppHandle, Emitter, Manager };
 
@@ -42,6 +44,9 @@ pub struct AppState {
     /// The one running scan, if any. Its lock is never held together with
     /// `conn` or `signatures`, or across a scan.
     pub scan: ScanControl,
+    /// `settings.json`, next to the database. Read and written without any
+    /// other lock held.
+    pub settings_path: PathBuf,
 }
 
 impl AppState {
@@ -59,6 +64,7 @@ impl AppState {
             rules,
             signatures: Mutex::new(Arc::new(signatures)),
             scan: ScanControl::new(),
+            settings_path: Path::new(db_path).with_file_name("settings.json"),
         })
     }
 }
@@ -385,6 +391,93 @@ pub fn exit_app_cmd(app: AppHandle) {
 #[tauri::command]
 pub async fn recent_scans_cmd(app: AppHandle, limit: i64) -> Result<Vec<ScanResult>, String> {
     run_blocking(app, "history", move |state| do_recent_scans(state, limit)).await
+}
+
+/// What the page may know about the abuse.ch Auth-Key. It never contains the
+/// key. `source` is exactly "settings", "environment" or "none".
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct KeyStatus {
+    pub configured: bool,
+    pub saved: bool,
+    pub source: &'static str,
+}
+
+fn key_status(env: Option<String>, saved: Option<String>) -> KeyStatus {
+    let saved_flag = signature_sync::auth_key_from(saved.clone()).is_some();
+    let source = match settings::resolve_auth_key(env, saved) {
+        Some((_, KeySource::Environment)) => "environment",
+        Some((_, KeySource::Settings)) => "settings",
+        None => "none",
+    };
+    KeyStatus { configured: source != "none", saved: saved_flag, source }
+}
+
+/// Reports where the key comes from. `env` is the environment key (blank
+/// already counts as none), passed in so tests need no environment. A corrupt
+/// settings file is an error here.
+pub fn do_key_status(state: &AppState, env: Option<String>) -> Result<KeyStatus, String> {
+    let saved = settings::load(&state.settings_path)?.abuse_ch_auth_key;
+    Ok(key_status(env, saved))
+}
+
+/// Validates and saves the key. A corrupt settings file refuses the save and
+/// is left as it is. When the saved key is the one that will be used (no
+/// environment key), the sync cooldown is cleared, so a corrected key is not
+/// held back by the attempt an earlier, rejected key started; failing to clear
+/// it is logged and is not an error.
+pub fn do_save_auth_key(
+    state: &AppState,
+    key: &str,
+    env: Option<String>
+) -> Result<KeyStatus, String> {
+    let key = settings::validate_auth_key(key).map_err(str::to_string)?;
+    let mut current = settings::load(&state.settings_path)?;
+    current.abuse_ch_auth_key = Some(key.clone());
+    settings::save(&state.settings_path, &current)?;
+
+    if signature_sync::auth_key_from(env.clone()).is_none() {
+        let cleared = state.conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())
+            .and_then(|conn| {
+                storage
+                    ::clear_feed_attempt(&conn, signature_sync::FEED_MALWAREBAZAAR)
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(e) = cleared {
+            eprintln!("warning: could not clear the sync cooldown: {e}");
+        }
+    }
+    Ok(key_status(env, Some(key)))
+}
+
+/// Removes the saved key. A corrupt settings file refuses and is left as it is.
+pub fn do_clear_auth_key(state: &AppState, env: Option<String>) -> Result<KeyStatus, String> {
+    let mut current = settings::load(&state.settings_path)?;
+    current.abuse_ch_auth_key = None;
+    settings::save(&state.settings_path, &current)?;
+    Ok(key_status(env, None))
+}
+
+#[tauri::command]
+pub async fn auth_key_status_cmd(app: AppHandle) -> Result<KeyStatus, String> {
+    run_blocking(app, "key status", |state| {
+        do_key_status(state, signature_sync::auth_key_from_env())
+    }).await
+}
+
+#[tauri::command]
+pub async fn save_auth_key_cmd(app: AppHandle, key: String) -> Result<KeyStatus, String> {
+    run_blocking(app, "save key", move |state| {
+        do_save_auth_key(state, &key, signature_sync::auth_key_from_env())
+    }).await
+}
+
+#[tauri::command]
+pub async fn clear_auth_key_cmd(app: AppHandle) -> Result<KeyStatus, String> {
+    run_blocking(app, "clear key", |state| {
+        do_clear_auth_key(state, signature_sync::auth_key_from_env())
+    }).await
 }
 
 #[tauri::command]
@@ -804,5 +897,106 @@ mod tests {
         let after = Arc::as_ptr(&*state.signatures.lock().unwrap());
         assert_eq!(before, after, "a throttled sync must not reload the signature set");
         assert!(state.conn.lock().is_ok());
+    }
+
+    const KEY: &str = "distinct-key-AbC123";
+
+    fn env(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn status_reports_none_settings_or_environment_and_whether_a_key_is_saved() {
+        let (state, _dir) = test_state();
+
+        let none = do_key_status(&state, None).unwrap();
+        assert_eq!(none, KeyStatus { configured: false, saved: false, source: "none" });
+
+        do_save_auth_key(&state, KEY, None).unwrap();
+        let saved = do_key_status(&state, None).unwrap();
+        assert_eq!(saved, KeyStatus { configured: true, saved: true, source: "settings" });
+
+        let both = do_key_status(&state, env("from-env")).unwrap();
+        assert_eq!(both, KeyStatus { configured: true, saved: true, source: "environment" });
+
+        do_clear_auth_key(&state, None).unwrap();
+        let env_only = do_key_status(&state, env("from-env")).unwrap();
+        assert_eq!(env_only, KeyStatus { configured: true, saved: false, source: "environment" });
+    }
+
+    #[test]
+    fn save_then_a_fresh_state_on_the_same_folder_still_has_the_key() {
+        let (state, dir) = test_state();
+        do_save_auth_key(&state, KEY, None).unwrap();
+
+        let reopened = AppState::new(&dir.path().join("test.db").to_string_lossy()).unwrap();
+
+        assert_eq!(do_key_status(&reopened, None).unwrap().source, "settings");
+    }
+
+    #[test]
+    fn the_status_json_and_every_error_omit_the_key() {
+        let (state, _dir) = test_state();
+        let status = do_save_auth_key(&state, KEY, None).unwrap();
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains(KEY), "{json}");
+        assert!(json.contains("\"source\":\"settings\""), "{json}");
+
+        let error = do_save_auth_key(&state, "bad key SECRETLOOKING", None).unwrap_err();
+        assert!(!error.contains("SECRETLOOKING"), "{error}");
+    }
+
+    #[test]
+    fn clear_removes_the_saved_key() {
+        let (state, _dir) = test_state();
+        do_save_auth_key(&state, KEY, None).unwrap();
+
+        let status = do_clear_auth_key(&state, None).unwrap();
+
+        assert_eq!(status, KeyStatus { configured: false, saved: false, source: "none" });
+    }
+
+    #[test]
+    fn saving_clears_the_cooldown_only_when_the_saved_key_will_be_used() {
+        let (state, _dir) = test_state();
+        let seed = |state: &AppState| {
+            let conn = state.conn.lock().unwrap();
+            storage::record_feed_attempt(&conn, signature_sync::FEED_MALWAREBAZAAR, 123).unwrap();
+        };
+        let attempt = |state: &AppState| {
+            let conn = state.conn.lock().unwrap();
+            storage::last_feed_attempt(&conn, signature_sync::FEED_MALWAREBAZAAR).unwrap()
+        };
+
+        seed(&state);
+        do_save_auth_key(&state, KEY, None).unwrap();
+        assert_eq!(attempt(&state), None, "the saved key is the one in use, so it may fetch now");
+
+        seed(&state);
+        do_save_auth_key(&state, KEY, env("from-env")).unwrap();
+        assert_eq!(attempt(&state), Some(123), "the environment key wins, so the cooldown stays");
+    }
+
+    #[test]
+    fn a_save_works_when_there_is_no_cooldown_row_to_clear() {
+        let (state, _dir) = test_state();
+        assert!(do_save_auth_key(&state, KEY, None).is_ok());
+    }
+
+    #[test]
+    fn a_corrupt_settings_file_is_reported_and_left_untouched_by_status_save_and_clear() {
+        let (state, _dir) = test_state();
+        let corrupt = b"{ not json SECRETLOOKING";
+        std::fs::write(&state.settings_path, corrupt).unwrap();
+
+        for error in [
+            do_key_status(&state, None).unwrap_err(),
+            do_save_auth_key(&state, KEY, None).unwrap_err(),
+            do_clear_auth_key(&state, None).unwrap_err(),
+        ] {
+            assert!(error.contains("settings.json"), "{error}");
+            assert!(!error.contains("SECRETLOOKING"), "{error}");
+        }
+        assert_eq!(std::fs::read(&state.settings_path).unwrap(), corrupt);
     }
 }
