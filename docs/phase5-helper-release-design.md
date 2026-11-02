@@ -99,8 +99,12 @@ helper, removing hosts-file entries on uninstall, and the abuse.ch key (done).
 - Set `bundle.windows.nsis.installMode` to `perMachine` in the base config.
 - Remove the standalone helper from the extra-binaries upload. Keep `scg-scan`, attach it to the
   release with a per-target file name (`scg-scan-<triple>[.exe]`).
-- Rework `checksum-and-sign` to download the release's actual assets with `gh release download`
-  and checksum those, so installers and `scg-scan` are all covered, then sign as today.
+- Rework the checksums so installers and `scg-scan` are all covered. Each build job copies the
+  installers it found under `target/<triple>/release/bundle` (the same files `tauri-action`
+  attached to the draft release) and `scg-scan-<triple>` into one folder and uploads it as the
+  workflow artifact `release-assets-<triple>`. `checksum-and-sign` downloads those, runs the
+  tested `make-checksums.sh`, signs as today, and attaches the checksums, the signature and the
+  `scg-scan` files. It does not use `gh release download`, which may not see a draft release.
 - Remove the macOS matrix entries and the `dmg` target, as above.
 - The dry run is a real tag. `tauri-action` already creates a draft release, so nothing is
   public until Dhruv publishes it. A failed attempt is a deleted draft and tag.
@@ -139,6 +143,7 @@ helper, removing hosts-file entries on uninstall, and the abuse.ch key (done).
 
 Bump `[workspace.package].version` to `0.2.0`, turn the `[Unreleased]` changelog section into
 `## [0.2.0]` (the version check in `release.yml` fails without it), and push the tag `v0.2.0`.
+`tauri.conf.json` follows by itself: the desktop `build.rs` syncs its `version` to the Cargo one.
 The workflow creates a draft release. Dhruv runs the checklists above on the draft and
 publishes it only when they pass. Each PR before that carries its own changelog entry.
 
@@ -158,7 +163,7 @@ Dhruv's.
 - **PR 1.** Dry run with a tag. Checklist: the draft release lists the Windows installers, the
   `.deb`, the AppImage and `scg-scan-*`, and no macOS or standalone helper; `dpkg -c` on the
   `.deb` shows `/usr/bin/secureguard-helper`; the Windows installer puts
-  `secureguard-helper.exe` in Program Files; `sha256sum -c checksums.txt` passes on the
+  `secureguard-helper.exe` in Program Files; `sha256sum -c --ignore-missing checksums.txt` passes on the
   downloaded files and `gpg --verify` passes on the signature.
 - **PR 2.** Unit tests with an injectable clock for idle exit; `quit` ends the helper; on Linux
   an integration test connects as the allowed user (accepted) and as another user (rejected,
@@ -181,7 +186,8 @@ Dhruv's.
 | `ShellExecuteExW` `runas` from a Tauri app shows the prompt with no console flash | Windows manual test |
 | `pkexec` finds an authentication agent in an Ubuntu desktop VM and its exit codes mean what the code expects | Linux VM manual test |
 | Checksums really miss the installers today | PR 1 dry run |
-| `gh release download` can read a draft release with the workflow's token | PR 1 dry run |
+| The files collected under `target/<triple>/release/bundle` are exactly the installers `tauri-action` attached | PR 1 dry run |
+| The attach step leaves the release a draft (it now sets `draft: true`) | PR 1 dry run |
 | A Program Files prefix check is enough on Windows | Reviewed in PR 3; an install elsewhere is refused, not trusted |
 
 ## Open decisions

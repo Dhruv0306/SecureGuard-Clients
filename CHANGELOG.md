@@ -8,6 +8,10 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Release: the privileged helper is built into the Windows installers and the Linux packages,
+  as a Tauri sidecar. It comes from a release-only config (`tauri.release.conf.json`), so
+  ordinary builds and CI never need the helper file. `scg-scan` is attached to each release as
+  `scg-scan-<target>`.
 - Desktop: a key row under the header where the user pastes the free abuse.ch Auth-Key once,
   so Sync works in an installed app. The key is saved in `settings.json` in the app's data
   folder, next to the database. It is stored as plain text there, so anyone who can read that
@@ -52,6 +56,12 @@ project uses [Semantic Versioning](https://semver.org/).
 - CI: a macOS job runs the core tests.
 
 ### Changed
+- Release: the Windows setup installer (`-setup.exe`, NSIS) is now per machine, so it installs
+  under Program Files. The helper has to be started with administrator rights from a folder
+  that only administrators can write, and a per-user install folder is not one.
+- Release: the signed `checksums.txt` now covers every file attached to the release (the
+  installers and `scg-scan`) and lists plain file names, so
+  `sha256sum -c --ignore-missing checksums.txt` works in the folder you downloaded to.
 - Desktop: a `.env` file is now read only in debug builds (`cargo tauri dev`). An installed
   build never reads a `.env` from its working folder or a parent of it, and uses the key saved
   in the app or a real environment variable instead.
@@ -68,6 +78,11 @@ project uses [Semantic Versioning](https://semver.org/).
   dependencies need edition 2024 manifests. A new `msrv` CI job runs
   `cargo check --workspace --locked` on Rust 1.93, so a dependency bump that raises the
   floor again fails CI instead of silently breaking older toolchains.
+
+### Removed
+- Release: macOS builds, for now. Bringing them back needs Apple signing and notarization, a
+  safe place for the helper, and a Mac to test on. The standalone helper download is gone too:
+  the helper ships inside the installers.
 
 ### Fixed
 - Core, desktop: signature sync works again. abuse.ch now requires a free Auth-Key and the old
