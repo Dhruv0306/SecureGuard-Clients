@@ -100,5 +100,9 @@ being reachable.
 ```bash
 gpg --import secureguard-release-signing-key.pub   # one-time, import the public key
 gpg --verify checksums.txt.asc checksums.txt        # confirms checksums.txt is genuinely signed
-sha256sum -c checksums.txt                          # confirms your downloaded file matches
+sha256sum -c --ignore-missing checksums.txt         # confirms the files you downloaded match
 ```
+
+`checksums.txt` lists every file attached to the release (the installers and the `scg-scan`
+binaries) by plain file name. Run the last command in the folder you downloaded to;
+`--ignore-missing` skips the files you did not download.

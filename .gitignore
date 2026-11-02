@@ -29,6 +29,9 @@ desktop/src-tauri/gen/
 .env.*
 !.env.example
 
+# The helper copied in by the release workflow as a Tauri sidecar
+desktop/src-tauri/binaries/
+
 # Ignore .patch and .bundle files created by the desktop app
 *.patch
 *.bundle
