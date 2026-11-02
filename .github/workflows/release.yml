@@ -98,13 +98,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # macOS is removed from the release for now. Bringing it back needs
+        # Apple signing and notarization, a safe place for the helper, and a
+        # Mac to test on; see docs/phase5-helper-release-design.md.
         include:
           - platform: 'windows-latest'
             target-triple: 'x86_64-pc-windows-msvc'
-          - platform: 'macos-latest'
-            target-triple: 'aarch64-apple-darwin'
-          - platform: 'macos-latest'
-            target-triple: 'x86_64-apple-darwin'
           - platform: 'ubuntu-22.04'
             target-triple: 'x86_64-unknown-linux-gnu'
 
@@ -151,6 +150,22 @@ jobs:
         working-directory: desktop
         run: npm install
 
+      # The helper goes INSIDE the installers, as a Tauri sidecar, so it must
+      # exist before tauri-action runs. The sidecar is named with the target
+      # triple, which is how Tauri finds it. The base tauri.conf.json does not
+      # list it (a missing file would fail every ordinary build); the overlay
+      # config passed below does.
+      - name: Build the privileged helper and place it for the installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXT=""
+          if [ "${{ runner.os }}" = "Windows" ]; then EXT=".exe"; fi
+          cargo build --release --package secureguard-helper --target ${{ matrix.target-triple }}
+          mkdir -p desktop/src-tauri/binaries
+          cp "target/${{ matrix.target-triple }}/release/secureguard-helper$EXT" \
+             "desktop/src-tauri/binaries/secureguard-helper-${{ matrix.target-triple }}$EXT"
+
       - name: Build and release the desktop bundle
         uses: tauri-apps/tauri-action@v1
         env:
@@ -162,21 +177,43 @@ jobs:
           releaseBody: ${{ needs.check-version-matches-tag.outputs.release_notes }}
           releaseDraft: true
           prerelease: false
-          args: '--target ${{ matrix.target-triple }}'
-
-      - name: Build the privileged helper binary
-        run: cargo build --release --package secureguard-helper --target ${{ matrix.target-triple }}
+          args: '--target ${{ matrix.target-triple }} --config src-tauri/tauri.release.conf.json'
 
       - name: Build the scg-scan CLI binary
         run: cargo build --release --package secureguard-core --bin scg-scan --target ${{ matrix.target-triple }}
 
-      - name: Upload helper and CLI binaries as workflow artifacts
+      # tauri-action attaches the installers to the draft release itself, but
+      # the checksum job cannot see them there. Copy the same files, plus the
+      # CLI under a per-target name, into one folder and hand it on as a
+      # workflow artifact. Nothing else is collected, so the checksums cover
+      # exactly what is attached to the release.
+      - name: Collect the release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="${{ matrix.target-triple }}"
+          EXT=""
+          if [ "${{ runner.os }}" = "Windows" ]; then EXT=".exe"; fi
+          if [ ! -d "target/$T/release/bundle" ]; then
+            echo "::error::The bundle folder target/$T/release/bundle does not exist"
+            exit 1
+          fi
+          mkdir -p release-assets
+          find "target/$T/release/bundle" -type f \
+            \( -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.AppImage' \) \
+            -exec cp {} release-assets/ \;
+          if [ -z "$(find release-assets -maxdepth 1 -type f)" ]; then
+            echo "::error::No installers found under target/$T/release/bundle"
+            exit 1
+          fi
+          cp "target/$T/release/scg-scan$EXT" "release-assets/scg-scan-$T$EXT"
+          ls -l release-assets
+
+      - name: Upload the release files as a workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: secureguard-extra-binaries-${{ matrix.target-triple }}
-          path: |
-            target/${{ matrix.target-triple }}/release/secureguard-helper*
-            target/${{ matrix.target-triple }}/release/scg-scan*
+          name: release-assets-${{ matrix.target-triple }}
+          path: release-assets/*
           if-no-files-found: error
 
   checksum-and-sign:
@@ -185,17 +222,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Download all platform artifacts
+      - name: Download the release files from every platform
         uses: actions/download-artifact@v8
         with:
-          path: release-artifacts
+          pattern: release-assets-*
+          merge-multiple: true
+          path: release-assets
 
+      # Checksums are listed by bare file name so `sha256sum -c
+      # --ignore-missing checksums.txt` works in a downloads folder.
       - name: Compute SHA-256 checksums
-        working-directory: release-artifacts
         run: |
-          find . -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name 'secureguard-helper*' -o -name 'scg-scan*' \) \
-            -exec sha256sum {} \; > ../checksums.txt
-          cat ../checksums.txt
+          bash .github/scripts/make-checksums.sh release-assets checksums.txt
+          cat checksums.txt
 
       - name: Import GPG signing key
         run: echo "${{ secrets.RELEASE_GPG_PRIVATE_KEY }}" | gpg --batch --import
@@ -205,10 +244,16 @@ jobs:
           gpg --batch --yes --passphrase "${{ secrets.RELEASE_GPG_PASSPHRASE }}" \
             --pinentry-mode loopback --armor --detach-sign checksums.txt
 
-      - name: Attach checksums and signature to the release
+      # The installers are already on the release (tauri-action attached
+      # them). This adds the CLI binaries, the checksums and the signature.
+      # draft: true keeps the release a draft whatever its state was, so
+      # nothing becomes public until it is published by hand.
+      - name: Attach the CLI binaries, checksums and signature to the release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
+          draft: true
           files: |
             checksums.txt
             checksums.txt.asc
+            release-assets/scg-scan-*
