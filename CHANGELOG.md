@@ -8,6 +8,10 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Release: a manual workflow, "Check the release signing key" (Actions tab, Run workflow), that
+  imports the signing key from the repository secrets, proves it can sign and checks a sample
+  signature, without making a release. The release itself now runs the same check first, as its
+  own job before any build, so a bad secret fails in about a minute and not after the builds.
 - Release: the privileged helper is built into the Windows installers and the Linux packages,
   as a Tauri sidecar. It comes from a release-only config (`tauri.release.conf.json`), so
   ordinary builds and CI never need the helper file. `scg-scan` is attached to each release as
@@ -56,6 +60,10 @@ project uses [Semantic Versioning](https://semver.org/).
 - CI: a macOS job runs the core tests.
 
 ### Changed
+- Release: the signing steps use two tested scripts. A signing secret that cannot work (empty,
+  a public key instead of the private key, a wrong passphrase) now fails with a message that
+  says what to fix, instead of "gpg: no default secret key". The secrets reach the scripts
+  through the environment, and the passphrase is no longer put on a command line.
 - Release: the Windows setup installer (`-setup.exe`, NSIS) is now per machine, so it installs
   under Program Files. The helper has to be started with administrator rights from a folder
   that only administrators can write, and a per-user install folder is not one.

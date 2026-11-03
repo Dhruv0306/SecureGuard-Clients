@@ -1,0 +1,30 @@
+name: Check the release signing key
+
+# Run by hand: Actions, "Check the release signing key", Run workflow. It uses
+# the same two secrets and the same scripts as the release, signs a sample file
+# and uploads nothing, so it is a quick way to test the secrets without
+# pushing a release tag. A key that passes here will sign the release checksums.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-signing-key:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Import the GPG signing key and check that it can sign
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: bash .github/scripts/import-gpg-key.sh
+
+      - name: Sign a sample file and check the signature
+        env:
+          GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: |
+          echo "sample" > sample.txt
+          bash .github/scripts/sign-checksums.sh sample.txt
