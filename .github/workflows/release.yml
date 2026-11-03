@@ -91,8 +91,22 @@ jobs:
           cat release-notes.md >> "$GITHUB_OUTPUT"
           echo "RELEASE_NOTES_EOF" >> "$GITHUB_OUTPUT"
 
+  # A bad signing secret used to show up only in the last job, after the
+  # builds. This fails in about a minute instead. The same two scripts sign
+  # the checksums below, so a pass here means that step will work.
+  check-signing-key:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Import the GPG signing key and check that it can sign
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: bash .github/scripts/import-gpg-key.sh
+
   build-desktop:
-    needs: check-version-matches-tag
+    needs: [check-version-matches-tag, check-signing-key]
     permissions:
       contents: write
     strategy:
@@ -236,13 +250,17 @@ jobs:
           bash .github/scripts/make-checksums.sh release-assets checksums.txt
           cat checksums.txt
 
-      - name: Import GPG signing key
-        run: echo "${{ secrets.RELEASE_GPG_PRIVATE_KEY }}" | gpg --batch --import
+      # The secrets go in through the environment, not into the script text.
+      - name: Import the GPG signing key and check that it can sign
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: bash .github/scripts/import-gpg-key.sh
 
       - name: Sign the checksums file
-        run: |
-          gpg --batch --yes --passphrase "${{ secrets.RELEASE_GPG_PASSPHRASE }}" \
-            --pinentry-mode loopback --armor --detach-sign checksums.txt
+        env:
+          GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        run: bash .github/scripts/sign-checksums.sh checksums.txt
 
       # The installers are already on the release (tauri-action attached
       # them). This adds the CLI binaries, the checksums and the signature.
