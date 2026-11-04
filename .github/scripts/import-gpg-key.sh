@@ -31,8 +31,20 @@ if [ "$import_status" -ne 0 ]; then
     fail "gpg could not import RELEASE_GPG_PRIVATE_KEY (exit $import_status): $(one_line "$import_output")"
 fi
 
-if ! gpg --list-secret-keys --with-colons 2>/dev/null | grep -q '^sec:'; then
+secret_records="$(gpg --list-secret-keys --with-colons 2>/dev/null)"
+
+if ! grep -q '^sec:' <<<"$secret_records"; then
     fail "gpg read RELEASE_GPG_PRIVATE_KEY but no secret key was imported from it. It probably holds a PUBLIC key, or secret subkeys without the primary key that signs. Export the private key with: gpg --armor --export-secret-keys <KEYID>  (not --export)."
+fi
+
+# A key can only sign if the secret part of a key with the signing capability
+# is present. In the colon listing, field 12 holds a key's own capabilities
+# (a lowercase s means it can sign) and field 15 is # when the secret part is
+# missing, a stub. That is what --export-secret-subkeys leaves of the primary
+# key, so a primary that signs shows up as "sec#" and nothing can sign.
+if ! awk -F: '($1 == "sec" || $1 == "ssb") && $15 != "#" && $12 ~ /s/ { found = 1 } END { exit !found }' <<<"$secret_records"; then
+    listing="$(gpg --list-secret-keys --keyid-format long 2>/dev/null | grep -E '^(sec|ssb)' | tr -s ' ' | paste -sd ';' -)"
+    fail "RELEASE_GPG_PRIVATE_KEY holds no secret key that can sign. gpg sees: $listing. A line starting with sec# means the secret part of the primary key is missing, which is what gpg --export-secret-subkeys produces. Export the full private key with: gpg --armor --export-secret-keys --output secureguard-release-signing-key.asc <KEYID>  and store that file's whole contents as RELEASE_GPG_PRIVATE_KEY."
 fi
 
 probe_dir="$(mktemp -d)"

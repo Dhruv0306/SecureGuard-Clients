@@ -77,6 +77,24 @@ Get-Content secureguard-release-signing-key.asc -TotalCount 1   # PowerShell
 # expect: -----BEGIN PGP PRIVATE KEY BLOCK-----
 ```
 
+Better still, check what the file really contains by importing it into a throwaway keyring
+(nothing is written to your real one) before you store it:
+
+```powershell
+# PowerShell
+gpg --homedir "$env:TEMP\gpgcheck" --import secureguard-release-signing-key.asc
+gpg --homedir "$env:TEMP\gpgcheck" --list-secret-keys --keyid-format long
+Remove-Item -Recurse -Force "$env:TEMP\gpgcheck"
+```
+```bash
+# bash
+d=$(mktemp -d); gpg --homedir "$d" --import secureguard-release-signing-key.asc
+gpg --homedir "$d" --list-secret-keys --keyid-format long; rm -rf "$d"
+```
+
+The list must show a line starting with `sec` followed by spaces. A line starting with `sec#`
+means the secret part of the primary key is missing, so that export cannot sign (see below).
+
 Do not mix this file up with the `.pub` file from step 4. That one is the PUBLIC key; stored as
 the secret it imports without any error and then cannot sign. Do not export with
 `--export-secret-subkeys` unless the key you sign with is a subkey.
@@ -108,6 +126,7 @@ Success ends with `Signing key OK` and the key id. Each failure says what to fix
 | `RELEASE_GPG_PRIVATE_KEY is empty or not visible` | The secret is missing, empty, or stored as an environment or Dependabot secret. It must be a **repository** secret with exactly that name. |
 | `...is not an ASCII-armored key block` | Often a key pasted onto one line with literal `\n` between lines. Paste the whole block with real line breaks. |
 | `no secret key was imported` | The secret holds a PUBLIC key, or only secret subkeys without the primary key that signs. Store the output of `--export-secret-keys` from step 2. |
+| `holds no secret key that can sign` | gpg found a secret entry but none that can sign. The message lists what it saw; a `sec#` line means the primary key's secret part is missing, which `--export-secret-subkeys` produces. Export the full private key with `--export-secret-keys` and store that. |
 | `RELEASE_GPG_PASSPHRASE does not unlock` | The passphrase secret is not the one for this key. |
 | `the imported key cannot sign` | gpg's own reason follows; the key may be expired or have no signing capability. |
 
