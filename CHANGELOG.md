@@ -8,6 +8,10 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Release: a manual workflow, "Check attaching files to a draft release" (Actions tab, Run
+  workflow), that creates a throwaway draft release, attaches sample files to it twice with the
+  release's own script, checks the files and that it is still a draft, and deletes it. It
+  takes about a minute and builds nothing.
 - Release: a manual workflow, "Check the release signing key" (Actions tab, Run workflow), that
   imports the signing key from the repository secrets, proves it can sign and checks a sample
   signature, without making a release. The release itself now runs the same check first, as its
@@ -60,6 +64,10 @@ project uses [Semantic Versioning](https://semver.org/).
 - CI: a macOS job runs the core tests.
 
 ### Changed
+- Release: the CLI binaries, checksums and signature are attached to the draft release by a
+  tested script that makes upload calls only, instead of `softprops/action-gh-release`, whose
+  update call on the draft was refused with "Resource not accessible by integration". The script
+  never edits the release, so it cannot publish it, and it refuses a release that is not a draft.
 - Release: the signing steps use two tested scripts. A signing secret that cannot work (empty,
   a public key instead of the private key, a wrong passphrase) now fails with a message that
   says what to fix, instead of "gpg: no default secret key". The secrets reach the scripts
