@@ -187,7 +187,7 @@ Dhruv's.
 | `pkexec` finds an authentication agent in an Ubuntu desktop VM and its exit codes mean what the code expects | Linux VM manual test |
 | Checksums really miss the installers today | PR 1 dry run |
 | The files collected under `target/<triple>/release/bundle` are exactly the installers `tauri-action` attached | PR 1 dry run |
-| The attach step leaves the release a draft (it now sets `draft: true`) | PR 1 dry run |
+| The workflow token may create a draft, attach files to it, and read it back with upload calls only (the attach script never edits the release) | The manual "Check attaching files to a draft release" workflow, then the PR 1 dry run |
 | A Program Files prefix check is enough on Windows | Reviewed in PR 3; an install elsewhere is refused, not trusted |
 
 ## Open decisions
