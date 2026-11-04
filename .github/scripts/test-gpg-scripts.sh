@@ -55,6 +55,15 @@ fpr3="$(GNUPGHOME="$gen3" gpg --list-keys --with-colons 2>/dev/null | awk -F: '/
 g3 --passphrase 'pw-three' --quick-add-key "$fpr3" ed25519 sign never 2>/dev/null
 g3 --passphrase 'pw-three' --armor --export-secret-subkeys >"$work/subkeys-with-signing-subkey.asc" 2>/dev/null
 
+gen4="$(newhome)"
+g4() { GNUPGHOME="$gen4" gpg --batch --quiet --pinentry-mode loopback "$@"; }
+g4 --passphrase 'pw-four' --quick-generate-key "Four <four@example.test>" ed25519 sign never 2>/dev/null
+fpr4="$(GNUPGHOME="$gen4" gpg --list-keys --with-colons 2>/dev/null | awk -F: '/^fpr/ {print $10; exit}')"
+g4 --passphrase 'pw-four' --quick-add-key "$fpr4" cv25519 encr never 2>/dev/null
+g4 --passphrase 'pw-four' --armor --export-secret-keys >"$work/full-with-encryption-subkey.asc" 2>/dev/null
+g4 --passphrase 'pw-four' --armor --export-secret-subkeys >"$work/subkeys-without-signing-primary.asc" 2>/dev/null
+key4_id="$(GNUPGHOME="$gen4" gpg --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^sec/ {print $5; exit}')"
+
 check "the test keys were made" test -s "$work/protected.asc" -a -s "$work/public.asc" -a -s "$work/unprotected.asc" -a -s "$work/subkeys-with-signing-subkey.asc"
 
 # run <script> <key file or text> <passphrase>: output in $out, status in $status
@@ -95,6 +104,17 @@ run_import "$(cat "$work/public.asc")" 'pw-one'
 check "a public key in the secret fails" test "$status" -ne 0
 check "it says no secret key was imported" has "no secret key"
 check "it points at export-secret-keys" has "export-secret-keys"
+
+run_import "$(cat "$work/full-with-encryption-subkey.asc")" 'pw-four'
+check "a full export of a key with a signing primary and an encryption subkey works" test "$status" -eq 0
+
+run_import "$(cat "$work/subkeys-without-signing-primary.asc")" 'pw-four'
+check "secret subkeys without the signing primary's secret part fail" test "$status" -ne 0
+check "it shows gpg's sec# stub line" has "sec#"
+check "it names the key id, which is public" has "$key4_id"
+check "it says the secret part of the primary key is missing" has "secret part of the primary key"
+check "it points at export-secret-keys, not subkeys" has "export-secret-keys"
+check "that message still never prints the key or the passphrase" bash -c "! grep -q 'BEGIN PGP PRIVATE' <<<\"\$1\" && ! grep -q 'pw-four' <<<\"\$1\"" _ "$out"
 
 run_import "$(cat "$work/subkeys-of-signing-primary.asc")" 'pw-one'
 check "subkeys only, where the primary key signs, fails" test "$status" -ne 0
