@@ -9,9 +9,10 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 - Release: a manual workflow, "Check attaching files to a draft release" (Actions tab, Run
-  workflow), that creates a throwaway draft release, attaches sample files to it twice with the
-  release's own script, checks the files and that it is still a draft, and deletes it. It
-  takes about a minute and builds nothing.
+  workflow), that creates a throwaway tag and a draft release for it, prints what GitHub reports
+  about the draft, attaches sample files to it twice with the release's own script, checks the
+  files and that it is still a draft, and deletes the draft and the tag. It takes about a
+  minute and builds nothing.
 - Release: a manual workflow, "Check the release signing key" (Actions tab, Run workflow), that
   imports the signing key from the repository secrets, proves it can sign and checks a sample
   signature, without making a release. The release itself now runs the same check first, as its
@@ -68,6 +69,9 @@ project uses [Semantic Versioning](https://semver.org/).
   tested script that makes upload calls only, instead of `softprops/action-gh-release`, whose
   update call on the draft was refused with "Resource not accessible by integration". The script
   never edits the release, so it cannot publish it, and it refuses a release that is not a draft.
+  It looks for the draft up to three times, five seconds apart, because a list of releases can
+  lag just after one is created, and when it still cannot find it, the error lists the releases
+  it did see.
 - Release: the signing steps use two tested scripts. A signing secret that cannot work (empty,
   a public key instead of the private key, a wrong passphrase) now fails with a message that
   says what to fix, instead of "gpg: no default secret key". The secrets reach the scripts
