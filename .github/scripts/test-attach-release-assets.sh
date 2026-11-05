@@ -40,7 +40,15 @@ while [ "$#" -gt 0 ]; do
 done
 case "$method $endpoint" in
     "GET repos/owner/repo/releases?per_page=100")
-        cat "$FAKE_RELEASES_FILE"
+        count_file="$FAKE_GH_LOG.listings"
+        n=$(cat "$count_file" 2>/dev/null || echo 0)
+        n=$((n + 1))
+        echo "$n" >"$count_file"
+        if [ "$n" -le "${FAKE_EMPTY_LISTINGS:-0}" ]; then
+            echo '[]'
+        else
+            cat "$FAKE_RELEASES_FILE"
+        fi
         ;;
     "DELETE repos/owner/repo/releases/assets/"*)
         if [ -n "${FAKE_FAIL_DELETE:-}" ]; then
@@ -73,18 +81,23 @@ printf 'd' >"$work/files/my file.txt"
 extra_env=()
 repo="owner/repo"
 log="$work/gh.log"
+attempts=3
+wait_secs=0
 
 run() { # run <releases json> <args...>: sets out and status; the log is $log
     printf '%s' "$1" >"$work/releases.json"
     shift
     : >"$log"
+    rm -f "$log.listings"
     out="$(cd "$work/files" && env PATH="$work/bin:$PATH" FAKE_GH_LOG="$log" FAKE_RELEASES_FILE="$work/releases.json" \
+        ATTACH_LOOKUP_ATTEMPTS="$attempts" ATTACH_LOOKUP_WAIT_SECONDS="$wait_secs" \
         ${repo:+GITHUB_REPOSITORY="$repo"} ${extra_env[@]+"${extra_env[@]}"} bash "$script" "$@" 2>&1)"
     status=$?
 }
 
 has() { grep -qi -- "$1" <<<"$out"; }
 logged() { grep -q -- "$1" "$log"; }
+listings() { cat "$log.listings" 2>/dev/null || echo 0; }
 line_of() { grep -n -- "$1" "$log" | head -1 | cut -d: -f1; }
 
 default='[
@@ -159,6 +172,61 @@ run "$default"
 check "no arguments is a usage error" test "$status" -eq 2
 run "$default" v0.2.0-1
 check "a tag with no files is a usage error" test "$status" -eq 2
+
+
+# 6. a release that is not in the list yet (the list can lag just after a create)
+extra_env=(FAKE_EMPTY_LISTINGS=1)
+run "$default" v0.2.0-1 "${files[@]}"
+check "a draft missing from the first listing is found on the second" test "$status" -eq 0
+check "...after exactly two listings" test "$(listings)" = "2"
+check "...and the files are uploaded to it" test "$(grep -c '^gh api --method POST' "$log")" = "3"
+check "...and it said it was waiting" has "waiting"
+
+extra_env=(FAKE_EMPTY_LISTINGS=2)
+run "$default" v0.2.0-1 "${files[@]}"
+check "a draft that shows up on the last allowed attempt is still found" test "$status" -eq 0
+
+extra_env=(FAKE_EMPTY_LISTINGS=99)
+run "$default" v0.2.0-1 checksums.txt
+check "a draft that never shows up fails" test "$status" -ne 0
+check "...after exactly the allowed number of listings" test "$(listings)" = "3"
+check "...saying no release was found" has "no release"
+check "...and that it looked 3 times" has "3 look"
+check "...and that the list was empty" has "Releases seen: none"
+check "...and uploads nothing" bash -c "! grep -q POST '$log'"
+extra_env=()
+
+wait_secs=1
+attempts=2
+extra_env=(FAKE_EMPTY_LISTINGS=1)
+started="$(date +%s%N)"
+run "$default" v0.2.0-1 checksums.txt
+elapsed_ms=$((($(date +%s%N) - started) / 1000000))
+check "it really waits between looks" test "$elapsed_ms" -ge 900
+check "...and still finds the draft afterwards" test "$status" -eq 0
+wait_secs=0
+attempts=3
+extra_env=()
+
+run '[{"id":111,"tag_name":"v0.1.0","draft":false,"assets":[]},{"id":333,"tag_name":"untagged-abc123","draft":true,"assets":[]}]' v0.2.0-1 checksums.txt
+check "when other releases exist the failure lists them" has "111 v0.1.0 draft=false"
+check "...including a draft whose tag name is different" has "333 untagged-abc123 draft=true"
+
+attempts=1
+run '[]' v0.2.0-1 checksums.txt
+check "one attempt means one listing and no waiting" test "$(listings)" = "1"
+attempts=3
+
+run '[{"id":333,"tag_name":"v0.2.0-1","draft":false,"assets":[]}]' v0.2.0-1 checksums.txt
+check "a published release is not retried" test "$(listings)" = "1"
+
+for bad in 0 x -1 ""; do
+    attempts=$bad
+    run "$default" v0.2.0-1 checksums.txt
+    check "ATTACH_LOOKUP_ATTEMPTS='$bad' is rejected" test "$status" -eq 2
+    check "...naming the variable, with no call made" bash -c "grep -q 'ATTACH_LOOKUP_ATTEMPTS' <<<\"\$1\" && [ ! -s '$log' ]" _ "$out"
+done
+attempts=3
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures check(s) failed"
