@@ -85,6 +85,14 @@ helper, removing hosts-file entries on uninstall, and the abuse.ch key (done).
   says it is an abstract socket on Linux, which has no file permissions.
 - The app already sends the whole active list on every block or unblock, and rolls the database
   change back when the helper cannot be reached.
+- Dry run of the release workflow, 05/11/2026 (tag `v0.2.0-1`): the draft held the Windows
+  installers, the `.deb`, the AppImage and both `scg-scan` files, and no macOS file and no
+  standalone helper. `checksums.txt` listed exactly those six by plain name and every hash
+  matched the downloaded file. `gpg --verify` reported a good signature by the release key,
+  fingerprint `22BF 18D2 1862 BB6C B7D0 FEE0 EB1D 6289 4E8B 6121`. Both Windows installers
+  register under `HKEY_LOCAL_MACHINE`, so both install per machine, and both installed to
+  `D:\Program Files\SecureGuard` on that computer, not to `C:\Program Files`. The MSI shows version
+  `0.2.0.1` for `0.2.0-1`. Both uninstalled cleanly.
 
 ## Design
 
@@ -123,10 +131,13 @@ helper, removing hosts-file entries on uninstall, and the abuse.ch key (done).
 
 ### Starting the helper (PR 3 Windows, PR 4 Linux)
 
-- A pure check decides whether the helper file is somewhere only administrators can write:
-  under `%ProgramFiles%` or `%ProgramW6432%` on Windows; owned by root and not group- or
-  world-writable on Linux; and not running as an AppImage (the `APPIMAGE` variable is set).
-  Debug builds skip the check, so `cargo tauri dev` keeps working.
+- A check decides whether ordinary programs could replace the helper. On Windows it runs as the
+  current, non-elevated user and refuses the helper if it can open the helper file for writing
+  or create a file in the helper's folder. It does not look at where the program is installed:
+  the dry run installed to `D:\Program Files\SecureGuard`, which a `%ProgramFiles%` prefix check
+  would have refused although the install is per machine. On Linux the helper and its folder
+  must be owned by root and not group- or world-writable. It also refuses an AppImage (the
+  `APPIMAGE` variable is set). Debug builds skip the check, so `cargo tauri dev` keeps working.
 - `start_helper_cmd` asks the operating system to elevate:
   - Windows: `ShellExecuteExW` with the `runas` verb, window hidden, through `windows-sys`
     (one new Windows-only dependency).
@@ -163,7 +174,7 @@ Dhruv's.
 - **PR 1.** Dry run with a tag. Checklist: the draft release lists the Windows installers, the
   `.deb`, the AppImage and `scg-scan-*`, and no macOS or standalone helper; `dpkg -c` on the
   `.deb` shows `/usr/bin/secureguard-helper`; the Windows installer puts
-  `secureguard-helper.exe` in Program Files; `sha256sum -c --ignore-missing checksums.txt` passes on the
+  `secureguard-helper.exe` in the install folder; `sha256sum -c --ignore-missing checksums.txt` passes on the
   downloaded files and `gpg --verify` passes on the signature.
 - **PR 2.** Unit tests with an injectable clock for idle exit; `quit` ends the helper; on Linux
   an integration test connects as the allowed user (accepted) and as another user (rejected,
@@ -181,14 +192,14 @@ Dhruv's.
 |---|---|
 | `--config` with the overlay file works in `tauri-action` on every runner | PR 1 dry run |
 | The `.deb` puts the helper at `/usr/bin/secureguard-helper` | `dpkg -c` in the dry run |
-| The MSI installs per machine by default | Inspect the installed path in the dry run |
 | `peer_creds()` works on the socket kind the helper listens on | First test in PR 2 |
 | `ShellExecuteExW` `runas` from a Tauri app shows the prompt with no console flash | Windows manual test |
 | `pkexec` finds an authentication agent in an Ubuntu desktop VM and its exit codes mean what the code expects | Linux VM manual test |
 | Checksums really miss the installers today | PR 1 dry run |
 | The files collected under `target/<triple>/release/bundle` are exactly the installers `tauri-action` attached | PR 1 dry run |
 | The workflow token may create a draft, attach files to it, and read it back with upload calls only (the attach script never edits the release) | The manual "Check attaching files to a draft release" workflow, then the PR 1 dry run |
-| A Program Files prefix check is enough on Windows | Reviewed in PR 3; an install elsewhere is refused, not trusted |
+| The helper is really inside both Windows installers | Install one and list its install folder (not yet checked on the real installers; the dry run's search looked in `C:` only) |
+| "The current user cannot write to the helper or its folder" is a good proxy for "ordinary programs cannot replace it" on Windows | PR 3 tests it on a normal install folder and on a user-writable folder |
 
 ## Open decisions
 

@@ -158,6 +158,12 @@ gpg --verify checksums.txt.asc checksums.txt        # confirms checksums.txt is 
 sha256sum -c --ignore-missing checksums.txt         # confirms the files you downloaded match
 ```
 
+`gpg --verify` names the key that signed. Check that it is the real one: the release signing key's
+fingerprint is `22BF 18D2 1862 BB6C B7D0 FEE0 EB1D 6289 4E8B 6121`, and the key file to import is
+`docs/secureguard-release-signing-key.pub` in this repository. gpg will also warn that the key is
+"not certified with a trusted signature". That is expected for a key you have not met; compare the
+fingerprint instead. The key expires on 04/11/2027 and has to be renewed before then.
+
 `checksums.txt` lists every file attached to the release (the installers and the `scg-scan`
 binaries) by plain file name. Run the last command in the folder you downloaded to;
 `--ignore-missing` skips the files you did not download.
