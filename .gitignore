@@ -38,3 +38,6 @@ desktop/src-tauri/binaries/
 
 # feed_sync_tool.py
 feed_sync_tool.py
+
+# list-deb.py
+list-deb.py
