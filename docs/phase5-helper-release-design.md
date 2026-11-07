@@ -1,6 +1,6 @@
 # Shipping the helper: site blocking that works from the download
 
-Date: 01/11/2026. Status: written for review, not yet planned or built.
+Date: 01/11/2026. Status: PR 1 (release packaging) is built and was proved by a dry run on 05/11/2026. PRs 2 to 4 and the release itself are still to do.
 
 Item 2 of the next-steps order (release v0.2.0), widened after a real test: Dhruv downloaded a
 build, site blocking did not work, and it worked once the helper was run separately. Decisions
@@ -93,6 +93,13 @@ helper, removing hosts-file entries on uninstall, and the abuse.ch key (done).
   register under `HKEY_LOCAL_MACHINE`, so both install per machine, and both installed to
   `D:\Program Files\SecureGuard` on that computer, not to `C:\Program Files`. The MSI shows version
   `0.2.0.1` for `0.2.0-1`. Both uninstalled cleanly.
+- The helper is inside every package. Extracting the MSI with `msiexec /a` and installing the NSIS
+  setup both show `secureguard-helper.exe` (4,902,400 bytes) next to `secureguard-desktop.exe`,
+  and the `.deb` lists `usr/bin/secureguard-helper` and `usr/bin/secureguard-desktop`, owned by
+  root, mode 755. On that computer `%ProgramFiles%` is `C:\Program Files`, yet both installers
+  registered `D:\Program Files\SecureGuard`, which a prefix check on `%ProgramFiles%` would
+  have refused. The release overlay config, the collected files, the checksums and the attach
+  step all worked in that run.
 
 ## Design
 
@@ -190,15 +197,9 @@ Dhruv's.
 
 | Assumption | How it gets checked |
 |---|---|
-| `--config` with the overlay file works in `tauri-action` on every runner | PR 1 dry run |
-| The `.deb` puts the helper at `/usr/bin/secureguard-helper` | `dpkg -c` in the dry run |
 | `peer_creds()` works on the socket kind the helper listens on | First test in PR 2 |
 | `ShellExecuteExW` `runas` from a Tauri app shows the prompt with no console flash | Windows manual test |
 | `pkexec` finds an authentication agent in an Ubuntu desktop VM and its exit codes mean what the code expects | Linux VM manual test |
-| Checksums really miss the installers today | PR 1 dry run |
-| The files collected under `target/<triple>/release/bundle` are exactly the installers `tauri-action` attached | PR 1 dry run |
-| The workflow token may create a draft, attach files to it, and read it back with upload calls only (the attach script never edits the release) | The manual "Check attaching files to a draft release" workflow, then the PR 1 dry run |
-| The helper is really inside both Windows installers | Install one and list its install folder (not yet checked on the real installers; the dry run's search looked in `C:` only) |
 | "The current user cannot write to the helper or its folder" is a good proxy for "ordinary programs cannot replace it" on Windows | PR 3 tests it on a normal install folder and on a user-writable folder |
 
 ## Open decisions
