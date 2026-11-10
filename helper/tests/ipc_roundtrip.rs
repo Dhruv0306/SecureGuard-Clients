@@ -113,32 +113,184 @@ fn round_trips_a_malformed_request_as_a_reported_error_not_a_crash() {
     assert!(response.error.is_some());
 }
 
-#[test]
-fn serve_returns_quit_after_a_quit_request_and_the_client_reads_success() {
-    let hosts_file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(hosts_file.path(), "127.0.0.1 localhost\n").unwrap();
-    let hosts_path = hosts_file.path().to_path_buf();
+// ---- serve: quit, idle exit, and clients that say nothing ----
 
-    let socket_name = unique_socket_name("quit");
-    let server_socket_name = socket_name.clone();
+use secureguard_helper::{ ExitReason, ServeOptions };
+use std::time::{ Duration, Instant };
 
-    let server = thread::spawn(move || {
-        let listener = secureguard_helper::bind_listener(&server_socket_name).expect(
-            "test server should bind"
-        );
-        secureguard_helper::serve(&listener, &HostsFileWriter::new(hosts_path))
+/// Runs a test body on its own thread and fails the test if it does not finish,
+/// so a helper that stops answering fails fast instead of hanging the run.
+fn within<T: Send + 'static>(seconds: u64, body: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done, result) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(body());
     });
+    result
+        .recv_timeout(Duration::from_secs(seconds))
+        .unwrap_or_else(|_| panic!("the test did not finish within {seconds} s (the helper stopped answering)"))
+}
 
-    thread::sleep(std::time::Duration::from_millis(100));
-    let name = socket_name.to_ns_name::<GenericNamespaced>().unwrap();
-    let mut conn = Stream::connect(name).unwrap();
-    conn.write_all(b"{\"quit\":true}\n").unwrap();
+fn options(idle_limit_ms: u64) -> ServeOptions {
+    ServeOptions { idle_limit: Duration::from_millis(idle_limit_ms), poll: Duration::from_millis(20) }
+}
+
+fn hosts() -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "127.0.0.1 localhost\n").unwrap();
+    file
+}
+
+/// Starts the real accept loop on a real socket. The listener is bound here,
+/// before the thread starts, so a client can connect at once.
+fn start_serve(
+    test_name: &str,
+    hosts: &tempfile::NamedTempFile,
+    options: ServeOptions
+) -> (String, thread::JoinHandle<std::io::Result<ExitReason>>) {
+    let socket_name = unique_socket_name(test_name);
+    let listener = secureguard_helper::bind_listener(&socket_name).expect("test server should bind");
+    let hosts_path = hosts.path().to_path_buf();
+    let handle = thread::spawn(move || {
+        secureguard_helper::serve(&listener, &HostsFileWriter::new(hosts_path), &options)
+    });
+    (socket_name, handle)
+}
+
+fn connect(socket_name: &str) -> Stream {
+    Stream::connect(socket_name.to_ns_name::<GenericNamespaced>().unwrap()).expect("client should connect")
+}
+
+fn request_on(conn: Stream, line: &str) -> HelperResponse {
+    let mut conn = conn;
+    conn.write_all(line.as_bytes()).unwrap();
     let mut reader = BufReader::new(conn);
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    let response: HelperResponse = serde_json::from_str(&line).unwrap();
+    let mut reply = String::new();
+    reader.read_line(&mut reply).unwrap();
+    serde_json::from_str(&reply).unwrap()
+}
 
+#[test]
+fn serve_handles_a_domain_request_and_then_a_quit_request() {
+    let hosts = hosts();
+    let (socket_name, server) = start_serve("serve-end-to-end", &hosts, options(60_000));
+
+    let response = request_on(connect(&socket_name), "{\"active_domains\":[\"malware.example.com\"]}\n");
     assert!(response.success, "{:?}", response.error);
-    assert_eq!(server.join().unwrap(), secureguard_helper::ExitReason::Quit);
-    assert_eq!(std::fs::read_to_string(hosts_file.path()).unwrap(), "127.0.0.1 localhost\n");
+    assert!(std::fs::read_to_string(hosts.path()).unwrap().contains("malware.example.com"));
+
+    let before = std::fs::read(hosts.path()).unwrap();
+    let response = request_on(connect(&socket_name), "{\"quit\":true}\n");
+    assert!(response.success, "{:?}", response.error);
+    assert_eq!(server.join().unwrap().unwrap(), ExitReason::Quit);
+    assert_eq!(std::fs::read(hosts.path()).unwrap(), before, "quit must not change the hosts file");
+}
+
+#[test]
+fn serve_exits_when_idle_and_not_before_the_limit() {
+    let hosts = hosts();
+    let started = Instant::now();
+    let (_socket_name, server) = start_serve("serve-idle", &hosts, options(1_500));
+
+    assert_eq!(server.join().unwrap().unwrap(), ExitReason::Idle);
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(1_500), "left after only {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+}
+
+#[test]
+fn a_request_restarts_the_idle_timer() {
+    let hosts = hosts();
+    let started = Instant::now();
+    let (socket_name, server) = start_serve("serve-idle-reset", &hosts, options(1_500));
+
+    thread::sleep(Duration::from_millis(500));
+    // Sent no earlier than 500 ms in, so the limit now runs out no earlier than 2,000 ms.
+    let response = request_on(connect(&socket_name), "{\"active_domains\":[]}\n");
+    assert!(response.success);
+
+    thread::sleep(Duration::from_millis(1_200));
+    assert!(!server.is_finished(), "the helper left although a request arrived less than the limit ago");
+
+    assert_eq!(server.join().unwrap().unwrap(), ExitReason::Idle);
+    assert!(started.elapsed() >= Duration::from_millis(2_000), "left after only {:?}", started.elapsed());
+}
+
+#[test]
+fn a_rejected_request_also_restarts_the_idle_timer() {
+    let hosts = hosts();
+    let started = Instant::now();
+    let (socket_name, server) = start_serve("serve-idle-reset-bad", &hosts, options(1_500));
+
+    thread::sleep(Duration::from_millis(500));
+    let response = request_on(connect(&socket_name), "not json\n");
+    assert!(!response.success);
+
+    assert_eq!(server.join().unwrap().unwrap(), ExitReason::Idle);
+    assert!(started.elapsed() >= Duration::from_millis(2_000), "left after only {:?}", started.elapsed());
+}
+
+#[test]
+fn a_client_that_connects_and_says_nothing_does_not_block_a_quit_request() {
+    within(20, move || {
+        let hosts = hosts();
+        let (socket_name, server) = start_serve("serve-silent-quit", &hosts, options(60_000));
+
+        let _silent = connect(&socket_name); // never writes, never closes
+        thread::sleep(Duration::from_millis(200));
+
+        let response = request_on(connect(&socket_name), "{\"quit\":true}\n");
+        assert!(response.success, "{:?}", response.error);
+        assert_eq!(server.join().unwrap().unwrap(), ExitReason::Quit);
+    });
+}
+
+#[test]
+fn a_client_that_connects_and_says_nothing_does_not_keep_the_helper_alive() {
+    within(20, move || {
+        let hosts = hosts();
+        let (socket_name, server) = start_serve("serve-silent-idle", &hosts, options(1_000));
+
+        let _silent = connect(&socket_name);
+
+        assert_eq!(server.join().unwrap().unwrap(), ExitReason::Idle);
+    });
+}
+
+#[test]
+fn connections_beyond_the_reader_limit_are_closed_and_service_resumes_when_clients_leave() {
+    within(20, move || {
+        let hosts = hosts();
+        let (socket_name, server) = start_serve("serve-reader-cap", &hosts, options(60_000));
+
+        let silent: Vec<Stream> = (0..secureguard_helper::MAX_READERS).map(|_| connect(&socket_name)).collect();
+        thread::sleep(Duration::from_millis(500)); // let the loop accept and start a reader for each
+
+        // One more is closed by the helper: it gets no reply.
+        let mut extra = BufReader::new(connect(&socket_name));
+        thread::sleep(Duration::from_millis(300));
+        extra.get_mut().write_all(b"{\"active_domains\":[]}\n").ok();
+        let mut reply = String::new();
+        assert!(
+            matches!(extra.read_line(&mut reply), Ok(0) | Err(_)),
+            "a connection over the limit must not be answered, got {reply:?}"
+        );
+        drop(extra);
+
+        // When the silent clients leave, their readers end and requests are served again.
+        drop(silent);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut conn = connect(&socket_name);
+            let sent = conn.write_all(b"{\"quit\":true}\n").is_ok();
+            let mut reader = BufReader::new(conn);
+            let mut reply = String::new();
+            if sent && matches!(reader.read_line(&mut reply), Ok(n) if n > 0) {
+                assert!(reply.contains("\"success\":true"), "{reply}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "service did not resume after the silent clients left");
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(server.join().unwrap().unwrap(), ExitReason::Quit);
+    });
 }
