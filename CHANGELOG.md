@@ -8,6 +8,13 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Helper: a quit request (`{"quit":true}`) makes the helper answer and exit, and the helper now
+  exits by itself after 30 minutes without a request. Neither changes who may connect, and
+  nothing in the app starts the helper yet. A client that connects and sends nothing no longer
+  blocks the helper, and a request line is limited to 2 MB.
+- Desktop: when the helper is not running, blocking or unblocking a site now says so in plain
+  words ("Site blocking is off: the privileged helper is not running. Start it as an
+  administrator, then try again.") instead of showing a raw connection error.
 - Release: a manual workflow, "Check attaching files to a draft release" (Actions tab, Run
   workflow), that creates a throwaway tag and a draft release for it, prints what GitHub reports
   about the draft, attaches sample files to it twice with the release's own script, checks the

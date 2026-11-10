@@ -44,6 +44,23 @@ and the helper were both elevated (confirmed by testing both ways).
   another program run by the same user. A stricter option is for the helper to check the
   caller's executable with `GetNamedPipeClientProcessId`; not done.
 
+## Quit, idle exit and silent clients
+
+- A `{"quit":true}` request makes the helper answer and exit. It never touches the hosts file.
+  The helper also exits by itself after 30 minutes without a request. Any request that is read
+  restarts the limit, including a rejected one. Nothing in the app sends a quit or starts the
+  helper yet (that is Windows and Linux start-up work still to come).
+- A client that connects and sends nothing is read on its own short-lived thread, so it blocks
+  neither a quit nor the idle exit, and it does not count as activity. At most 16 connections are
+  read at once; one over that is closed. A request line over 2 MB is rejected without reading
+  the rest.
+- **What this adds to "what this does not prevent":** the pipe's access list is unchanged, so any
+  interactive user can send a quit and stop the helper. That is a denial of service only, with no
+  effect on the hosts file. Holding 16 silent connections open does the same until they close.
+  Either way blocking from the app stops until the helper is started again.
+- Nothing here changes who may connect. The Unix access check named under "Not covered" is still
+  open and is part of the Linux start-up work.
+
 ## What the helper accepts
 
 Hostnames go through `BlockedDomain::parse` (`core/src/blocked_domain.rs`):

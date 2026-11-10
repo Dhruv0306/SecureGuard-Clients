@@ -1,6 +1,6 @@
 # Shipping the helper: site blocking that works from the download
 
-Date: 01/11/2026. Status: PR 1 (release packaging) is built and was proved by a dry run on 05/11/2026. PRs 2 to 4 and the release itself are still to do.
+Date: 01/11/2026. Status: PR 1 (release packaging) is built and was proved by a dry run on 05/11/2026. PR 2 (helper lifecycle) is built, see "Helper changes (PR 2)". PRs 3 and 4 and the release itself are still to do.
 
 Item 2 of the next-steps order (release v0.2.0), widened after a real test: Dhruv downloaded a
 build, site blocking did not work, and it worked once the helper was run separately. Decisions
@@ -126,15 +126,32 @@ helper, removing hosts-file entries on uninstall, and the abuse.ch key (done).
 
 ### Helper changes (PR 2, in `secureguard-core` and `secureguard-helper`)
 
-- A new `quit` request. The helper answers success and then exits.
-- An idle limit of 30 minutes without a request, after which the helper exits.
-- On Unix, the helper accepts a connection only from root or from one allowed user id. The id
-  comes from `--allow-uid <uid>`, or from `PKEXEC_UID` when started by `pkexec`. With neither,
+- A new `quit` request. The request is an untagged enum with `deny_unknown_fields`: a set-domains
+  request stays exactly `{"active_domains":[...]}` and a quit is `{"quit":true}`. A mixed shape is
+  a parse error, and an older helper rejects `{"quit":true}` as a missing `active_domains`, so it
+  can never mistake a quit for an empty list. The helper answers success and then exits. A quit
+  never touches the hosts file.
+- An idle limit of 30 minutes without a request, after which the helper exits. Any request that
+  is read, including one that is rejected, restarts it. A client that connects and sends nothing
+  does not.
+- Each connection is read on its own short-lived thread and only the finished line goes back to
+  the accept loop, so a client that connects and sends nothing cannot block a quit or the idle
+  exit. Requests are handled one at a time, because the hosts file write is not atomic. At most
+  16 connections are read at once, and a request line is limited to 2 MB (the largest legal
+  list is about 1.3 MB).
+- The desktop's `helper_client` returns a typed error. Only a missing or refused connection
+  means "not running"; the block and unblock commands put the marker `helper-unreachable:` at the
+  start of their error text for that case, and the page shows a plain explanation. Every other
+  failure keeps its own text.
+
+Moved out of PR 2 by the plan of 05/11/2026, because only the Linux start-up needs it or nothing
+in PR 2 would use it (the desktop crate rejects unused code):
+
+- PR 3: the `helper_status_cmd` command (`{ supported, running, reason }`) and the client's `quit`
+  call.
+- PR 4: on Unix, the helper accepts a connection only from root or from one allowed user id. The
+  id comes from `--allow-uid <uid>`, or from `PKEXEC_UID` when started by `pkexec`. With neither,
   the Unix helper refuses to start. Windows keeps the pipe access list it has.
-- The desktop's `helper_client` returns a typed "unreachable" result, and the block and unblock
-  commands put a stable marker at the start of their error text so the page can recognize it.
-- A `helper_status_cmd` command returns `{ supported, running, reason }`, where `reason` is
-  plain text when `supported` is false.
 
 ### Starting the helper (PR 3 Windows, PR 4 Linux)
 
@@ -183,10 +200,14 @@ Dhruv's.
   `.deb` shows `/usr/bin/secureguard-helper`; the Windows installer puts
   `secureguard-helper.exe` in the install folder; `sha256sum -c --ignore-missing checksums.txt` passes on the
   downloaded files and `gpg --verify` passes on the signature.
-- **PR 2.** Unit tests with an injectable clock for idle exit; `quit` ends the helper; on Linux
-  an integration test connects as the allowed user (accepted) and as another user (rejected,
-  using a child process that drops to `nobody`; the sandbox runs as root); no allowed user and no
-  `PKEXEC_UID` means a refusal to start; the unreachable marker and `helper_status_cmd`.
+- **PR 2.** Unit tests with an injectable clock for idle exit, and the same limit on a real
+  socket with short timings; `quit` ends the helper and leaves the hosts file byte for byte
+  unchanged; a client that says nothing blocks neither a quit nor the idle exit; the request size
+  limit and the reader limit; the unreachable marker on the Rust side and the page text under
+  Node.
+- **PR 4.** On Linux an integration test connects as the allowed user (accepted) and as another
+  user (rejected, using a child process that drops to `nobody`; the sandbox runs as root); no
+  allowed user and no `PKEXEC_UID` means a refusal to start.
 - **PR 3 and 4.** Unit tests for the location check (a table of paths per platform) and for the
   status logic. Manual: Windows all-users install, Enable, approve UAC, block a domain, confirm
   the hosts file, close the app, confirm the helper exited; cancel the prompt; a per-user
@@ -197,7 +218,7 @@ Dhruv's.
 
 | Assumption | How it gets checked |
 |---|---|
-| `peer_creds()` works on the socket kind the helper listens on | First test in PR 2 |
+| `peer_creds()` works on the socket kind the helper listens on | First test in PR 4 |
 | `ShellExecuteExW` `runas` from a Tauri app shows the prompt with no console flash | Windows manual test |
 | `pkexec` finds an authentication agent in an Ubuntu desktop VM and its exit codes mean what the code expects | Linux VM manual test |
 | "The current user cannot write to the helper or its folder" is a good proxy for "ordinary programs cannot replace it" on Windows | PR 3 tests it on a normal install folder and on a user-writable folder |
