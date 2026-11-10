@@ -165,9 +165,30 @@
         return "Key status unknown.";
     }
 
+    // block_domain_cmd and unblock_domain_cmd start their error text with this
+    // when the helper is not running (HELPER_UNREACHABLE in
+    // desktop/src-tauri/src/helper_client.rs). Matched at the start only, so
+    // no other failure is ever shown as "not running".
+    const HELPER_UNREACHABLE = "helper-unreachable:";
+    const HELPER_NOT_RUNNING =
+        "Site blocking is off: the privileged helper is not running. " +
+        "Start it as an administrator, then try again.";
+
+    // The line under the blocked-domains form when a block or an unblock fails.
+    // `action` is "block" or "unblock". Every failure except a helper that is
+    // not running keeps the wording it always had.
+    function domainFailureText(action, domain, error) {
+        const text = typeof error === "string" ? error : String(error);
+        if (text.startsWith(HELPER_UNREACHABLE)) {
+            return HELPER_NOT_RUNNING;
+        }
+        return `Failed to ${action} ${domain}: ${text}`;
+    }
+
     const api = {
         reasonText, shortenMiddle, splitFindings, takeUnseen, formatCount, formatDuration,
         bannerText, progressText, summaryText, skippedText, syncText, keyStatusText,
+        domainFailureText,
     };
     root.ScanView = api;
 })(window);

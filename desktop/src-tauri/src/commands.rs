@@ -517,17 +517,13 @@ pub async fn block_domain_cmd(
         let domain = normalize_domain(&domain)?;
         let active = do_block_domain(state, &domain, reason.as_deref())?;
 
-        match crate::helper_client::send_domain_list(&active) {
-            Ok(response) if response.success => Ok(()),
-            Ok(response) => {
-                let _ = do_unblock_domain(state, &domain); // roll back, it isn't actually blocked
-                Err(response.error.unwrap_or_else(|| "helper reported failure".to_string()))
-            }
-            Err(e) => {
-                let _ = do_unblock_domain(state, &domain);
-                Err(e)
-            }
+        let result = crate::helper_client::helper_outcome(
+            crate::helper_client::send_domain_list(&active)
+        );
+        if result.is_err() {
+            let _ = do_unblock_domain(state, &domain); // roll back, it isn't actually blocked
         }
+        result
     }).await
 }
 
@@ -540,17 +536,13 @@ pub async fn unblock_domain_cmd(app: AppHandle, domain: String) -> Result<(), St
         // acceptable tradeoff, the domain still ends up correctly re-blocked.
         let active = do_unblock_domain(state, &domain)?;
 
-        match crate::helper_client::send_domain_list(&active) {
-            Ok(response) if response.success => Ok(()),
-            Ok(response) => {
-                restore_blocked_domain(state, &domain);
-                Err(response.error.unwrap_or_else(|| "helper reported failure".to_string()))
-            }
-            Err(e) => {
-                restore_blocked_domain(state, &domain);
-                Err(e)
-            }
+        let result = crate::helper_client::helper_outcome(
+            crate::helper_client::send_domain_list(&active)
+        );
+        if result.is_err() {
+            restore_blocked_domain(state, &domain); // roll back, it is still blocked
         }
+        result
     }).await
 }
 

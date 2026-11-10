@@ -171,7 +171,7 @@ async function unblockDomain(domain) {
         // helper failure (see desktop/src-tauri/src/commands.rs), so a
         // failure here means the domain's active state is unchanged, not
         // left inconsistent, refreshing still shows the accurate list.
-        domainStatus.textContent = `Failed to unblock ${domain}: ${err}`;
+        domainStatus.textContent = V.domainFailureText("unblock", domain, err);
         await refreshBlockedDomains();
     }
 }
@@ -191,7 +191,7 @@ blockDomainBtn.addEventListener("click", async () => {
         domainInput.value = "";
         await refreshBlockedDomains();
     } catch (err) {
-        domainStatus.textContent = `Failed to block ${domain}: ${err}`;
+        domainStatus.textContent = V.domainFailureText("block", domain, err);
     } finally {
         blockDomainBtn.disabled = false;
     }

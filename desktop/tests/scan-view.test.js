@@ -171,3 +171,50 @@ test("an unexpected key status reads as unknown and never throws", () => {
         assert.equal(V.keyStatusText(odd), "Key status unknown.");
     }
 });
+
+const NOT_RUNNING =
+    "Site blocking is off: the privileged helper is not running. Start it as an administrator, then try again.";
+const UNREACHABLE =
+    "helper-unreachable: failed to connect to the privileged helper: The system cannot find the file specified. (os error 2)";
+
+test("a helper that is not running gets a plain explanation for block and unblock", () => {
+    for (const action of ["block", "unblock"]) {
+        const text = V.domainFailureText(action, "github.com", UNREACHABLE);
+        assert.equal(text, NOT_RUNNING);
+        assert.ok(!text.includes("os error"), text);
+        assert.ok(!text.includes("helper-unreachable"), text);
+    }
+});
+
+test("every other failure keeps the text the page showed before", () => {
+    assert.equal(
+        V.domainFailureText("block", "github.com", "invalid domain"),
+        "Failed to block github.com: invalid domain"
+    );
+    assert.equal(
+        V.domainFailureText("unblock", "github.com", "rejected request: bad name"),
+        "Failed to unblock github.com: rejected request: bad name"
+    );
+    // Mentions the helper, but is not the not-running marker.
+    assert.equal(
+        V.domainFailureText("block", "a.example", "helper reported failure"),
+        "Failed to block a.example: helper reported failure"
+    );
+    assert.equal(
+        V.domainFailureText("block", "a.example", "failed to connect to the privileged helper: Access is denied. (os error 5)"),
+        "Failed to block a.example: failed to connect to the privileged helper: Access is denied. (os error 5)"
+    );
+});
+
+test("the marker counts only at the start of the text", () => {
+    assert.equal(
+        V.domainFailureText("block", "a.example", "something helper-unreachable: odd"),
+        "Failed to block a.example: something helper-unreachable: odd"
+    );
+});
+
+test("an error that is not a string is turned into text and never throws", () => {
+    assert.equal(V.domainFailureText("block", "a.example", new Error("boom")), "Failed to block a.example: Error: boom");
+    assert.equal(V.domainFailureText("unblock", "a.example", undefined), "Failed to unblock a.example: undefined");
+    assert.equal(V.domainFailureText("block", "a.example", null), "Failed to block a.example: null");
+});
