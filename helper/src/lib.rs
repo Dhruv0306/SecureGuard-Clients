@@ -8,7 +8,7 @@ use interprocess::local_socket::{ prelude::*, GenericNamespaced, Listener, Liste
 use secureguard_core::blocked_domain::parse_domain_list;
 use secureguard_core::helper_protocol::{ HelperRequest, HelperResponse };
 use secureguard_core::hosts_writer::HostsFileWriter;
-use std::io::{ BufRead, BufReader };
+use std::io::{ BufRead, BufReader, Read };
 
 /// Who may open the helper's named pipe on Windows, as a security descriptor
 /// string. Without an explicit one, a pipe created by an elevated process lets
@@ -49,8 +49,29 @@ pub fn bind_listener(socket_name: &str) -> std::io::Result<Listener> {
     options.create_sync()
 }
 
-/// Binds the given socket name and serves requests forever, one connection
-/// at a time. Blocking, meant to be the entire body of `main()`.
+/// The longest request line the helper reads. The largest legal request, 5,000
+/// names of 253 characters as JSON, is about 1.3 MB, so 2 MB leaves room. A
+/// longer line is rejected without reading the rest, so a client cannot make
+/// the helper buffer without limit.
+pub const MAX_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
+
+/// What the helper does after one connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Continue,
+    Quit,
+}
+
+/// Why `serve` returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// A client sent a quit request.
+    Quit,
+}
+
+/// Binds the given socket name and serves requests until a quit request
+/// arrives, then exits the process with status 0. Blocking, meant to be the
+/// entire body of `main()`.
 pub fn run_helper_server(socket_name: &str, writer: HostsFileWriter) -> ! {
     let listener = bind_listener(socket_name).unwrap_or_else(|e| {
         eprintln!(
@@ -62,61 +83,97 @@ pub fn run_helper_server(socket_name: &str, writer: HostsFileWriter) -> ! {
 
     eprintln!("secureguard-helper listening on '{socket_name}'");
 
-    for connection in listener.incoming() {
-        match connection {
-            Ok(conn) => handle_connection(conn, &writer),
-            Err(e) => eprintln!("failed to accept a connection: {e}"),
+    match serve(&listener, &writer) {
+        ExitReason::Quit => eprintln!("secureguard-helper: quit requested, exiting"),
+    }
+    std::process::exit(0);
+}
+
+/// Serves one connection at a time on an already-bound listener until a client
+/// sends a quit request. Public so integration tests can run the real loop on a
+/// real socket.
+pub fn serve(listener: &Listener, writer: &HostsFileWriter) -> ExitReason {
+    loop {
+        match listener.accept() {
+            Ok(conn) => {
+                if handle_connection(conn, writer) == Outcome::Quit {
+                    return ExitReason::Quit;
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to accept a connection: {e}");
+                // Do not spin if accept keeps failing.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
     }
+}
 
-    // listener.incoming() only yields None if the listener itself is
-    // dropped, which never happens here, but the type system doesn't know
-    // that, satisfy the `-> !` return type explicitly.
-    unreachable!("local socket listener's incoming() ended unexpectedly")
+fn rejected(message: impl std::fmt::Display) -> HelperResponse {
+    HelperResponse { success: false, error: Some(format!("rejected request: {message}")) }
 }
 
 /// Handles exactly one request-response exchange on an already-accepted
 /// connection, then returns (the connection closes when dropped). Public so
 /// integration tests can drive it directly against a real local socket
 /// without needing the full accept loop.
-pub fn handle_connection(conn: impl std::io::Read + std::io::Write, writer: &HostsFileWriter) {
+///
+/// A quit request is answered with success and returns `Outcome::Quit`; the
+/// caller decides when to exit, so the reply is already written by then. It
+/// never touches the hosts file.
+pub fn handle_connection(conn: impl std::io::Read + std::io::Write, writer: &HostsFileWriter) -> Outcome {
     let mut reader = BufReader::new(conn);
     let mut line = String::new();
 
-    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-        return; // client disconnected without sending anything
+    // Read at most one byte more than the limit, so an over-long line is
+    // noticed without buffering it all.
+    match (&mut reader).take(MAX_REQUEST_BYTES + 1).read_line(&mut line) {
+        Ok(0) | Err(_) => {
+            return Outcome::Continue; // client disconnected without sending a line
+        }
+        Ok(_) => {}
     }
 
-    let response = match serde_json::from_str::<HelperRequest>(&line) {
-        // The helper is the trust boundary: it checks every name itself and
-        // rejects the whole request, untouched file included, if any is bad.
-        Ok(request) =>
-            match parse_domain_list(&request.active_domains) {
-                Err(e) =>
+    let (response, outcome) = if (line.len() as u64) > MAX_REQUEST_BYTES {
+        (rejected(format!("request is longer than {MAX_REQUEST_BYTES} bytes")), Outcome::Continue)
+    } else {
+        match serde_json::from_str::<HelperRequest>(&line) {
+            // The helper is the trust boundary: it checks every name itself and
+            // rejects the whole request, untouched file included, if any is bad.
+            Ok(HelperRequest::SetDomains { active_domains }) =>
+                (
+                    match parse_domain_list(&active_domains) {
+                        Err(e) => rejected(e),
+                        Ok(domains) =>
+                            match writer.write(&domains) {
+                                Ok(()) => HelperResponse { success: true, error: None },
+                                Err(e) =>
+                                    HelperResponse {
+                                        success: false,
+                                        error: Some(format!("failed to write hosts file: {e}")),
+                                    },
+                            }
+                    },
+                    Outcome::Continue,
+                ),
+            Ok(HelperRequest::Quit { quit: true }) =>
+                (HelperResponse { success: true, error: None }, Outcome::Quit),
+            Ok(HelperRequest::Quit { quit: false }) =>
+                (rejected("quit must be true"), Outcome::Continue),
+            Err(e) =>
+                (
                     HelperResponse {
                         success: false,
-                        error: Some(format!("rejected request: {e}")),
+                        error: Some(format!("malformed request: {e}")),
                     },
-                Ok(domains) =>
-                    match writer.write(&domains) {
-                        Ok(()) => HelperResponse { success: true, error: None },
-                        Err(e) =>
-                            HelperResponse {
-                                success: false,
-                                error: Some(format!("failed to write hosts file: {e}")),
-                            },
-                    }
-            }
-        Err(e) =>
-            HelperResponse {
-                success: false,
-                error: Some(format!("malformed request: {e}")),
-            },
+                    Outcome::Continue,
+                ),
+        }
     };
 
     let Ok(mut response_json) = serde_json::to_string(&response) else {
         eprintln!("failed to serialize response, dropping connection");
-        return;
+        return Outcome::Continue;
     };
     response_json.push('\n');
 
@@ -124,6 +181,7 @@ pub fn handle_connection(conn: impl std::io::Read + std::io::Write, writer: &Hos
     if let Err(e) = stream.write_all(response_json.as_bytes()) {
         eprintln!("failed to write response to client: {e}");
     }
+    outcome
 }
 
 #[cfg(test)]
@@ -161,14 +219,27 @@ mod tests {
         file
     }
 
+    /// Sends one raw line and returns the reply (None when the helper sent
+    /// nothing) with the outcome.
+    fn exchange(raw: &[u8], hosts: &tempfile::NamedTempFile) -> (Option<HelperResponse>, Outcome) {
+        let mut conn = Duplex { input: Cursor::new(raw.to_vec()), output: Vec::new() };
+        let outcome = handle_connection(&mut conn, &HostsFileWriter::new(hosts.path()));
+        let reply = if conn.output.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_slice(&conn.output).unwrap())
+        };
+        (reply, outcome)
+    }
+
     fn send(domains: Vec<String>, hosts: &tempfile::NamedTempFile) -> HelperResponse {
-        let request = HelperRequest { active_domains: domains };
+        let request = HelperRequest::SetDomains { active_domains: domains };
         let mut line = serde_json::to_string(&request).unwrap();
         line.push('\n');
 
-        let mut conn = Duplex { input: Cursor::new(line.into_bytes()), output: Vec::new() };
-        handle_connection(&mut conn, &HostsFileWriter::new(hosts.path()));
-        serde_json::from_slice(&conn.output).unwrap()
+        let (reply, outcome) = exchange(line.as_bytes(), hosts);
+        assert_eq!(outcome, Outcome::Continue, "a domain request never ends the helper");
+        reply.expect("a request gets a reply")
     }
 
     #[test]
@@ -232,5 +303,109 @@ mod tests {
         let content = std::fs::read_to_string(hosts.path()).unwrap();
         assert!(content.contains("127.0.0.1 localhost"));
         assert!(!content.contains("SECUREGUARD_BLOCKED_DOMAIN"));
+    }
+
+    #[test]
+    fn a_quit_request_is_answered_and_ends_the_helper_without_touching_the_hosts_file() {
+        let hosts = hosts_file();
+        send(vec!["blocked.example.com".to_string()], &hosts);
+        let before = std::fs::read(hosts.path()).unwrap();
+
+        let (reply, outcome) = exchange(b"{\"quit\":true}\n", &hosts);
+
+        let reply = reply.expect("quit gets a reply before the helper exits");
+        assert!(reply.success, "{:?}", reply.error);
+        assert_eq!(outcome, Outcome::Quit);
+        assert_eq!(std::fs::read(hosts.path()).unwrap(), before, "quit must not change the hosts file");
+    }
+
+    #[test]
+    fn quit_false_is_a_bad_request_and_the_helper_keeps_running() {
+        let hosts = hosts_file();
+        let (reply, outcome) = exchange(b"{\"quit\":false}\n", &hosts);
+
+        let reply = reply.unwrap();
+        assert!(!reply.success);
+        assert!(reply.error.unwrap().starts_with("rejected request:"));
+        assert_eq!(outcome, Outcome::Continue);
+        assert_eq!(std::fs::read_to_string(hosts.path()).unwrap(), ORIGINAL_HOSTS);
+    }
+
+    #[test]
+    fn a_mixed_request_neither_quits_nor_writes() {
+        let hosts = hosts_file();
+        let (reply, outcome) = exchange(b"{\"active_domains\":[],\"quit\":true}\n", &hosts);
+
+        let reply = reply.unwrap();
+        assert!(!reply.success);
+        assert!(reply.error.unwrap().starts_with("malformed request:"));
+        assert_eq!(outcome, Outcome::Continue);
+        assert_eq!(std::fs::read_to_string(hosts.path()).unwrap(), ORIGINAL_HOSTS);
+    }
+
+    #[test]
+    fn a_malformed_line_and_a_silent_client_keep_the_helper_running() {
+        let hosts = hosts_file();
+        let (reply, outcome) = exchange(b"not json\n", &hosts);
+        assert!(!reply.unwrap().success);
+        assert_eq!(outcome, Outcome::Continue);
+
+        let (reply, outcome) = exchange(b"", &hosts);
+        assert!(reply.is_none(), "a client that sent nothing gets nothing");
+        assert_eq!(outcome, Outcome::Continue);
+    }
+
+    /// A client that never sends a newline and never stops. The test fails
+    /// (panics) if the helper reads far past the limit.
+    struct Endless {
+        served: u64,
+        output: Vec<u8>,
+    }
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.served += buf.len() as u64;
+            assert!(self.served < 2 * MAX_REQUEST_BYTES, "the helper kept reading past the limit");
+            buf.fill(b'x');
+            Ok(buf.len())
+        }
+    }
+
+    impl Write for Endless {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_request_over_the_size_limit_is_rejected_without_reading_it_all() {
+        let hosts = hosts_file();
+        let mut conn = Endless { served: 0, output: Vec::new() };
+        let outcome = handle_connection(&mut conn, &HostsFileWriter::new(hosts.path()));
+
+        let reply: HelperResponse = serde_json::from_slice(&conn.output).unwrap();
+        assert!(!reply.success);
+        assert!(reply.error.unwrap().starts_with("rejected request:"));
+        assert_eq!(outcome, Outcome::Continue);
+        assert_eq!(std::fs::read_to_string(hosts.path()).unwrap(), ORIGINAL_HOSTS);
+    }
+
+    #[test]
+    fn the_largest_allowed_list_fits_under_the_size_limit() {
+        // 5,000 names of the maximum length, as the JSON a client would send.
+        let longest = format!("{0}.{0}.{0}.{1}", "a".repeat(63), "a".repeat(61));
+        assert_eq!(longest.len(), 253);
+        let request = HelperRequest::SetDomains {
+            active_domains: vec![longest; secureguard_core::blocked_domain::MAX_BLOCKED_DOMAINS],
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        assert!(
+            (line.len() as u64) < MAX_REQUEST_BYTES,
+            "a legal request of {} bytes must fit under the {MAX_REQUEST_BYTES} limit",
+            line.len()
+        );
     }
 }

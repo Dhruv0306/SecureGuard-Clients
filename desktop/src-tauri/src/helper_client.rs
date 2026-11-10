@@ -19,7 +19,7 @@ pub fn send_domain_list(active_domains: &[String]) -> Result<HelperResponse, Str
         format!("failed to connect to the privileged helper (is it installed and running?): {e}")
     })?;
 
-    let request = HelperRequest {
+    let request = HelperRequest::SetDomains {
         active_domains: active_domains.to_vec(),
     };
     let mut request_json = serde_json

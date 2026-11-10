@@ -27,7 +27,7 @@ fn send_request(socket_name: &str, active_domains: Vec<String>) -> HelperRespons
 
     let mut conn = Stream::connect(name).expect("client should connect to the test server");
 
-    let request = HelperRequest { active_domains };
+    let request = HelperRequest::SetDomains { active_domains };
     let mut request_json = serde_json::to_string(&request).unwrap();
     request_json.push('\n');
     conn.write_all(request_json.as_bytes()).unwrap();
@@ -111,4 +111,34 @@ fn round_trips_a_malformed_request_as_a_reported_error_not_a_crash() {
 
     assert!(!response.success);
     assert!(response.error.is_some());
+}
+
+#[test]
+fn serve_returns_quit_after_a_quit_request_and_the_client_reads_success() {
+    let hosts_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(hosts_file.path(), "127.0.0.1 localhost\n").unwrap();
+    let hosts_path = hosts_file.path().to_path_buf();
+
+    let socket_name = unique_socket_name("quit");
+    let server_socket_name = socket_name.clone();
+
+    let server = thread::spawn(move || {
+        let listener = secureguard_helper::bind_listener(&server_socket_name).expect(
+            "test server should bind"
+        );
+        secureguard_helper::serve(&listener, &HostsFileWriter::new(hosts_path))
+    });
+
+    thread::sleep(std::time::Duration::from_millis(100));
+    let name = socket_name.to_ns_name::<GenericNamespaced>().unwrap();
+    let mut conn = Stream::connect(name).unwrap();
+    conn.write_all(b"{\"quit\":true}\n").unwrap();
+    let mut reader = BufReader::new(conn);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let response: HelperResponse = serde_json::from_str(&line).unwrap();
+
+    assert!(response.success, "{:?}", response.error);
+    assert_eq!(server.join().unwrap(), secureguard_helper::ExitReason::Quit);
+    assert_eq!(std::fs::read_to_string(hosts_file.path()).unwrap(), "127.0.0.1 localhost\n");
 }
