@@ -4,6 +4,7 @@ pub mod dir_scan;
 pub mod entropy;
 pub mod extension;
 pub mod hash_match;
+pub mod helper_launch;
 pub mod helper_protocol;
 pub mod hosts_writer;
 pub mod rootkit;
