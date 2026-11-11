@@ -167,6 +167,55 @@ pub enum LaunchError {
     Failed(u32),
 }
 
+/// UTF-16 units with the terminating zero the Windows calls expect.
+pub fn wide_with_nul(units: impl IntoIterator<Item = u16>) -> Vec<u16> {
+    units.into_iter().chain(std::iter::once(0)).collect()
+}
+
+// FFI-BEGIN
+/// Starts the program at `file` (UTF-16, zero-terminated) with the "runas"
+/// verb, which makes Windows show its approval prompt. Returns once the prompt
+/// has been answered and the program started; it does not wait for the program.
+#[cfg(windows)]
+fn shell_execute_runas(file: &[u16]) -> Result<(), LaunchError> {
+    use windows_sys::Win32::Foundation::{ ERROR_CANCELLED, GetLastError };
+    use windows_sys::Win32::UI::Shell::{ ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    debug_assert_eq!(file.last(), Some(&0), "the path must be zero-terminated");
+    let verb = wide_with_nul("runas".encode_utf16());
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        // The call may return before the shell has finished; this asks it to
+        // finish first, because this thread may end right after.
+        fMask: SEE_MASK_NOASYNC,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        nShow: SW_HIDE,
+        ..Default::default()
+    };
+
+    // SAFETY: `info` is a fully initialized SHELLEXECUTEINFOW with its size set,
+    // and `verb` and `file` are zero-terminated and outlive the call.
+    let started = unsafe { ShellExecuteExW(&mut info) };
+    if started != 0 {
+        return Ok(());
+    }
+    // SAFETY: GetLastError has no preconditions.
+    let code = unsafe { GetLastError() };
+    if code == ERROR_CANCELLED { Err(LaunchError::Declined) } else { Err(LaunchError::Failed(code)) }
+}
+// FFI-END
+
+/// Starts the helper at `path` elevated: Windows asks the user to approve, and
+/// `Declined` means they said no.
+#[cfg(windows)]
+pub fn launch_elevated(path: &Path) -> Result<(), LaunchError> {
+    use std::os::windows::ffi::OsStrExt;
+    shell_execute_runas(&wide_with_nul(path.as_os_str().encode_wide()))
+}
+
 /// What `enable_with` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Enabled {
@@ -505,6 +554,12 @@ mod tests {
         assert_eq!(check_helper_location(&missing, true), Err(Refusal::FileWritableByUser));
         // A developer build skips the write checks but still needs the file.
         assert_eq!(check_helper_location(&missing, false), Ok(()));
+    }
+
+    #[test]
+    fn a_wide_string_gets_exactly_one_terminating_zero() {
+        assert_eq!(wide_with_nul("ab".encode_utf16()), vec![97, 98, 0]);
+        assert_eq!(wide_with_nul(std::iter::empty()), vec![0]);
     }
 
     #[test]

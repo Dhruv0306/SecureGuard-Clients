@@ -30,7 +30,15 @@ dotenvy = "0.15"
 # Drive enumeration for the system scan (GetLogicalDrives, GetDriveTypeW). Already
 # in the dependency tree through other crates.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    # helper_launch: ShellExecuteExW with the "runas" verb. The struct holds an
+    # HKEY, which is why Win32_System_Registry is needed too.
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 tempfile = "3"
