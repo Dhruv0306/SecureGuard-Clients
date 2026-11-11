@@ -27,6 +27,8 @@ const domainInput = document.getElementById("domain-input");
 const blockDomainBtn = document.getElementById("block-domain-btn");
 const domainStatus = document.getElementById("domain-status");
 const blockedDomainsList = document.getElementById("blocked-domains-list");
+const helperStatusEl = document.getElementById("helper-status");
+const enableHelperBtn = document.getElementById("enable-helper-btn");
 
 const scanFolderBtn = document.getElementById("scan-folder-btn");
 const recursiveBox = document.getElementById("recursive-checkbox");
@@ -130,6 +132,7 @@ syncBtn.addEventListener("click", async () => {
 
 refreshHistory();
 refreshBlockedDomains();
+refreshHelperStatus();
 
 async function refreshBlockedDomains() {
     try {
@@ -160,6 +163,35 @@ function renderBlockedDomains(domains) {
     }
 }
 
+// Asks the backend whether site blocking is on or can be turned on, and shows
+// it above the blocked-domains form. A failed call reads as "unknown".
+async function refreshHelperStatus() {
+    let status = null;
+    try {
+        status = await invoke("helper_status_cmd");
+    } catch (err) {
+        status = null;
+    }
+    const panel = V.helperPanel(status);
+    helperStatusEl.textContent = panel.text;
+    enableHelperBtn.hidden = !panel.showEnable;
+}
+
+enableHelperBtn.addEventListener("click", async () => {
+    enableHelperBtn.disabled = true;
+    helperStatusEl.textContent = "Waiting for your approval\u2026";
+    try {
+        await invoke("enable_blocking_cmd");
+        await refreshHelperStatus();
+    } catch (err) {
+        // Declined, refused or timed out: the error text says which, and the
+        // button stays so the user can try again.
+        helperStatusEl.textContent = String(err);
+    } finally {
+        enableHelperBtn.disabled = false;
+    }
+});
+
 async function unblockDomain(domain) {
     domainStatus.textContent = `Unblocking ${domain}\u2026`;
     try {
@@ -173,6 +205,7 @@ async function unblockDomain(domain) {
         // left inconsistent, refreshing still shows the accurate list.
         domainStatus.textContent = V.domainFailureText("unblock", domain, err);
         await refreshBlockedDomains();
+        await refreshHelperStatus();
     }
 }
 
@@ -192,6 +225,7 @@ blockDomainBtn.addEventListener("click", async () => {
         await refreshBlockedDomains();
     } catch (err) {
         domainStatus.textContent = V.domainFailureText("block", domain, err);
+        await refreshHelperStatus();
     } finally {
         blockDomainBtn.disabled = false;
     }

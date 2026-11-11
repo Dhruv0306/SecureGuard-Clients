@@ -170,9 +170,7 @@
     // desktop/src-tauri/src/helper_client.rs). Matched at the start only, so
     // no other failure is ever shown as "not running".
     const HELPER_UNREACHABLE = "helper-unreachable:";
-    const HELPER_NOT_RUNNING =
-        "Site blocking is off: the privileged helper is not running. " +
-        "Start it as an administrator, then try again.";
+    const HELPER_NOT_RUNNING = "Site blocking is off: the privileged helper is not running.";
 
     // The line under the blocked-domains form when a block or an unblock fails.
     // `action` is "block" or "unblock". Every failure except a helper that is
@@ -185,10 +183,36 @@
         return `Failed to ${action} ${domain}: ${text}`;
     }
 
+    // The line above the blocked-domains form, and whether the "Enable site
+    // blocking" button shows. `status` is what helper_status_cmd returns:
+    // { supported, running, reason }. Anything else reads as unknown, with no
+    // button, because enabling from a state nobody understands would be a guess.
+    function helperPanel(status) {
+        const valid = status !== null && typeof status === "object" &&
+            typeof status.supported === "boolean" && typeof status.running === "boolean";
+        if (!valid) {
+            return { text: "Site blocking status is unknown.", showEnable: false };
+        }
+        if (status.running) {
+            return { text: "Site blocking is on: the privileged helper is running.", showEnable: false };
+        }
+        if (status.supported) {
+            return {
+                text: "Site blocking is off. Enable it to start the privileged helper; " +
+                    "your system will ask you to approve.",
+                showEnable: true,
+            };
+        }
+        const reason = typeof status.reason === "string" && status.reason !== ""
+            ? status.reason
+            : "Site blocking is not available for this installation.";
+        return { text: reason, showEnable: false };
+    }
+
     const api = {
         reasonText, shortenMiddle, splitFindings, takeUnseen, formatCount, formatDuration,
         bannerText, progressText, summaryText, skippedText, syncText, keyStatusText,
-        domainFailureText,
+        domainFailureText, helperPanel,
     };
     root.ScanView = api;
 })(window);

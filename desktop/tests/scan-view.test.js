@@ -172,8 +172,7 @@ test("an unexpected key status reads as unknown and never throws", () => {
     }
 });
 
-const NOT_RUNNING =
-    "Site blocking is off: the privileged helper is not running. Start it as an administrator, then try again.";
+const NOT_RUNNING = "Site blocking is off: the privileged helper is not running.";
 const UNREACHABLE =
     "helper-unreachable: failed to connect to the privileged helper: The system cannot find the file specified. (os error 2)";
 
@@ -217,4 +216,39 @@ test("an error that is not a string is turned into text and never throws", () =>
     assert.equal(V.domainFailureText("block", "a.example", new Error("boom")), "Failed to block a.example: Error: boom");
     assert.equal(V.domainFailureText("unblock", "a.example", undefined), "Failed to unblock a.example: undefined");
     assert.equal(V.domainFailureText("block", "a.example", null), "Failed to block a.example: null");
+});
+
+test("the helper panel says site blocking is on when the helper runs", () => {
+    const panel = V.helperPanel({ supported: true, running: true, reason: null });
+    assert.equal(panel.text, "Site blocking is on: the privileged helper is running.");
+    assert.equal(panel.showEnable, false);
+});
+
+test("a stopped helper that may be started shows the enable button", () => {
+    const panel = V.helperPanel({ supported: true, running: false, reason: null });
+    assert.equal(panel.showEnable, true);
+    assert.ok(panel.text.includes("off"), panel.text);
+    assert.ok(panel.text.includes("approve"), "it should say the system asks for approval");
+});
+
+test("an install that may not start the helper shows the reason and no button", () => {
+    const reason = "Site blocking needs SecureGuard installed for all users. Reinstall SecureGuard for all users.";
+    const panel = V.helperPanel({ supported: false, running: false, reason });
+    assert.equal(panel.text, reason);
+    assert.equal(panel.showEnable, false);
+    const bare = V.helperPanel({ supported: false, running: false, reason: null });
+    assert.equal(bare.showEnable, false);
+    assert.ok(bare.text.length > 0);
+});
+
+test("a status that is missing or malformed reads as unknown and never throws", () => {
+    for (const bad of [undefined, null, 5, "yes", {}, { supported: "yes", running: false }, { supported: true }]) {
+        const panel = V.helperPanel(bad);
+        assert.equal(panel.text, "Site blocking status is unknown.");
+        assert.equal(panel.showEnable, false);
+    }
+});
+
+test("a running helper never shows the enable button even if it is also marked unsupported", () => {
+    assert.equal(V.helperPanel({ supported: false, running: true, reason: "x" }).showEnable, false);
 });

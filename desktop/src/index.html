@@ -93,9 +93,12 @@
         <section id="domain-block-section">
             <h2>Blocked domains</h2>
             <p class="hint">
-                Requires the privileged helper to be running (elevated), it's the only
-                process that writes the hosts file.
+                The privileged helper is the only process that writes the hosts file.
             </p>
+            <div class="helper-row">
+                <span id="helper-status">Checking site blocking\u2026</span>
+                <button id="enable-helper-btn" hidden>Enable site blocking</button>
+            </div>
             <div class="domain-input-row">
                 <input
                     id="domain-input"
