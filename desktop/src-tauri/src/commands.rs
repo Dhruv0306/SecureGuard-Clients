@@ -14,6 +14,7 @@ use secureguard_core::rusqlite::Connection;
 use secureguard_core::blocked_domain::{ BlockedDomain, MAX_BLOCKED_DOMAINS };
 use secureguard_core::dir_scan::{ self, Progress, ScanOptions, ScanReport };
 use secureguard_core::hash_match::SignatureSet;
+use secureguard_core::helper_launch::HelperStatus;
 use secureguard_core::signature_sync::{ self, SyncResult };
 use secureguard_core::storage;
 use secureguard_core::types::ScanResult;
@@ -23,6 +24,7 @@ use secureguard_core::DEFAULT_RULES;
 use crate::settings::{ self, KeySource };
 use serde::Serialize;
 use std::path::{ Path, PathBuf };
+use std::sync::atomic::AtomicBool;
 use std::sync::{ Arc, Mutex };
 use tauri::{ AppHandle, Emitter, Manager };
 
@@ -47,6 +49,10 @@ pub struct AppState {
     /// `settings.json`, next to the database. Read and written without any
     /// other lock held.
     pub settings_path: PathBuf,
+    /// Set when this app started the helper through "Enable site blocking", so
+    /// it is asked to quit when the app exits. A helper that was already
+    /// running, or that the user started by hand, is left alone.
+    pub helper_started_by_app: AtomicBool,
 }
 
 impl AppState {
@@ -65,6 +71,7 @@ impl AppState {
             signatures: Mutex::new(Arc::new(signatures)),
             scan: ScanControl::new(),
             settings_path: Path::new(db_path).with_file_name("settings.json"),
+            helper_started_by_app: AtomicBool::new(false),
         })
     }
 }
@@ -400,6 +407,25 @@ pub fn cancel_scan_cmd(state: tauri::State<AppState>) -> bool {
 #[tauri::command]
 pub fn exit_app_cmd(app: AppHandle) {
     app.exit(0);
+}
+
+/// Whether site blocking is on (the helper answers), or can be turned on from
+/// the page, or cannot and why.
+#[tauri::command]
+pub async fn helper_status_cmd() -> Result<HelperStatus, String> {
+    tauri::async_runtime
+        ::spawn_blocking(crate::helper_control::current_status)
+        .await
+        .map_err(|e| format!("helper status task failed: {e}"))
+}
+
+/// Starts the helper through the operating system's approval prompt and
+/// waits for it to answer. The error text is shown on the page as it is.
+#[tauri::command]
+pub async fn enable_blocking_cmd(app: AppHandle) -> Result<HelperStatus, String> {
+    run_blocking(app, "enable blocking", |state| {
+        crate::helper_control::enable_current(&state.helper_started_by_app)
+    }).await
 }
 
 #[tauri::command]
