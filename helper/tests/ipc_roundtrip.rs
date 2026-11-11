@@ -115,7 +115,7 @@ fn round_trips_a_malformed_request_as_a_reported_error_not_a_crash() {
 
 // ---- serve: quit, idle exit, and clients that say nothing ----
 
-use secureguard_helper::{ ExitReason, ServeOptions };
+use secureguard_helper::{ Access, ExitReason, ServeOptions };
 use std::time::{ Duration, Instant };
 
 /// Runs a test body on its own thread and fails the test if it does not finish,
@@ -131,7 +131,11 @@ fn within<T: Send + 'static>(seconds: u64, body: impl FnOnce() -> T + Send + 'st
 }
 
 fn options(idle_limit_ms: u64) -> ServeOptions {
-    ServeOptions { idle_limit: Duration::from_millis(idle_limit_ms), poll: Duration::from_millis(20) }
+    ServeOptions {
+        idle_limit: Duration::from_millis(idle_limit_ms),
+        poll: Duration::from_millis(20),
+        access: Access::Anyone,
+    }
 }
 
 fn hosts() -> tempfile::NamedTempFile {
@@ -293,4 +297,146 @@ fn connections_beyond_the_reader_limit_are_closed_and_service_resumes_when_clien
         }
         assert_eq!(server.join().unwrap().unwrap(), ExitReason::Quit);
     });
+}
+
+// ---- who may connect (Unix): the check uses the peer's real user id ----
+
+#[cfg(unix)]
+mod access {
+    use super::*;
+    use interprocess::local_socket::traits::StreamCommon;
+    use std::os::unix::process::CommandExt;
+
+    const CLIENT_SOCKET_ENV: &str = "SCG_TEST_CLIENT_SOCKET";
+    /// "nobody", a user that exists on Linux and macOS.
+    const OTHER_USER: u32 = 65534;
+
+    /// The user id this test process runs as, as the helper would see it: ask
+    /// a listener of our own about the peer that connects to it.
+    fn my_euid() -> u32 {
+        let name = unique_socket_name("whoami");
+        let listener = secureguard_helper::bind_listener(&name).unwrap();
+        let client = connect(&name);
+        let server_side = listener.accept().unwrap();
+        drop(client);
+        server_side.peer_creds().unwrap().euid().expect("this platform reports the peer user")
+    }
+
+    fn serve_with(
+        test_name: &str,
+        hosts: &tempfile::NamedTempFile,
+        access: Access,
+        idle_limit_ms: u64
+    ) -> (String, thread::JoinHandle<std::io::Result<ExitReason>>) {
+        let mut opts = options(idle_limit_ms);
+        opts.access = access;
+        start_serve(test_name, hosts, opts)
+    }
+
+    /// What a client got back: the reply's success flag, or None when the
+    /// helper closed the connection without answering.
+    fn client_in_process(socket_name: &str) -> Option<bool> {
+        let mut conn = connect(socket_name);
+        if conn.write_all(b"{\"active_domains\":[]}\n").is_err() {
+            return None;
+        }
+        let mut reader = BufReader::new(conn);
+        let mut reply = String::new();
+        match reader.read_line(&mut reply) {
+            Ok(n) if n > 0 => Some(serde_json::from_str::<HelperResponse>(&reply).unwrap().success),
+            _ => None,
+        }
+    }
+
+    /// The same client in a copy of this test program that runs as another
+    /// user. Only possible when this process is root.
+    fn client_as_other_user(socket_name: &str) -> Option<bool> {
+        let output = std::process::Command
+            ::new(std::env::current_exe().unwrap())
+            .args(["--exact", "access::client_entry", "--nocapture", "--test-threads=1"])
+            .env(CLIENT_SOCKET_ENV, socket_name)
+            .uid(OTHER_USER)
+            .output()
+            .expect("the test program should start as another user");
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        // The test harness prints "test name ... " before what the test prints.
+        let line = text
+            .lines()
+            .find_map(|l| l.find("RESULT:").map(|at| l[at..].trim()))
+            .unwrap_or_else(|| panic!("the child printed no result: {text}\n{}", String::from_utf8_lossy(&output.stderr)));
+        match line {
+            "RESULT:ok" => Some(true),
+            "RESULT:refused" => Some(false),
+            "RESULT:none" => None,
+            other => panic!("unexpected result {other}"),
+        }
+    }
+
+    /// Not a test of its own: when started by `client_as_other_user` it plays
+    /// the client and prints what happened. Run normally it does nothing.
+    #[test]
+    fn client_entry() {
+        let Ok(socket_name) = std::env::var(CLIENT_SOCKET_ENV) else {
+            return;
+        };
+        let result = match client_in_process(&socket_name) {
+            Some(true) => "ok",
+            Some(false) => "refused",
+            None => "none",
+        };
+        println!("RESULT:{result}");
+    }
+
+    /// A client of the named kind: as `OTHER_USER` when this test runs as root
+    /// (the only way to be another user), otherwise as ourselves.
+    fn client(socket_name: &str, as_other_user: bool) -> Option<bool> {
+        if as_other_user { client_as_other_user(socket_name) } else { client_in_process(socket_name) }
+    }
+
+    #[test]
+    fn the_user_the_helper_was_told_about_is_served() {
+        within(30, || {
+            let me = my_euid();
+            let hosts = hosts();
+            // As root the other user is a child process; otherwise it is us.
+            let (allowed, other) = if me == 0 { (OTHER_USER, true) } else { (me, false) };
+            let (socket_name, server) = serve_with("acc-allowed", &hosts, Access::Uid(allowed), 1_000);
+
+            assert_eq!(client(&socket_name, other), Some(true));
+            assert_eq!(server.join().unwrap().unwrap(), ExitReason::Idle);
+        });
+    }
+
+    #[test]
+    fn any_other_user_is_closed_without_a_reply_and_the_hosts_file_is_untouched() {
+        within(30, || {
+            let me = my_euid();
+            let hosts = hosts();
+            // Name a user that is neither root nor the client.
+            let (allowed, other) = if me == 0 { (1000, true) } else { (me.wrapping_add(1), false) };
+            let (socket_name, server) = serve_with("acc-refused", &hosts, Access::Uid(allowed), 1_500);
+
+            assert_eq!(client(&socket_name, other), None, "a refused user gets no answer");
+            assert_eq!(server.join().unwrap().unwrap(), ExitReason::Idle);
+            assert_eq!(
+                std::fs::read_to_string(hosts.path()).unwrap(),
+                "127.0.0.1 localhost\n",
+                "a refused request must not touch the hosts file"
+            );
+        });
+    }
+
+    #[test]
+    fn root_is_served_whoever_the_helper_was_told_about() {
+        within(30, || {
+            if my_euid() != 0 {
+                return; // only meaningful as root
+            }
+            let hosts = hosts();
+            let (socket_name, server) = serve_with("acc-root", &hosts, Access::Uid(1000), 1_000);
+
+            assert_eq!(client_in_process(&socket_name), Some(true));
+            assert_eq!(server.join().unwrap().unwrap(), ExitReason::Idle);
+        });
+    }
 }

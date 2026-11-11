@@ -119,22 +119,115 @@ impl IdleTimer {
     }
 }
 
+/// Who may talk to the helper, decided from the user id of the connecting
+/// process. On Windows the pipe has an access list, so `Anyone` is used there.
+/// On Unix the socket has no file permissions (on Linux it is an abstract
+/// socket), so this check is the only access control and a user must be named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Anyone,
+    /// Root and this user.
+    Uid(u32),
+}
+
+impl Access {
+    /// `peer_euid` is the connecting process's effective user id, or None when
+    /// the platform could not tell. With a user named, None is refused: no
+    /// answer means no access. Root is always allowed because it can already do
+    /// everything the helper can.
+    pub fn permits(&self, peer_euid: Option<u32>) -> bool {
+        match self {
+            Access::Anyone => true,
+            Access::Uid(allowed) => peer_euid == Some(0) || peer_euid == Some(*allowed),
+        }
+    }
+}
+
+/// A Unix helper must be told which user to allow; refusing to start is safer
+/// than serving every local user. Windows must not be asked to.
+pub fn check_access_for_platform(access: Access, unix: bool) -> Result<(), String> {
+    if unix && access == Access::Anyone {
+        Err(
+            "no user is allowed to use this helper: pass --allow-uid <uid>, or start it through pkexec"
+                .to_string()
+        )
+    } else {
+        Ok(())
+    }
+}
+
+/// The user to allow, from the arguments (everything after the program name)
+/// and the `PKEXEC_UID` variable that pkexec sets to the user who started it.
+/// `--allow-uid <n>` or `--allow-uid=<n>` wins; the variable is read only
+/// without it; with neither the answer is an error and the helper does not
+/// start. Only plain decimal numbers that fit a `u32` are accepted.
+pub fn parse_allowed_uid(args: &[String], pkexec_uid: Option<&str>) -> Result<u32, String> {
+    let mut named: Option<String> = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let value = if arg == "--allow-uid" {
+            rest.next().ok_or("--allow-uid needs a user id")?.clone()
+        } else if let Some(value) = arg.strip_prefix("--allow-uid=") {
+            value.to_string()
+        } else {
+            return Err(format!("unknown argument: {arg}"));
+        };
+        if named.replace(value).is_some() {
+            return Err("--allow-uid was given more than once".to_string());
+        }
+    }
+
+    match (named, pkexec_uid) {
+        (Some(value), _) => uid_from_text(&value).map_err(|e| format!("--allow-uid: {e}")),
+        (None, Some(value)) => uid_from_text(value).map_err(|e| format!("PKEXEC_UID: {e}")),
+        (None, None) => check_access_for_platform(Access::Anyone, true).map(|()| 0),
+    }
+}
+
+fn uid_from_text(text: &str) -> Result<u32, String> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{text:?} is not a user id (digits only)"));
+    }
+    text.parse::<u32>().map_err(|_| format!("{text:?} is too large for a user id"))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ServeOptions {
     pub idle_limit: Duration,
     pub poll: Duration,
+    pub access: Access,
 }
 
 impl Default for ServeOptions {
     fn default() -> Self {
-        Self { idle_limit: DEFAULT_IDLE_LIMIT, poll: DEFAULT_POLL }
+        Self { idle_limit: DEFAULT_IDLE_LIMIT, poll: DEFAULT_POLL, access: Access::Anyone }
     }
+}
+
+/// The effective user id of the process on the other end of the connection.
+#[cfg(unix)]
+fn peer_euid(conn: &interprocess::local_socket::Stream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon;
+    conn.peer_creds().ok().and_then(|creds| creds.euid())
+}
+
+/// Windows has no user id to read; it never names a user, so this is only
+/// reached with `Access::Anyone`.
+#[cfg(not(unix))]
+fn peer_euid(_conn: &interprocess::local_socket::Stream) -> Option<u32> {
+    None
 }
 
 /// Binds the given socket name and serves requests until a quit request
 /// arrives or the helper has been idle for the default limit, then exits the
-/// process (status 0). Blocking, meant to be the entire body of `main()`.
-pub fn run_helper_server(socket_name: &str, writer: HostsFileWriter) -> ! {
+/// process (status 0). Exits with status 2 on a Unix platform if `access` names
+/// no user. Blocking, meant to be the entire body of `main()`.
+pub fn run_helper_server(socket_name: &str, writer: HostsFileWriter, access: Access) -> ! {
+    if let Err(e) = check_access_for_platform(access, cfg!(unix)) {
+        eprintln!("secureguard-helper: {e}");
+        std::process::exit(2);
+    }
+
     let listener = bind_listener(socket_name).unwrap_or_else(|e| {
         eprintln!(
             "failed to bind helper socket (already running elsewhere, or a \
@@ -145,7 +238,7 @@ pub fn run_helper_server(socket_name: &str, writer: HostsFileWriter) -> ! {
 
     eprintln!("secureguard-helper listening on '{socket_name}'");
 
-    match serve(&listener, &writer, &ServeOptions::default()) {
+    match serve(&listener, &writer, &(ServeOptions { access, ..ServeOptions::default() })) {
         Ok(ExitReason::Quit) => eprintln!("secureguard-helper: quit requested, exiting"),
         Ok(ExitReason::Idle) => eprintln!("secureguard-helper: idle, exiting"),
         Err(e) => {
@@ -194,7 +287,14 @@ pub fn serve(
         }
 
         match listener.accept() {
-            Ok(conn) => start_reader(conn, &sender, &readers),
+            Ok(conn) => {
+                if options.access.permits(peer_euid(&conn)) {
+                    start_reader(conn, &sender, &readers);
+                } else {
+                    // Closed unread: no reader thread, no reply, no activity.
+                    eprintln!("refused a connection from a user that is not allowed");
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if idle.expired(Instant::now()) {
                     return Ok(ExitReason::Idle);
@@ -601,5 +701,99 @@ mod tests {
     fn the_default_idle_limit_is_thirty_minutes() {
         assert_eq!(DEFAULT_IDLE_LIMIT, Duration::from_secs(30 * 60));
         assert_eq!(ServeOptions::default().idle_limit, DEFAULT_IDLE_LIMIT);
+    }
+
+    // ---- who may connect (Unix) ----
+
+    #[test]
+    fn anyone_means_anyone_even_when_the_peer_is_unknown() {
+        assert!(Access::Anyone.permits(Some(0)));
+        assert!(Access::Anyone.permits(Some(1000)));
+        assert!(Access::Anyone.permits(None));
+    }
+
+    #[test]
+    fn a_named_user_and_root_are_allowed_and_nobody_else() {
+        let access = Access::Uid(1000);
+        assert!(access.permits(Some(1000)));
+        assert!(access.permits(Some(0)), "root can already do everything the helper can");
+        assert!(!access.permits(Some(1001)));
+        assert!(!access.permits(Some(65534)));
+    }
+
+    #[test]
+    fn a_peer_whose_user_cannot_be_read_is_refused_when_a_user_is_named() {
+        assert!(!Access::Uid(1000).permits(None));
+    }
+
+    #[test]
+    fn naming_root_allows_only_root() {
+        let access = Access::Uid(0);
+        assert!(access.permits(Some(0)));
+        assert!(!access.permits(Some(1000)));
+    }
+
+    #[test]
+    fn the_default_options_allow_anyone_because_windows_uses_the_pipe_access_list() {
+        assert_eq!(ServeOptions::default().access, Access::Anyone);
+    }
+
+    #[test]
+    fn a_unix_helper_must_name_a_user_and_a_windows_helper_must_not_be_told_to() {
+        assert!(check_access_for_platform(Access::Uid(1000), true).is_ok());
+        assert!(check_access_for_platform(Access::Anyone, true).unwrap_err().contains("--allow-uid"));
+        assert!(check_access_for_platform(Access::Anyone, false).is_ok());
+    }
+
+    // ---- which user to allow ----
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn the_allowed_user_comes_from_the_argument_in_either_spelling() {
+        assert_eq!(parse_allowed_uid(&args(&["--allow-uid", "1000"]), None), Ok(1000));
+        assert_eq!(parse_allowed_uid(&args(&["--allow-uid=1000"]), None), Ok(1000));
+        assert_eq!(parse_allowed_uid(&args(&["--allow-uid", "0"]), None), Ok(0));
+    }
+
+    #[test]
+    fn without_an_argument_the_user_pkexec_names_is_used() {
+        assert_eq!(parse_allowed_uid(&[], Some("1000")), Ok(1000));
+    }
+
+    #[test]
+    fn the_argument_wins_over_the_pkexec_variable_even_if_that_is_garbage() {
+        assert_eq!(parse_allowed_uid(&args(&["--allow-uid", "1000"]), Some("2000")), Ok(1000));
+        assert_eq!(parse_allowed_uid(&args(&["--allow-uid", "1000"]), Some("junk")), Ok(1000));
+    }
+
+    #[test]
+    fn with_neither_the_helper_says_how_to_start_it() {
+        let error = parse_allowed_uid(&[], None).unwrap_err();
+        assert!(error.contains("--allow-uid") && error.contains("pkexec"), "{error}");
+    }
+
+    #[test]
+    fn only_plain_decimal_numbers_that_fit_are_accepted() {
+        for bad in ["", " 1000", "1000 ", "abc", "-1", "+5", "1e3", "1000x", "0x10", "4294967296", "99999999999"] {
+            assert!(parse_allowed_uid(&args(&["--allow-uid", bad]), None).is_err(), "argument {bad:?}");
+            assert!(parse_allowed_uid(&[], Some(bad)).is_err(), "variable {bad:?}");
+        }
+        assert_eq!(parse_allowed_uid(&args(&["--allow-uid", "4294967295"]), None), Ok(u32::MAX));
+    }
+
+    #[test]
+    fn a_bad_pkexec_variable_is_named_in_the_error() {
+        assert!(parse_allowed_uid(&[], Some("junk")).unwrap_err().contains("PKEXEC_UID"));
+    }
+
+    #[test]
+    fn unknown_missing_or_repeated_arguments_are_errors() {
+        assert!(parse_allowed_uid(&args(&["--bogus"]), Some("1000")).unwrap_err().contains("unknown argument"));
+        assert!(parse_allowed_uid(&args(&["--allow-uid"]), Some("1000")).is_err());
+        assert!(parse_allowed_uid(&args(&["--allow-uid", "1", "--allow-uid", "2"]), None).is_err());
+        assert!(parse_allowed_uid(&args(&["1000"]), None).is_err());
     }
 }
