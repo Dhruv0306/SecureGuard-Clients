@@ -1,5 +1,6 @@
 mod commands;
 mod helper_client;
+mod helper_control;
 mod scan_control;
 mod settings;
 
@@ -15,7 +16,7 @@ fn main() {
     #[cfg(debug_assertions)]
     secureguard_core::signature_sync::load_env_file();
 
-    tauri::Builder
+    let app = tauri::Builder
         ::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -64,9 +65,22 @@ fn main() {
                 commands::clear_auth_key_cmd,
                 commands::block_domain_cmd,
                 commands::unblock_domain_cmd,
-                commands::list_blocked_domains_cmd
+                commands::list_blocked_domains_cmd,
+                commands::helper_status_cmd,
+                commands::enable_blocking_cmd
             ]
         )
-        .run(tauri::generate_context!())
-        .expect("error while running SecureGuard desktop shell");
+        .build(tauri::generate_context!())
+        .expect("error while building SecureGuard desktop shell");
+
+    app.run(|app_handle, event| {
+        // Closing the window and exit_app_cmd both end here. A helper this app
+        // started is asked to quit (it also leaves by itself after 30 idle
+        // minutes); one that was already running is left alone.
+        if let tauri::RunEvent::Exit = event {
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                helper_control::quit_started_helper(&state.helper_started_by_app);
+            }
+        }
+    });
 }

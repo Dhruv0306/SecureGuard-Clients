@@ -9,6 +9,8 @@
 use interprocess::local_socket::{ prelude::*, GenericNamespaced, Stream, ToNsName };
 use secureguard_core::helper_protocol::{ HelperRequest, HelperResponse, HELPER_SOCKET_NAME };
 use std::io::{ BufRead, BufReader, ErrorKind, Write };
+use std::sync::mpsc;
+use std::time::Duration;
 
 /// Why a request did not get an answer from the helper.
 #[derive(Debug)]
@@ -45,6 +47,42 @@ pub fn send_domain_list_to(
     socket_name: &str,
     active_domains: &[String]
 ) -> Result<HelperResponse, HelperError> {
+    exchange(socket_name, &(HelperRequest::SetDomains { active_domains: active_domains.to_vec() }))
+}
+
+/// Whether anything is listening on the socket. Connects and leaves without
+/// sending a line; the helper ignores such a connection and does not count it
+/// as activity.
+pub fn helper_reachable_at(socket_name: &str) -> bool {
+    match socket_name.to_ns_name::<GenericNamespaced>() {
+        Ok(name) => Stream::connect(name).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Asks the helper to answer and exit. The text of an error is the same as
+/// for a block request (see `helper_outcome`), so an unreachable helper starts
+/// with `HELPER_UNREACHABLE`.
+pub fn quit_helper_at(socket_name: &str) -> Result<(), String> {
+    helper_outcome(exchange(socket_name, &(HelperRequest::Quit { quit: true })))
+}
+
+/// `quit_helper_at` that gives up after `timeout`. The request runs on its own
+/// thread, so a helper that never answers cannot hold up the caller; the thread
+/// is left behind and ends when the process does.
+pub fn quit_helper_within(socket_name: &str, timeout: Duration) -> Result<(), String> {
+    let (sender, receiver) = mpsc::channel();
+    let name = socket_name.to_string();
+    std::thread::spawn(move || {
+        let _ = sender.send(quit_helper_at(&name));
+    });
+    receiver
+        .recv_timeout(timeout)
+        .unwrap_or_else(|_| Err("the privileged helper did not answer the quit request in time".to_string()))
+}
+
+/// One request, one response, over a fresh connection.
+fn exchange(socket_name: &str, request: &HelperRequest) -> Result<HelperResponse, HelperError> {
     let name = socket_name.to_ns_name::<GenericNamespaced>().map_err(|e|
         HelperError::Other(format!("invalid helper socket name: {e}"))
     )?;
@@ -58,11 +96,8 @@ pub fn send_domain_list_to(
         }
     })?;
 
-    let request = HelperRequest::SetDomains {
-        active_domains: active_domains.to_vec(),
-    };
     let mut request_json = serde_json
-        ::to_string(&request)
+        ::to_string(request)
         .map_err(|e| HelperError::Other(format!("failed to build request: {e}")))?;
     request_json.push('\n');
 
@@ -95,7 +130,7 @@ pub fn helper_outcome(result: Result<HelperResponse, HelperError>) -> Result<(),
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::ErrorKind;
 
@@ -154,5 +189,87 @@ mod tests {
 
         assert_eq!(text, "failed to send request");
         assert!(!text.contains(HELPER_UNREACHABLE));
+    }
+
+    // ---- probing and quitting, against a fake helper on a real local socket ----
+
+    use interprocess::local_socket::ListenerOptions;
+    use std::sync::{ Arc, Mutex };
+    use std::time::{ Duration, Instant };
+
+    pub(crate) fn unique_name(tag: &str) -> String {
+        format!("secureguard-test-{}-{}", std::process::id(), tag)
+    }
+
+    /// Listens on `name`, records every line it receives, and answers each with
+    /// `reply` (an empty reply means: hold the connection open and say nothing).
+    pub(crate) fn fake_helper(name: &str, reply: &'static str) -> Arc<Mutex<Vec<String>>> {
+        let listener = ListenerOptions::new()
+            .name(name.to_ns_name::<GenericNamespaced>().unwrap())
+            .create_sync()
+            .expect("the fake helper should bind");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming().flatten() {
+                let mut reader = BufReader::new(conn);
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue; // a probe: connected and left
+                }
+                recorded.lock().unwrap().push(line.trim_end().to_string());
+                if reply.is_empty() {
+                    held.push(reader); // never answers, never closes
+                } else {
+                    let _ = reader.get_mut().write_all(reply.as_bytes());
+                }
+            }
+        });
+        seen
+    }
+
+    #[test]
+    fn a_helper_that_listens_is_reachable_and_nothing_is_not() {
+        let name = unique_name("reach");
+        assert!(!helper_reachable_at(&name));
+
+        let _seen = fake_helper(&name, "");
+        assert!(helper_reachable_at(&name));
+    }
+
+    #[test]
+    fn a_quit_sends_exactly_the_quit_line_and_succeeds_on_a_success_reply() {
+        let name = unique_name("quit-ok");
+        let seen = fake_helper(&name, "{\"success\":true,\"error\":null}\n");
+
+        assert_eq!(quit_helper_at(&name), Ok(()));
+        assert_eq!(*seen.lock().unwrap(), vec!["{\"quit\":true}".to_string()]);
+    }
+
+    #[test]
+    fn a_quit_the_helper_refuses_returns_the_helpers_text() {
+        let name = unique_name("quit-no");
+        let _seen = fake_helper(&name, "{\"success\":false,\"error\":\"rejected request: nope\"}\n");
+
+        assert_eq!(quit_helper_at(&name), Err("rejected request: nope".to_string()));
+    }
+
+    #[test]
+    fn a_quit_with_no_helper_running_carries_the_unreachable_marker() {
+        let text = quit_helper_at(&unique_name("quit-none")).unwrap_err();
+        assert!(text.starts_with(HELPER_UNREACHABLE), "{text}");
+    }
+
+    #[test]
+    fn a_quit_to_a_helper_that_never_answers_gives_up_at_the_time_limit() {
+        let name = unique_name("quit-slow");
+        let _seen = fake_helper(&name, "");
+
+        let started = Instant::now();
+        let result = quit_helper_within(&name, Duration::from_millis(400));
+
+        assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+        assert!(result.unwrap_err().contains("did not answer"));
     }
 }
