@@ -1,6 +1,6 @@
 # Shipping the helper: site blocking that works from the download
 
-Date: 01/11/2026. Status: PR 1 (release packaging) is built and was proved by a dry run on 05/11/2026. PR 2 (helper lifecycle) is built, see "Helper changes (PR 2)". PRs 3 and 4 and the release itself are still to do.
+Date: 01/11/2026. Status: PR 1 (release packaging) is built and was proved by a dry run on 05/11/2026. PR 2 (helper lifecycle) is built, see "Helper changes (PR 2)". PR 3 (Windows "Enable site blocking") is built, see "Built in PR 3". PR 4 and the release itself are still to do.
 
 Item 2 of the next-steps order (release v0.2.0), widened after a real test: Dhruv downloaded a
 build, site blocking did not work, and it worked once the helper was run separately. Decisions
@@ -147,8 +147,8 @@ helper, removing hosts-file entries on uninstall, and the abuse.ch key (done).
 Moved out of PR 2 by the plan of 05/11/2026, because only the Linux start-up needs it or nothing
 in PR 2 would use it (the desktop crate rejects unused code):
 
-- PR 3: the `helper_status_cmd` command (`{ supported, running, reason }`) and the client's `quit`
-  call.
+- PR 3 (done): the `helper_status_cmd` command (`{ supported, running, reason }`) and the client's
+  `quit` call.
 - PR 4: on Unix, the helper accepts a connection only from root or from one allowed user id. The
   id comes from `--allow-uid <uid>`, or from `PKEXEC_UID` when started by `pkexec`. With neither,
   the Unix helper refuses to start. Windows keeps the pipe access list it has.
@@ -162,17 +162,35 @@ in PR 2 would use it (the desktop crate rejects unused code):
   would have refused although the install is per machine. On Linux the helper and its folder
   must be owned by root and not group- or world-writable. It also refuses an AppImage (the
   `APPIMAGE` variable is set). Debug builds skip the check, so `cargo tauri dev` keeps working.
-- `start_helper_cmd` asks the operating system to elevate:
+- `enable_blocking_cmd` asks the operating system to elevate:
   - Windows: `ShellExecuteExW` with the `runas` verb, window hidden, through `windows-sys`
-    (one new Windows-only dependency).
+    (already a dependency of `core`; PR 3 adds four features, no new crate).
   - Linux: `pkexec <helper> --allow-uid <current uid>`.
-  Then it waits a few seconds for the helper to answer. A dismissed prompt is reported as
+  Then it waits up to 10 seconds for the helper to answer. A dismissed prompt is reported as
   "cancelled", not as a failure.
 - The app sends `quit` when it closes, but only to a helper it started itself. A helper started
   by hand in an administrator shell is left alone.
 - On the page, "Site blocking" shows the helper state and an "Enable site blocking" button.
   A block or unblock that finds the helper missing shows the same offer. After it is enabled the
   page says so and the user repeats the action; there is no automatic retry.
+
+### Built in PR 3 (Windows)
+
+- `core::helper_launch` holds the decisions as plain functions: the location rule
+  (`check_location`, `check_helper_location`), the status (`helper_status`), the wait loop
+  (`wait_until`, which counts its own sleeps so tests need no clock), and the whole flow with the
+  outside world passed in (`enable_with`). Only `launch_elevated` is Windows-only. It lives in
+  `core` so the `windows-latest` CI job compiles it; the `desktop` crate is not built on Windows
+  by CI before a release tag.
+- The desktop crate's `helper_control` module connects those to the real socket, the real helper
+  path (next to the app's own executable) and the real prompt, and keeps `helper_started_by_app`
+  in `AppState`. `main.rs` builds the app and handles `RunEvent::Exit`, which both closing the
+  window and `exit_app_cmd` end in; the quit waits at most 2 seconds.
+- The write checks run only in release builds (`target/debug` is user-writable by design) and
+  only when the helper is not running: a running executable cannot be opened for writing even
+  when its permissions allow it, which would read as "safe".
+- The page's text for a missing helper no longer tells the user to start it as an
+  administrator; the status line and the button do that.
 
 ### The release itself (after PR 4)
 

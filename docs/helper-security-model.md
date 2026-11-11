@@ -48,8 +48,9 @@ and the helper were both elevated (confirmed by testing both ways).
 
 - A `{"quit":true}` request makes the helper answer and exit. It never touches the hosts file.
   The helper also exits by itself after 30 minutes without a request. Any request that is read
-  restarts the limit, including a rejected one. Nothing in the app sends a quit or starts the
-  helper yet (that is Windows and Linux start-up work still to come).
+  restarts the limit, including a rejected one. On Windows the app starts the helper on request
+  (see "Starting the helper from the app") and sends it a quit when the app closes, but only a
+  helper it started itself. Linux start-up is still to come.
 - A client that connects and sends nothing is read on its own short-lived thread, so it blocks
   neither a quit nor the idle exit, and it does not count as activity. At most 16 connections are
   read at once; one over that is closed. A request line over 2 MB is rejected without reading
@@ -83,6 +84,35 @@ An entry stored by an older version that no longer passes (for example one conta
 space) makes the helper reject the request. Unblock it in the app to clear it; unblocking
 does not re-validate.
 
+## Starting the helper from the app (Windows)
+
+- "Enable site blocking" asks Windows to start the helper elevated, and Windows shows its
+  approval prompt. Nothing is started without that approval. Declining is reported as
+  "cancelled".
+- **The rule before asking.** The app runs as the ordinary user and refuses to ask if that user
+  can open the helper file for writing or create a file in the helper's folder. Then an ordinary
+  program running as the user could replace the helper before it is given administrator rights.
+  A per-user install under the user's own profile fails this rule, and so does an install in a
+  folder the user can write; the page says to reinstall for all users. The helper is expected
+  next to the app's own executable. The rule is skipped in developer builds, and not applied
+  when the helper is already running (a running executable cannot be opened for writing, so the
+  probe would say nothing).
+- **What the rule does not cover.**
+  - Folders above the helper's folder are not checked. A user-writable parent that can be renamed
+    or replaced is not caught. Checking every parent would refuse a valid all-users install on a
+    drive where the user can create folders (the release dry run installed to
+    `D:\Program Files\SecureGuard`, and `D:\` is user-writable on that machine).
+  - Between the check and the start there is a short window. An attacker who could use it
+    already had write access somewhere the check did not look.
+  - The approval prompt names "Unknown publisher", because nothing is code signed.
+  - An app that is itself running as administrator, or on a PC with the approval prompts turned
+    off, can write the helper, so the rule refuses it and the page shows the reinstall message
+    although the install is fine. Starting the helper by hand in an Administrator shell works
+    around it: the app then finds it running.
+- **Quit on exit.** Only a helper the app started is asked to quit when the app closes. A helper
+  started by hand, or already running when the app opened, is left running. The quit waits at
+  most 2 seconds, so a helper that does not answer never holds up closing the app.
+
 ## Not covered
 
 - **Linux and macOS.** The same socket name is used, but access control for it is not
@@ -109,3 +139,14 @@ normal window (`cargo tauri dev`).
    $r.ReadLine()
    ```
 3. Start a second helper while the first is running. It must refuse to start.
+
+4. In an installed all-users build with no helper running, the Blocked domains section says site
+   blocking is off and shows "Enable site blocking". Click it and approve the Windows prompt.
+   The section says site blocking is on. Block `scg-smoke-test.example`; the hosts file gains the
+   line. Close the app. The `secureguard-helper` process is gone.
+5. Click "Enable site blocking" and cancel the prompt. The page says approval was cancelled, no
+   helper process exists, and the button is still there.
+6. In a per-user install (or any folder the user can write to), the section shows the reinstall
+   message and no button.
+7. Start the helper by hand in an Administrator PowerShell, open the app (it shows site blocking
+   is on), then close the app. The helper keeps running.

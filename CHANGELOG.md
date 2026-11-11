@@ -9,12 +9,17 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 - Helper: a quit request (`{"quit":true}`) makes the helper answer and exit, and the helper now
-  exits by itself after 30 minutes without a request. Neither changes who may connect, and
-  nothing in the app starts the helper yet. A client that connects and sends nothing no longer
-  blocks the helper, and a request line is limited to 2 MB.
+  exits by itself after 30 minutes without a request. Neither changes who may connect. A client
+  that connects and sends nothing no longer blocks the helper, and a request line is limited
+  to 2 MB.
+- Desktop (Windows): an "Enable site blocking" button starts the privileged helper through the
+  Windows approval prompt and waits up to 10 seconds for it to answer; a helper the app started
+  is asked to quit when the app closes. It is offered only when the install could not be
+  changed by an ordinary program (an all-users install, not a per-user one); otherwise the page
+  says to reinstall for all users. A helper started by hand is left running when the app closes.
 - Desktop: when the helper is not running, blocking or unblocking a site now says so in plain
-  words ("Site blocking is off: the privileged helper is not running. Start it as an
-  administrator, then try again.") instead of showing a raw connection error.
+  words ("Site blocking is off: the privileged helper is not running.") instead of showing a raw
+  connection error, and the section above the form shows whether site blocking is on.
 - Release: a manual workflow, "Check attaching files to a draft release" (Actions tab, Run
   workflow), that creates a throwaway tag and a draft release for it, prints what GitHub reports
   about the draft, attaches sample files to it twice with the release's own script, checks the
