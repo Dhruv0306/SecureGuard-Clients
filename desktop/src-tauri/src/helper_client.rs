@@ -23,6 +23,44 @@ pub enum HelperError {
     Other(String),
 }
 
+/// Whom the app will talk to. A Unix socket has no access list (on Linux it is
+/// an abstract socket anyone can bind), so another local user could bind the
+/// helper's name first and wait for requests. On Unix the app therefore talks
+/// only to a socket whose owner is root; nothing is sent otherwise. Windows
+/// pipes are protected by the helper's first-instance flag and access list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerTrust {
+    Anyone,
+    /// The socket must belong to this user.
+    Uid(u32),
+}
+
+impl ServerTrust {
+    pub fn for_platform() -> Self {
+        if cfg!(unix) { ServerTrust::Uid(0) } else { ServerTrust::Anyone }
+    }
+
+    /// `owner` is the user id behind the socket, or None when it cannot be read.
+    pub fn accepts(&self, owner: Option<u32>) -> bool {
+        match self {
+            ServerTrust::Anyone => true,
+            ServerTrust::Uid(expected) => owner == Some(*expected),
+        }
+    }
+}
+
+/// The user id of the process behind the socket we connected to.
+#[cfg(unix)]
+fn owner_euid(conn: &Stream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon;
+    conn.peer_creds().ok().and_then(|creds| creds.euid())
+}
+
+#[cfg(not(unix))]
+fn owner_euid(_conn: &Stream) -> Option<u32> {
+    None
+}
+
 /// Starts the error text of a block or unblock that failed because the helper
 /// is not running, so the page can recognize it without matching on the
 /// operating system's wording. Keep in step with `HELPER_UNREACHABLE` in
@@ -38,16 +76,21 @@ fn means_not_running(kind: ErrorKind) -> bool {
 }
 
 pub fn send_domain_list(active_domains: &[String]) -> Result<HelperResponse, HelperError> {
-    send_domain_list_to(HELPER_SOCKET_NAME, active_domains)
+    send_domain_list_to(HELPER_SOCKET_NAME, ServerTrust::for_platform(), active_domains)
 }
 
 /// Same as `send_domain_list` for a chosen socket name, so a test can point it
 /// at a name nobody listens on.
 pub fn send_domain_list_to(
     socket_name: &str,
+    trust: ServerTrust,
     active_domains: &[String]
 ) -> Result<HelperResponse, HelperError> {
-    exchange(socket_name, &(HelperRequest::SetDomains { active_domains: active_domains.to_vec() }))
+    exchange(
+        socket_name,
+        trust,
+        &(HelperRequest::SetDomains { active_domains: active_domains.to_vec() })
+    )
 }
 
 /// Whether anything is listening on the socket. Connects and leaves without
@@ -63,26 +106,35 @@ pub fn helper_reachable_at(socket_name: &str) -> bool {
 /// Asks the helper to answer and exit. The text of an error is the same as
 /// for a block request (see `helper_outcome`), so an unreachable helper starts
 /// with `HELPER_UNREACHABLE`.
-pub fn quit_helper_at(socket_name: &str) -> Result<(), String> {
-    helper_outcome(exchange(socket_name, &(HelperRequest::Quit { quit: true })))
+pub fn quit_helper_at(socket_name: &str, trust: ServerTrust) -> Result<(), String> {
+    helper_outcome(exchange(socket_name, trust, &(HelperRequest::Quit { quit: true })))
 }
 
 /// `quit_helper_at` that gives up after `timeout`. The request runs on its own
 /// thread, so a helper that never answers cannot hold up the caller; the thread
 /// is left behind and ends when the process does.
-pub fn quit_helper_within(socket_name: &str, timeout: Duration) -> Result<(), String> {
+pub fn quit_helper_within(
+    socket_name: &str,
+    trust: ServerTrust,
+    timeout: Duration
+) -> Result<(), String> {
     let (sender, receiver) = mpsc::channel();
     let name = socket_name.to_string();
     std::thread::spawn(move || {
-        let _ = sender.send(quit_helper_at(&name));
+        let _ = sender.send(quit_helper_at(&name, trust));
     });
     receiver
         .recv_timeout(timeout)
         .unwrap_or_else(|_| Err("the privileged helper did not answer the quit request in time".to_string()))
 }
 
-/// One request, one response, over a fresh connection.
-fn exchange(socket_name: &str, request: &HelperRequest) -> Result<HelperResponse, HelperError> {
+/// One request, one response, over a fresh connection. Nothing is sent until
+/// the socket's owner passes `trust`.
+fn exchange(
+    socket_name: &str,
+    trust: ServerTrust,
+    request: &HelperRequest
+) -> Result<HelperResponse, HelperError> {
     let name = socket_name.to_ns_name::<GenericNamespaced>().map_err(|e|
         HelperError::Other(format!("invalid helper socket name: {e}"))
     )?;
@@ -95,6 +147,14 @@ fn exchange(socket_name: &str, request: &HelperRequest) -> Result<HelperResponse
             HelperError::Other(text)
         }
     })?;
+
+    if !trust.accepts(owner_euid(&conn)) {
+        return Err(
+            HelperError::Other(
+                "the privileged helper socket is not owned by the expected user, so nothing was sent to it".to_string()
+            )
+        );
+    }
 
     let mut request_json = serde_json
         ::to_string(request)
@@ -142,7 +202,7 @@ pub(crate) mod tests {
     fn a_socket_nobody_listens_on_is_reported_as_unreachable() {
         let name = format!("secureguard-helper-test-nobody-{}", std::process::id());
 
-        let result = send_domain_list_to(&name, &["a.example".to_string()]);
+        let result = send_domain_list_to(&name, ServerTrust::Anyone, &["a.example".to_string()]);
 
         assert!(matches!(result, Err(HelperError::Unreachable(_))), "got {result:?}");
     }
@@ -243,7 +303,7 @@ pub(crate) mod tests {
         let name = unique_name("quit-ok");
         let seen = fake_helper(&name, "{\"success\":true,\"error\":null}\n");
 
-        assert_eq!(quit_helper_at(&name), Ok(()));
+        assert_eq!(quit_helper_at(&name, ServerTrust::Anyone), Ok(()));
         assert_eq!(*seen.lock().unwrap(), vec!["{\"quit\":true}".to_string()]);
     }
 
@@ -252,12 +312,12 @@ pub(crate) mod tests {
         let name = unique_name("quit-no");
         let _seen = fake_helper(&name, "{\"success\":false,\"error\":\"rejected request: nope\"}\n");
 
-        assert_eq!(quit_helper_at(&name), Err("rejected request: nope".to_string()));
+        assert_eq!(quit_helper_at(&name, ServerTrust::Anyone), Err("rejected request: nope".to_string()));
     }
 
     #[test]
     fn a_quit_with_no_helper_running_carries_the_unreachable_marker() {
-        let text = quit_helper_at(&unique_name("quit-none")).unwrap_err();
+        let text = quit_helper_at(&unique_name("quit-none"), ServerTrust::Anyone).unwrap_err();
         assert!(text.starts_with(HELPER_UNREACHABLE), "{text}");
     }
 
@@ -267,9 +327,82 @@ pub(crate) mod tests {
         let _seen = fake_helper(&name, "");
 
         let started = Instant::now();
-        let result = quit_helper_within(&name, Duration::from_millis(400));
+        let result = quit_helper_within(&name, ServerTrust::Anyone, Duration::from_millis(400));
 
         assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
         assert!(result.unwrap_err().contains("did not answer"));
+    }
+
+    // ---- not talking to an impostor ----
+
+    #[test]
+    fn the_platform_trusts_root_on_unix_and_anyone_on_windows() {
+        if cfg!(unix) {
+            assert_eq!(ServerTrust::for_platform(), ServerTrust::Uid(0));
+        } else {
+            assert_eq!(ServerTrust::for_platform(), ServerTrust::Anyone);
+        }
+    }
+
+    #[test]
+    fn trust_in_a_user_means_exactly_that_user() {
+        assert!(ServerTrust::Anyone.accepts(None));
+        assert!(ServerTrust::Anyone.accepts(Some(1000)));
+        assert!(ServerTrust::Uid(0).accepts(Some(0)));
+        assert!(!ServerTrust::Uid(0).accepts(Some(1000)));
+        assert!(!ServerTrust::Uid(0).accepts(None), "a socket whose owner cannot be read is not trusted");
+    }
+
+    /// The user the fake helper (this process) runs as, as a client sees it.
+    #[cfg(unix)]
+    fn my_euid(name: &str) -> u32 {
+        use interprocess::local_socket::traits::StreamCommon;
+        let conn = Stream::connect(name.to_ns_name::<GenericNamespaced>().unwrap()).unwrap();
+        conn.peer_creds().unwrap().euid().expect("this platform reports the peer user")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_run_by_the_expected_user_is_talked_to() {
+        let name = unique_name("trust-ok");
+        let seen = fake_helper(&name, "{\"success\":true,\"error\":null}\n");
+        let me = my_euid(&name);
+
+        let result = send_domain_list_to(&name, ServerTrust::Uid(me), &["a.example".to_string()]);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_owned_by_someone_else_is_refused_and_is_sent_nothing() {
+        let name = unique_name("trust-no");
+        let seen = fake_helper(&name, "{\"success\":true,\"error\":null}\n");
+        let someone_else = my_euid(&name).wrapping_add(1);
+
+        let result = send_domain_list_to(&name, ServerTrust::Uid(someone_else), &["a.example".to_string()]);
+
+        match result {
+            Err(HelperError::Other(text)) => assert!(text.contains("not owned by the expected user"), "{text}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(seen.lock().unwrap().is_empty(), "the domain list must not reach an impostor");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_quit_is_not_sent_to_an_impostor_either() {
+        let name = unique_name("trust-quit");
+        let seen = fake_helper(&name, "{\"success\":true,\"error\":null}\n");
+        let someone_else = my_euid(&name).wrapping_add(1);
+
+        let text = quit_helper_at(&name, ServerTrust::Uid(someone_else)).unwrap_err();
+
+        assert!(text.contains("not owned by the expected user"), "{text}");
+        assert!(!text.starts_with(HELPER_UNREACHABLE), "a squatted socket is not a missing helper");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(seen.lock().unwrap().is_empty());
     }
 }

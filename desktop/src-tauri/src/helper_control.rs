@@ -4,7 +4,7 @@
 //! path and the platform as arguments so tests can use fakes; `current_*` use
 //! the real ones.
 
-use crate::helper_client;
+use crate::helper_client::{ self, ServerTrust };
 use secureguard_core::helper_launch::{
     check_helper_location,
     enable_with,
@@ -77,9 +77,14 @@ fn enable_using(
 
 /// Asks a helper this app started to quit, then clears the mark. Waits at most
 /// `timeout`. Does nothing for a helper the app did not start.
-fn quit_if_started(started: &AtomicBool, socket_name: &str, timeout: Duration) {
+fn quit_if_started(
+    started: &AtomicBool,
+    socket_name: &str,
+    trust: ServerTrust,
+    timeout: Duration
+) {
     if started.swap(false, Ordering::SeqCst) {
-        if let Err(e) = helper_client::quit_helper_within(socket_name, timeout) {
+        if let Err(e) = helper_client::quit_helper_within(socket_name, trust, timeout) {
             eprintln!("could not ask the privileged helper to quit: {e}");
         }
     }
@@ -113,7 +118,7 @@ pub fn enable_current(started: &AtomicBool) -> Result<HelperStatus, String> {
 
 /// Called when the app exits.
 pub fn quit_started_helper(started: &AtomicBool) {
-    quit_if_started(started, HELPER_SOCKET_NAME, QUIT_TIMEOUT);
+    quit_if_started(started, HELPER_SOCKET_NAME, ServerTrust::for_platform(), QUIT_TIMEOUT);
 }
 
 #[cfg(windows)]
@@ -289,7 +294,7 @@ mod tests {
         let name = unique_name("qx-none");
         let seen = fake_helper(&name, "{\"success\":true,\"error\":null}\n");
 
-        quit_if_started(&AtomicBool::new(false), &name, Duration::from_secs(1));
+        quit_if_started(&AtomicBool::new(false), &name, ServerTrust::Anyone, Duration::from_secs(1));
 
         assert!(seen.lock().unwrap().is_empty(), "no quit may be sent");
     }
@@ -300,8 +305,8 @@ mod tests {
         let seen = fake_helper(&name, "{\"success\":true,\"error\":null}\n");
         let started = AtomicBool::new(true);
 
-        quit_if_started(&started, &name, Duration::from_secs(1));
-        quit_if_started(&started, &name, Duration::from_secs(1));
+        quit_if_started(&started, &name, ServerTrust::Anyone, Duration::from_secs(1));
+        quit_if_started(&started, &name, ServerTrust::Anyone, Duration::from_secs(1));
 
         assert_eq!(*seen.lock().unwrap(), vec!["{\"quit\":true}".to_string()]);
         assert!(!started.load(Ordering::SeqCst));
@@ -313,14 +318,14 @@ mod tests {
         let _seen = fake_helper(&name, "");
 
         let began = std::time::Instant::now();
-        quit_if_started(&AtomicBool::new(true), &name, Duration::from_millis(300));
+        quit_if_started(&AtomicBool::new(true), &name, ServerTrust::Anyone, Duration::from_millis(300));
 
         assert!(began.elapsed() < Duration::from_secs(3), "took {:?}", began.elapsed());
     }
 
     #[test]
     fn a_helper_that_is_already_gone_is_not_an_error_on_exit() {
-        quit_if_started(&AtomicBool::new(true), &unique_name("qx-gone"), Duration::from_secs(1));
+        quit_if_started(&AtomicBool::new(true), &unique_name("qx-gone"), ServerTrust::Anyone, Duration::from_secs(1));
     }
 
     #[cfg(not(windows))]
