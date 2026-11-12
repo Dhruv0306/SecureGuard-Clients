@@ -29,8 +29,16 @@ pub const WAIT_STEP: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     NotFound,
+    /// Windows: the current user could write the helper file.
     FileWritableByUser,
+    /// Windows: the current user could create files next to the helper.
     FolderWritableByUser,
+    /// Unix: the helper or its folder is not owned by root.
+    NotRootOwned,
+    /// Unix: group or others could write the helper or its folder.
+    WritableByOthers,
+    /// Running from an AppImage, which cannot hold a root-owned helper.
+    AppImage,
 }
 
 impl Refusal {
@@ -41,6 +49,12 @@ impl Refusal {
                 "The privileged helper was not found next to SecureGuard. Reinstall SecureGuard.",
             Refusal::FileWritableByUser | Refusal::FolderWritableByUser =>
                 "Site blocking needs SecureGuard installed for all users, because an ordinary program could change this copy. Reinstall SecureGuard for all users.",
+            Refusal::NotRootOwned =>
+                "Site blocking needs SecureGuard installed from the .deb package, because only an administrator should be able to change the helper. Reinstall SecureGuard from the .deb package.",
+            Refusal::WritableByOthers =>
+                "Site blocking needs the helper to be changeable only by an administrator, and it is not. Reinstall SecureGuard from the .deb package.",
+            Refusal::AppImage =>
+                "Site blocking is not available in the AppImage. Install the SecureGuard .deb package instead.",
         }
     }
 }
@@ -85,17 +99,109 @@ pub fn can_create_in(dir: &Path) -> bool {
     }
 }
 
-/// Looks at the real file system. With `enforce_writable` false (a developer
-/// build, where `target/debug` is writable by design) only the existence of the
-/// helper is checked. The write probes run only when the file exists, so a
+/// The Windows rule on the real file system: a missing helper, a helper file
+/// the current user can open for writing, or a folder the current user can
+/// create files in. The write probes run only when the file exists, so a
 /// missing helper never causes a file to be created.
-pub fn check_helper_location(helper: &Path, enforce_writable: bool) -> Result<(), Refusal> {
+pub fn check_writable_location(helper: &Path) -> Result<(), Refusal> {
     let exists = helper.is_file();
-    if !enforce_writable {
-        return if exists { Ok(()) } else { Err(Refusal::NotFound) };
-    }
     let folder = helper.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     check_location(exists, exists && can_write_file(helper), exists && can_create_in(folder))
+}
+
+/// Owner and permission bits of a file or folder, as `stat` reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerMode {
+    pub uid: u32,
+    pub mode: u32,
+}
+
+/// The Unix rule, from the helper's and its folder's owner and mode: both owned
+/// by root, and neither writable by group or others. Owned by root is required
+/// even when the mode forbids writing, because the owner can change the mode
+/// back. `None` for the file means it does not exist. File type bits in `mode`
+/// are ignored.
+pub fn check_unix_location(file: Option<OwnerMode>, folder: OwnerMode) -> Result<(), Refusal> {
+    let Some(file) = file else {
+        return Err(Refusal::NotFound);
+    };
+    if file.uid != 0 || folder.uid != 0 {
+        return Err(Refusal::NotRootOwned);
+    }
+    const GROUP_OR_OTHER_WRITE: u32 = 0o022;
+    if (file.mode | folder.mode) & GROUP_OR_OTHER_WRITE != 0 {
+        return Err(Refusal::WritableByOthers);
+    }
+    Ok(())
+}
+
+/// The Unix rule on the real file system. Symlinks are resolved first, so a
+/// link in a root-owned folder to a file elsewhere is judged by that file and
+/// the folder that file is in.
+#[cfg(unix)]
+fn check_unix_location_on_disk(helper: &Path) -> Result<(), Refusal> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(real) = helper.canonicalize() else {
+        return Err(Refusal::NotFound);
+    };
+    let Ok(file) = std::fs::metadata(&real) else {
+        return Err(Refusal::NotFound);
+    };
+    if !file.is_file() {
+        return Err(Refusal::NotFound);
+    }
+    let Some(folder_path) = real.parent() else {
+        return Err(Refusal::NotFound);
+    };
+    let Ok(folder) = std::fs::metadata(folder_path) else {
+        return Err(Refusal::NotFound);
+    };
+    check_unix_location(
+        Some(OwnerMode { uid: file.uid(), mode: file.mode() }),
+        OwnerMode { uid: folder.uid(), mode: folder.mode() }
+    )
+}
+
+/// Looks at the real file system with this platform's rule. With
+/// `enforce_safe_install` false (a developer build, where `target/debug` is
+/// owned by the developer by design) only the existence of the helper is
+/// checked.
+pub fn check_helper_location(helper: &Path, enforce_safe_install: bool) -> Result<(), Refusal> {
+    if !enforce_safe_install {
+        return if helper.is_file() { Ok(()) } else { Err(Refusal::NotFound) };
+    }
+    #[cfg(unix)]
+    {
+        check_unix_location_on_disk(helper)
+    }
+    #[cfg(not(unix))]
+    {
+        check_writable_location(helper)
+    }
+}
+
+/// `Some(AppImage)` when the app runs from an AppImage (the `APPIMAGE`
+/// variable is set and not empty): its files are unpacked for the user, so the
+/// helper cannot be root-owned.
+pub fn appimage_refusal(appimage_variable: Option<&str>) -> Option<Refusal> {
+    match appimage_variable {
+        Some(value) if !value.is_empty() => Some(Refusal::AppImage),
+        _ => None,
+    }
+}
+
+/// Whether the helper may be started from this install: not from an AppImage
+/// (even in a developer build, where it could never work), then the platform's
+/// location rule.
+pub fn check_install(
+    helper: &Path,
+    enforce_safe_install: bool,
+    appimage_variable: Option<&str>
+) -> Result<(), Refusal> {
+    if let Some(refusal) = appimage_refusal(appimage_variable) {
+        return Err(refusal);
+    }
+    check_helper_location(helper, enforce_safe_install)
 }
 
 /// Where the helper is expected: in the same folder as the app's executable.
@@ -304,12 +410,93 @@ mod tests {
 
     #[test]
     fn every_refusal_says_what_to_do() {
-        for refusal in [Refusal::NotFound, Refusal::FileWritableByUser, Refusal::FolderWritableByUser] {
+        for refusal in [
+            Refusal::NotFound,
+            Refusal::FileWritableByUser,
+            Refusal::FolderWritableByUser,
+            Refusal::NotRootOwned,
+            Refusal::WritableByOthers,
+            Refusal::AppImage,
+        ] {
             let text = refusal.message();
             assert!(text.ends_with('.'), "{text}");
-            assert!(text.to_lowercase().contains("reinstall"), "{text}");
+            assert!(text.to_lowercase().contains("install"), "{text}");
         }
         assert!(Refusal::FolderWritableByUser.message().contains("all users"));
+        assert!(Refusal::AppImage.message().contains(".deb"));
+        assert!(Refusal::NotRootOwned.message().contains(".deb"));
+    }
+
+    // ---- check_unix_location ----
+
+    fn root(mode: u32) -> OwnerMode { OwnerMode { uid: 0, mode } }
+    fn user(mode: u32) -> OwnerMode { OwnerMode { uid: 1000, mode } }
+
+    #[test]
+    fn a_root_owned_helper_in_a_root_owned_folder_nobody_else_can_write_is_accepted() {
+        assert_eq!(check_unix_location(Some(root(0o755)), root(0o755)), Ok(()));
+        assert_eq!(check_unix_location(Some(root(0o555)), root(0o555)), Ok(()));
+        // The mode from a real stat has the file type in its high bits.
+        assert_eq!(check_unix_location(Some(root(0o100755)), root(0o040755)), Ok(()));
+    }
+
+    #[test]
+    fn a_missing_helper_is_refused_before_anything_else_on_unix_too() {
+        assert_eq!(check_unix_location(None, user(0o777)), Err(Refusal::NotFound));
+    }
+
+    #[test]
+    fn a_helper_or_folder_owned_by_anyone_but_root_is_refused() {
+        assert_eq!(check_unix_location(Some(user(0o755)), root(0o755)), Err(Refusal::NotRootOwned));
+        assert_eq!(check_unix_location(Some(root(0o755)), user(0o755)), Err(Refusal::NotRootOwned));
+        // Mode 555 does not help: the owner can change the mode back.
+        assert_eq!(check_unix_location(Some(user(0o555)), user(0o555)), Err(Refusal::NotRootOwned));
+    }
+
+    #[test]
+    fn a_helper_or_folder_that_group_or_others_can_write_is_refused() {
+        for mode in [0o775, 0o757, 0o777, 0o666, 0o100775, 0o100757] {
+            assert_eq!(
+                check_unix_location(Some(root(mode)), root(0o755)),
+                Err(Refusal::WritableByOthers),
+                "file mode {mode:o}"
+            );
+        }
+        for mode in [0o775, 0o757, 0o777, 0o041777, 0o040775] {
+            assert_eq!(
+                check_unix_location(Some(root(0o755)), root(mode)),
+                Err(Refusal::WritableByOthers),
+                "folder mode {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_is_reported_before_writability() {
+        assert_eq!(check_unix_location(Some(user(0o777)), root(0o755)), Err(Refusal::NotRootOwned));
+    }
+
+    // ---- AppImage and the whole install check ----
+
+    #[test]
+    fn an_appimage_is_recognized_by_its_environment_variable() {
+        assert_eq!(appimage_refusal(None), None);
+        assert_eq!(appimage_refusal(Some("")), None);
+        assert_eq!(appimage_refusal(Some("/tmp/SecureGuard.AppImage")), Some(Refusal::AppImage));
+    }
+
+    #[test]
+    fn an_appimage_is_refused_even_in_a_developer_build_and_even_if_the_file_is_missing() {
+        let missing = std::path::Path::new("no-such-dir").join(HELPER_FILE_NAME);
+        assert_eq!(check_install(&missing, false, Some("/x.AppImage")), Err(Refusal::AppImage));
+        assert_eq!(check_install(&missing, true, Some("/x.AppImage")), Err(Refusal::AppImage));
+    }
+
+    #[test]
+    fn without_an_appimage_the_install_check_is_the_location_check() {
+        let missing = std::path::Path::new("no-such-dir").join(HELPER_FILE_NAME);
+        assert_eq!(check_install(&missing, false, None), Err(Refusal::NotFound));
+        assert_eq!(check_install(&missing, true, Some("")), Err(Refusal::NotFound));
     }
 
     // ---- helper_status ----
@@ -543,17 +730,133 @@ mod tests {
     }
 
     #[test]
-    fn check_helper_location_reads_the_real_file_system() {
+    fn the_write_probes_read_the_real_file_system() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("secureguard-helper");
-        assert_eq!(check_helper_location(&missing, true), Err(Refusal::NotFound));
-        assert_eq!(check_helper_location(&missing, false), Err(Refusal::NotFound));
+        assert_eq!(check_writable_location(&missing), Err(Refusal::NotFound));
 
         std::fs::write(&missing, b"x").unwrap();
         // The test owns this folder, so an ordinary user could replace the file.
-        assert_eq!(check_helper_location(&missing, true), Err(Refusal::FileWritableByUser));
-        // A developer build skips the write checks but still needs the file.
-        assert_eq!(check_helper_location(&missing, false), Ok(()));
+        assert_eq!(check_writable_location(&missing), Err(Refusal::FileWritableByUser));
+    }
+
+    #[test]
+    fn a_developer_build_skips_the_checks_but_still_needs_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("secureguard-helper");
+        assert_eq!(check_helper_location(&helper, false), Err(Refusal::NotFound));
+
+        std::fs::write(&helper, b"x").unwrap();
+        // A place the rule refuses on every platform and for every user.
+        #[cfg(unix)]
+        {
+            set_mode(&helper, 0o777);
+            set_mode(dir.path(), 0o777);
+            assert!(check_helper_location(&helper, true).is_err());
+        }
+        assert_eq!(check_helper_location(&helper, false), Ok(()));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn on_windows_the_platform_rule_is_the_write_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("secureguard-helper.exe");
+        std::fs::write(&helper, b"x").unwrap();
+        assert_eq!(check_helper_location(&helper, true), Err(Refusal::FileWritableByUser));
+    }
+
+    /// Whether this test process owns what it creates as root would, which
+    /// decides what the real file system tests can say.
+    #[cfg(unix)]
+    fn running_as_root(dir: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir).unwrap().uid() == 0
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_the_platform_rule_reads_the_real_owner_and_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("bin");
+        std::fs::create_dir(&folder).unwrap();
+        let helper = folder.join("secureguard-helper");
+        std::fs::write(&helper, b"x").unwrap();
+        set_mode(&helper, 0o755);
+        set_mode(&folder, 0o755);
+
+        if !running_as_root(dir.path()) {
+            // Everything this process creates belongs to a normal user.
+            assert_eq!(check_helper_location(&helper, true), Err(Refusal::NotRootOwned));
+            return;
+        }
+        assert_eq!(check_helper_location(&helper, true), Ok(()));
+
+        set_mode(&helper, 0o775);
+        assert_eq!(check_helper_location(&helper, true), Err(Refusal::WritableByOthers));
+        set_mode(&helper, 0o755);
+
+        set_mode(&folder, 0o777);
+        assert_eq!(check_helper_location(&helper, true), Err(Refusal::WritableByOthers));
+        set_mode(&folder, 0o755);
+
+        std::os::unix::fs::chown(&helper, Some(65534), None).unwrap();
+        assert_eq!(check_helper_location(&helper, true), Err(Refusal::NotRootOwned));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_file_someone_else_owns_is_judged_by_the_file_it_points_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("secureguard-helper");
+        std::fs::write(&target, b"x").unwrap();
+        set_mode(&target, 0o755);
+        set_mode(dir.path(), 0o755);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        if running_as_root(dir.path()) {
+            std::os::unix::fs::chown(&target, Some(65534), None).unwrap();
+        }
+        assert_eq!(check_helper_location(&link, true), Err(Refusal::NotRootOwned));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_judged_by_the_folder_of_the_file_it_points_to() {
+        let dir = tempfile::tempdir().unwrap();
+        if !running_as_root(dir.path()) {
+            return; // everything made here is user-owned, so folders cannot be told apart
+        }
+        let safe = dir.path().join("safe");
+        let open = dir.path().join("open");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::create_dir(&open).unwrap();
+        set_mode(&safe, 0o755);
+        set_mode(&open, 0o777); // anyone could replace the file inside
+        let target = open.join("secureguard-helper");
+        std::fs::write(&target, b"x").unwrap();
+        set_mode(&target, 0o755);
+        let link = safe.join("secureguard-helper");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(check_helper_location(&link, true), Err(Refusal::WritableByOthers));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_a_missing_helper_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            check_helper_location(&dir.path().join("secureguard-helper"), true),
+            Err(Refusal::NotFound)
+        );
     }
 
     #[test]

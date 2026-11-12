@@ -6,13 +6,14 @@
 
 use crate::helper_client::{ self, ServerTrust };
 use secureguard_core::helper_launch::{
-    check_helper_location,
+    check_install,
     enable_with,
     helper_path_beside,
     helper_status,
     Enabled,
     HelperStatus,
     LaunchError,
+    Refusal,
     HELPER_FILE_NAME,
 };
 use secureguard_core::helper_protocol::HELPER_SOCKET_NAME;
@@ -27,6 +28,11 @@ const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Shown where the app has no way to start the helper yet.
 pub const NOT_AVAILABLE_HERE: &str =
     "Starting the privileged helper from the app is not available on this platform yet.";
+
+/// The install rule for this platform, with the `APPIMAGE` variable read here.
+fn install_check(helper: &Path, enforce_safe_install: bool) -> Result<(), Refusal> {
+    check_install(helper, enforce_safe_install, std::env::var("APPIMAGE").ok().as_deref())
+}
 
 /// Whether the helper answers and, if not, whether the app may start it.
 /// `enforce_writable` is false in developer builds. `can_start` is false on a
@@ -45,7 +51,7 @@ fn status_at(
             reason: Some(NOT_AVAILABLE_HERE.to_string()),
         };
     }
-    helper_status(running, || check_helper_location(helper, enforce_writable))
+    helper_status(running, || install_check(helper, enforce_writable))
 }
 
 /// The enable flow against a socket and a helper path, with `launch` and
@@ -61,7 +67,7 @@ fn enable_using(
 ) -> Result<HelperStatus, String> {
     let outcome = enable_with(
         || helper_client::helper_reachable_at(socket_name),
-        || check_helper_location(helper, enforce_writable),
+        || install_check(helper, enforce_writable),
         || launch(helper),
         sleep
     );
@@ -148,7 +154,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let helper = dir.path().join("secureguard-helper");
         std::fs::write(&helper, b"x").unwrap();
+        // Anyone can write it, so it is an unsafe place whoever runs the test
+        // (as root the owner would otherwise be fine on Unix).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o777)).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
         (dir, helper)
+    }
+
+    /// The refusal this platform gives for the unsafe place above.
+    fn refusal_for(helper: &std::path::Path) -> Refusal {
+        secureguard_core::helper_launch::check_helper_location(helper, true).unwrap_err()
     }
 
     fn no_sleep(_: Duration) {}
@@ -175,7 +194,7 @@ mod tests {
         let (_dir, helper) = helper_in_a_user_folder();
         let status = status_at(&unique_name("st-unsafe"), &helper, true, true);
         assert!(!status.supported && !status.running);
-        assert_eq!(status.reason.as_deref(), Some(Refusal::FileWritableByUser.message()));
+        assert_eq!(status.reason.as_deref(), Some(refusal_for(&helper).message()));
     }
 
     #[test]
@@ -228,7 +247,7 @@ mod tests {
             no_sleep
         );
 
-        assert_eq!(result, Err(Refusal::FileWritableByUser.message().to_string()));
+        assert_eq!(result, Err(refusal_for(&helper).message().to_string()));
         assert!(!started.load(Ordering::SeqCst));
     }
 
