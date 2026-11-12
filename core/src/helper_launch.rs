@@ -269,8 +269,32 @@ pub fn wait_until(
 pub enum LaunchError {
     /// The user said no to the approval prompt.
     Declined,
-    /// Windows could not start it; the number is the Windows error code.
+    /// The system could not start it; the number is the error code (a Windows
+    /// error code, or the launcher's exit status).
     Failed(u32),
+    /// The program that asks for approval (`pkexec` on Linux) is not installed.
+    MissingLauncher,
+}
+
+/// A started launcher: how long to wait for the helper to answer, and a watch
+/// that is asked each time the wait looks and says whether the launcher failed
+/// in the meantime. Windows asks for approval before it returns, so it waits
+/// 10 seconds with a watch that never fails. On Linux the prompt is still open
+/// while the wait runs, so it waits longer and the watch reports the launcher
+/// exiting.
+pub struct Launch {
+    pub timeout: Duration,
+    pub watch: Box<dyn FnMut() -> Option<LaunchError>>,
+}
+
+impl Launch {
+    pub fn standard() -> Self {
+        Self::with_watch(WAIT_TIMEOUT, || None)
+    }
+
+    pub fn with_watch(timeout: Duration, watch: impl FnMut() -> Option<LaunchError> + 'static) -> Self {
+        Self { timeout, watch: Box::new(watch) }
+    }
 }
 
 /// UTF-16 units with the terminating zero the Windows calls expect.
@@ -334,7 +358,9 @@ pub enum EnableError {
     Refused(Refusal),
     Declined,
     LaunchFailed(u32),
-    TimedOut,
+    MissingLauncher,
+    /// The helper was started but did not answer within this long.
+    TimedOut(Duration),
 }
 
 impl EnableError {
@@ -344,38 +370,64 @@ impl EnableError {
             EnableError::Declined =>
                 "Approval was cancelled, so site blocking was not turned on.".to_string(),
             EnableError::LaunchFailed(code) =>
-                format!("Windows could not start the privileged helper (error {code})."),
-            EnableError::TimedOut =>
+                format!("The privileged helper could not be started (error {code})."),
+            EnableError::MissingLauncher =>
+                "Starting the privileged helper needs pkexec (polkit), which was not found. Install polkit, or start the helper by hand.".to_string(),
+            EnableError::TimedOut(waited) =>
                 format!(
                     "The privileged helper was started but did not answer within {} seconds.",
-                    WAIT_TIMEOUT.as_secs()
+                    waited.as_secs()
                 ),
         }
     }
 }
 
+fn launch_error(error: LaunchError) -> EnableError {
+    match error {
+        LaunchError::Declined => EnableError::Declined,
+        LaunchError::Failed(code) => EnableError::LaunchFailed(code),
+        LaunchError::MissingLauncher => EnableError::MissingLauncher,
+    }
+}
+
 /// The whole "Enable site blocking" flow with the outside world passed in:
 /// does the helper answer, is the location safe, start it (the approval
-/// prompt), and sleep. Nothing is started unless the location is safe, and
-/// nothing is waited for if the user declined.
+/// prompt), and sleep. Nothing is started unless the location is safe. While
+/// waiting for the helper, a failure reported by the launcher's watch ends the
+/// wait at once, but a helper that answers in the same look wins.
 pub fn enable_with(
     mut is_running: impl FnMut() -> bool,
     location: impl FnOnce() -> Result<(), Refusal>,
-    launch: impl FnOnce() -> Result<(), LaunchError>,
+    launch: impl FnOnce() -> Result<Launch, LaunchError>,
     sleep: impl FnMut(Duration)
 ) -> Result<Enabled, EnableError> {
     if is_running() {
         return Ok(Enabled::AlreadyRunning);
     }
     location().map_err(EnableError::Refused)?;
-    launch().map_err(|e| match e {
-        LaunchError::Declined => EnableError::Declined,
-        LaunchError::Failed(code) => EnableError::LaunchFailed(code),
-    })?;
-    if wait_until(&mut is_running, WAIT_TIMEOUT, WAIT_STEP, sleep) {
-        Ok(Enabled::Started)
-    } else {
-        Err(EnableError::TimedOut)
+    let Launch { timeout, mut watch } = launch().map_err(launch_error)?;
+
+    let mut failure = None;
+    let answered = wait_until(
+        || {
+            if is_running() {
+                return true;
+            }
+            if let Some(error) = watch() {
+                failure = Some(error);
+                return true; // stop waiting; the failure is reported below
+            }
+            false
+        },
+        timeout,
+        WAIT_STEP,
+        sleep
+    );
+
+    match (failure, answered) {
+        (Some(error), _) => Err(launch_error(error)),
+        (None, true) => Ok(Enabled::Started),
+        (None, false) => Err(EnableError::TimedOut(timeout)),
     }
 }
 
@@ -602,7 +654,7 @@ mod tests {
         let result = enable_with(
             || true,
             never_called::<Result<(), Refusal>>(),
-            never_called::<Result<(), LaunchError>>(),
+            never_called::<Result<Launch, LaunchError>>(),
             |_| panic!("must not sleep")
         );
         assert_eq!(result, Ok(Enabled::AlreadyRunning));
@@ -613,7 +665,7 @@ mod tests {
         let result = enable_with(
             || false,
             || Err(Refusal::FolderWritableByUser),
-            never_called::<Result<(), LaunchError>>(),
+            never_called::<Result<Launch, LaunchError>>(),
             |_| panic!("must not sleep")
         );
         assert_eq!(result, Err(EnableError::Refused(Refusal::FolderWritableByUser)));
@@ -631,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_start_carries_the_windows_error_code() {
+    fn a_failed_start_carries_the_error_code() {
         let result = enable_with(|| false, || Ok(()), || Err(LaunchError::Failed(5)), |_| {});
         assert_eq!(result, Err(EnableError::LaunchFailed(5)));
         assert!(EnableError::LaunchFailed(5).message().contains('5'));
@@ -649,7 +701,7 @@ mod tests {
             || Ok(()),
             || {
                 launched.set(true);
-                Ok(())
+                Ok(Launch::standard())
             },
             |_| {}
         );
@@ -659,12 +711,94 @@ mod tests {
     #[test]
     fn a_started_helper_that_never_answers_times_out_after_the_limit() {
         let slept = RefCell::new(Duration::ZERO);
-        let result = enable_with(|| false, || Ok(()), || Ok(()), |d| {
+        let result = enable_with(|| false, || Ok(()), || Ok(Launch::standard()), |d| {
             *slept.borrow_mut() += d;
         });
-        assert_eq!(result, Err(EnableError::TimedOut));
+        assert_eq!(result, Err(EnableError::TimedOut(WAIT_TIMEOUT)));
         assert_eq!(*slept.borrow(), WAIT_TIMEOUT);
-        assert!(EnableError::TimedOut.message().contains("10 seconds"));
+        assert!(EnableError::TimedOut(WAIT_TIMEOUT).message().contains("10 seconds"));
+    }
+
+    // ---- a launcher that sets its own wait and can fail early ----
+
+    #[test]
+    fn the_standard_launch_waits_ten_seconds_and_never_fails_early() {
+        let mut launch = Launch::standard();
+        assert_eq!(launch.timeout, WAIT_TIMEOUT);
+        assert_eq!((launch.watch)(), None);
+    }
+
+    #[test]
+    fn the_launcher_sets_how_long_to_wait() {
+        let slept = RefCell::new(Duration::ZERO);
+        let result = enable_with(
+            || false,
+            || Ok(()),
+            || Ok(Launch::with_watch(Duration::from_secs(120), || None)),
+            |d| {
+                *slept.borrow_mut() += d;
+            }
+        );
+        assert_eq!(result, Err(EnableError::TimedOut(Duration::from_secs(120))));
+        assert_eq!(*slept.borrow(), Duration::from_secs(120));
+        assert!(EnableError::TimedOut(Duration::from_secs(120)).message().contains("120 seconds"));
+    }
+
+    #[test]
+    fn a_launcher_that_reports_a_decline_ends_the_wait_at_once() {
+        let slept = RefCell::new(Duration::ZERO);
+        let looks = Cell::new(0);
+        let result = enable_with(
+            || false,
+            || Ok(()),
+            || {
+                Ok(
+                    Launch::with_watch(Duration::from_secs(120), move || {
+                        looks.set(looks.get() + 1);
+                        if looks.get() >= 3 { Some(LaunchError::Declined) } else { None }
+                    })
+                )
+            },
+            |d| {
+                *slept.borrow_mut() += d;
+            }
+        );
+        assert_eq!(result, Err(EnableError::Declined));
+        assert_eq!(*slept.borrow(), WAIT_STEP * 2, "two sleeps between three looks, then it stops");
+    }
+
+    #[test]
+    fn a_launcher_that_exited_with_an_error_carries_its_code() {
+        let result = enable_with(
+            || false,
+            || Ok(()),
+            || Ok(Launch::with_watch(Duration::from_secs(120), || Some(LaunchError::Failed(127)))),
+            |_| panic!("must not sleep after a failure")
+        );
+        assert_eq!(result, Err(EnableError::LaunchFailed(127)));
+    }
+
+    #[test]
+    fn a_helper_that_comes_up_wins_over_a_failure_reported_at_the_same_moment() {
+        let polls = Cell::new(0);
+        let result = enable_with(
+            || {
+                polls.set(polls.get() + 1);
+                polls.get() >= 2
+            },
+            || Ok(()),
+            || Ok(Launch::with_watch(Duration::from_secs(120), || Some(LaunchError::Failed(1)))),
+            |_| {}
+        );
+        assert_eq!(result, Ok(Enabled::Started));
+    }
+
+    #[test]
+    fn a_missing_launcher_is_its_own_error_with_a_plain_message() {
+        let result = enable_with(|| false, || Ok(()), || Err(LaunchError::MissingLauncher), |_| {});
+        assert_eq!(result, Err(EnableError::MissingLauncher));
+        let text = EnableError::MissingLauncher.message();
+        assert!(text.contains("pkexec"), "{text}");
     }
 
     #[test]

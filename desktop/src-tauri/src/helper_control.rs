@@ -12,6 +12,7 @@ use secureguard_core::helper_launch::{
     helper_status,
     Enabled,
     HelperStatus,
+    Launch,
     LaunchError,
     Refusal,
     HELPER_FILE_NAME,
@@ -62,7 +63,7 @@ fn enable_using(
     helper: &Path,
     enforce_writable: bool,
     started: &AtomicBool,
-    launch: impl FnOnce(&Path) -> Result<(), LaunchError>,
+    launch: impl FnOnce(&Path) -> Result<Launch, LaunchError>,
     sleep: impl FnMut(Duration)
 ) -> Result<HelperStatus, String> {
     let outcome = enable_with(
@@ -128,12 +129,12 @@ pub fn quit_started_helper(started: &AtomicBool) {
 }
 
 #[cfg(windows)]
-fn platform_launch(helper: &Path) -> Result<(), LaunchError> {
-    secureguard_core::helper_launch::launch_elevated(helper)
+fn platform_launch(helper: &Path) -> Result<Launch, LaunchError> {
+    secureguard_core::helper_launch::launch_elevated(helper).map(|()| Launch::standard())
 }
 
 #[cfg(not(windows))]
-fn platform_launch(_helper: &Path) -> Result<(), LaunchError> {
+fn platform_launch(_helper: &Path) -> Result<Launch, LaunchError> {
     // enable_current returns before this on a platform with no launcher.
     Err(LaunchError::Failed(0))
 }
@@ -142,7 +143,6 @@ fn platform_launch(_helper: &Path) -> Result<(), LaunchError> {
 mod tests {
     use super::*;
     use crate::helper_client::tests::{ fake_helper, unique_name };
-    use secureguard_core::helper_launch::{ LaunchError, Refusal };
     use std::cell::Cell;
     use std::sync::atomic::{ AtomicBool, Ordering };
     use std::time::Duration;
@@ -267,7 +267,7 @@ mod tests {
                 assert_eq!(path, helper.as_path());
                 launched.set(launched.get() + 1);
                 let _seen = fake_helper(&name, ""); // "the helper comes up"
-                Ok(())
+                Ok(Launch::standard())
             },
             no_sleep
         );
@@ -300,7 +300,7 @@ mod tests {
         let (_dir, helper) = helper_in_a_user_folder();
         let started = AtomicBool::new(false);
 
-        let result = enable_using(&unique_name("en-slow"), &helper, false, &started, |_| Ok(()), no_sleep);
+        let result = enable_using(&unique_name("en-slow"), &helper, false, &started, |_| Ok(Launch::standard()), no_sleep);
 
         assert!(result.unwrap_err().contains("10 seconds"));
         assert!(!started.load(Ordering::SeqCst));
