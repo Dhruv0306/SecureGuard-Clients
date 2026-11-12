@@ -1,6 +1,6 @@
 # Shipping the helper: site blocking that works from the download
 
-Date: 01/11/2026. Status: PR 1 (release packaging) is built and was proved by a dry run on 05/11/2026. PR 2 (helper lifecycle) is built, see "Helper changes (PR 2)". PR 3 (Windows "Enable site blocking") is built, see "Built in PR 3". PR 4 and the release itself are still to do.
+Date: 01/11/2026. Status: PR 1 (release packaging) is built and was proved by a dry run on 05/11/2026. PR 2 (helper lifecycle) is built, see "Helper changes (PR 2)". PR 3 (Windows "Enable site blocking") is built, see "Built in PR 3". PR 4a (Unix access control, the Linux install rule, launch plumbing) is built, see "Built in PR 4a". PR 4b (the `pkexec` start) and the release itself are still to do.
 
 Item 2 of the next-steps order (release v0.2.0), widened after a real test: Dhruv downloaded a
 build, site blocking did not work, and it worked once the helper was run separately. Decisions
@@ -149,7 +149,7 @@ in PR 2 would use it (the desktop crate rejects unused code):
 
 - PR 3 (done): the `helper_status_cmd` command (`{ supported, running, reason }`) and the client's
   `quit` call.
-- PR 4: on Unix, the helper accepts a connection only from root or from one allowed user id. The
+- PR 4a (done): on Unix, the helper accepts a connection only from root or from one allowed user id. The
   id comes from `--allow-uid <uid>`, or from `PKEXEC_UID` when started by `pkexec`. With neither,
   the Unix helper refuses to start. Windows keeps the pipe access list it has.
 
@@ -165,9 +165,11 @@ in PR 2 would use it (the desktop crate rejects unused code):
 - `enable_blocking_cmd` asks the operating system to elevate:
   - Windows: `ShellExecuteExW` with the `runas` verb, window hidden, through `windows-sys`
     (already a dependency of `core`; PR 3 adds four features, no new crate).
-  - Linux: `pkexec <helper> --allow-uid <current uid>`.
-  Then it waits up to 10 seconds for the helper to answer. A dismissed prompt is reported as
-  "cancelled", not as a failure.
+  - Linux: `pkexec <helper>` with no arguments; the helper reads `PKEXEC_UID`, which pkexec sets.
+  Then it waits for the helper to answer: 10 seconds on Windows (the call returns once the prompt
+  has been answered), 120 seconds on Linux (the password prompt is still open while it waits),
+  and a Linux wait ends at once if `pkexec` exits (126 means the dialog was dismissed, 127 not
+  authorized or an error). A dismissed prompt is reported as "cancelled", not as a failure.
 - The app sends `quit` when it closes, but only to a helper it started itself. A helper started
   by hand in an administrator shell is left alone.
 - On the page, "Site blocking" shows the helper state and an "Enable site blocking" button.
@@ -191,6 +193,21 @@ in PR 2 would use it (the desktop crate rejects unused code):
   when its permissions allow it, which would read as "safe".
 - The page's text for a missing helper no longer tells the user to start it as an
   administrator; the status line and the button do that.
+
+### Built in PR 4a (Unix access control and the Linux install rule)
+
+- `helper`: `Access` (`Anyone` or `Uid`) in `ServeOptions`; `serve` reads `peer_creds().euid()` of
+  each accepted connection and closes it unless it is root or the allowed user. `parse_allowed_uid`
+  and `main.rs` take the user from `--allow-uid` or `PKEXEC_UID` and refuse to start without one
+  on Unix. Windows is unchanged (`Access::Anyone`, the pipe access list).
+- `desktop`: `ServerTrust`; on Unix the app talks only to a socket owned by root. The trust is a
+  parameter so tests can use a fake helper run as the test user.
+- `core::helper_launch`: `check_unix_location` (owner and mode, symlinks resolved),
+  `appimage_refusal`, `check_install`, new `Refusal` cases, and `Launch { timeout, watch }` so a
+  launcher can set its own wait and report an early failure. The Windows write-probe rule is kept
+  as `check_writable_location`.
+- Tested in the Linux sandbox as root (another user is a child process running as `nobody`) and
+  again as `nobody`, which is what CI sees. The Linux start through `pkexec` is PR 4b.
 
 ### The release itself (after PR 4)
 
@@ -236,7 +253,7 @@ Dhruv's.
 
 | Assumption | How it gets checked |
 |---|---|
-| `peer_creds()` works on the socket kind the helper listens on | First test in PR 4 |
+| `peer_creds()` works on the socket kind the helper listens on | Done in PR 4a: it reports the user on Linux, tested with a client running as another user |
 | `ShellExecuteExW` `runas` from a Tauri app shows the prompt with no console flash | Windows manual test |
 | `pkexec` finds an authentication agent in an Ubuntu desktop VM and its exit codes mean what the code expects | Linux VM manual test |
 | "The current user cannot write to the helper or its folder" is a good proxy for "ordinary programs cannot replace it" on Windows | PR 3 tests it on a normal install folder and on a user-writable folder |

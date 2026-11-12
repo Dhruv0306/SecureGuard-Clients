@@ -8,6 +8,11 @@ project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Helper (Linux and macOS): connections are accepted only from root and the user the helper was
+  started for (`--allow-uid`, or `PKEXEC_UID` which pkexec sets), and a helper started with
+  neither refuses to start. The app sends nothing to a helper socket that root does not own. On
+  Linux the helper must be owned by root in a folder only root can write, and an AppImage is
+  refused ("install the .deb"). Nothing in the app starts the helper on Linux yet.
 - Helper: a quit request (`{"quit":true}`) makes the helper answer and exit, and the helper now
   exits by itself after 30 minutes without a request. Neither changes who may connect. A client
   that connects and sends nothing no longer blocks the helper, and a request line is limited
