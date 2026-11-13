@@ -274,6 +274,9 @@ pub enum LaunchError {
     Failed(u32),
     /// The program that asks for approval (`pkexec` on Linux) is not installed.
     MissingLauncher,
+    /// Approval could not be obtained: the account may not approve it, or there
+    /// is no authentication agent to ask (`pkexec` exits 127).
+    NotAuthorized,
 }
 
 /// A started launcher: how long to wait for the helper to answer, and a watch
@@ -295,6 +298,87 @@ impl Launch {
     pub fn with_watch(timeout: Duration, watch: impl FnMut() -> Option<LaunchError> + 'static) -> Self {
         Self { timeout, watch: Box::new(watch) }
     }
+}
+
+/// Where polkit installs `pkexec` on Debian and Ubuntu. An absolute path, so a
+/// directory on the user's `PATH` cannot stand in for it.
+pub const PKEXEC_PATH: &str = "/usr/bin/pkexec";
+
+/// How long to wait for the helper after starting `pkexec`: unlike Windows,
+/// where the call returns once the prompt has been answered, the password
+/// prompt is still open while this waits.
+pub const PKEXEC_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// What an exit of `pkexec` means. Per the polkit manual, 126 means the user
+/// dismissed the authentication dialog and 127 means authorization could not be
+/// obtained (not authorized, or an error); any other status is the program's
+/// own. A process ended by a signal has no status: it is reported as a shell
+/// does, 128 plus the signal.
+pub fn pkexec_exit_error(code: Option<i32>, signal: Option<i32>) -> LaunchError {
+    match (code, signal) {
+        (Some(126), _) => LaunchError::Declined,
+        (Some(127), _) => LaunchError::NotAuthorized,
+        (Some(code), _) => LaunchError::Failed(code.max(0) as u32),
+        (None, Some(signal)) => LaunchError::Failed(128 + (signal.max(0) as u32)),
+        (None, None) => LaunchError::Failed(0),
+    }
+}
+
+/// Waits for the launcher once it is no longer needed, so it does not stay a
+/// zombie until the app exits: `pkexec` keeps running as long as the helper it
+/// started does.
+#[cfg(unix)]
+struct ReapOnDrop(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
+/// Starts `program` (`pkexec`) with the helper's path as its only argument, so
+/// polkit shows its approval dialog and then runs the helper as root. pkexec
+/// validates no arguments, and the helper learns who asked from `PKEXEC_UID`,
+/// which pkexec sets itself. It returns at once with the long wait of
+/// `PKEXEC_WAIT_TIMEOUT` and a watch that reports the launcher exiting: 126
+/// (dialog dismissed) is `Declined`, 127 is `NotAuthorized`.
+#[cfg(unix)]
+pub fn launch_pkexec(program: &Path, helper: &Path) -> Result<Launch, LaunchError> {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ Command, Stdio };
+
+    let child = Command::new(program)
+        .arg(helper)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                LaunchError::MissingLauncher
+            } else {
+                LaunchError::Failed(e.raw_os_error().unwrap_or(0).max(0) as u32)
+            }
+        })?;
+
+    let mut launched = ReapOnDrop(Some(child));
+    Ok(
+        Launch::with_watch(PKEXEC_WAIT_TIMEOUT, move || {
+            let child = launched.0.as_mut()?;
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    launched.0 = None; // already waited for
+                    Some(pkexec_exit_error(status.code(), status.signal()))
+                }
+                _ => None,
+            }
+        })
+    )
 }
 
 /// UTF-16 units with the terminating zero the Windows calls expect.
@@ -359,6 +443,7 @@ pub enum EnableError {
     Declined,
     LaunchFailed(u32),
     MissingLauncher,
+    NotAuthorized,
     /// The helper was started but did not answer within this long.
     TimedOut(Duration),
 }
@@ -373,6 +458,8 @@ impl EnableError {
                 format!("The privileged helper could not be started (error {code})."),
             EnableError::MissingLauncher =>
                 "Starting the privileged helper needs pkexec (polkit), which was not found. Install polkit, or start the helper by hand.".to_string(),
+            EnableError::NotAuthorized =>
+                "Administrator approval could not be obtained. Your account may not be allowed to approve it, or the desktop has no authentication agent running.".to_string(),
             EnableError::TimedOut(waited) =>
                 format!(
                     "The privileged helper was started but did not answer within {} seconds.",
@@ -387,6 +474,7 @@ fn launch_error(error: LaunchError) -> EnableError {
         LaunchError::Declined => EnableError::Declined,
         LaunchError::Failed(code) => EnableError::LaunchFailed(code),
         LaunchError::MissingLauncher => EnableError::MissingLauncher,
+        LaunchError::NotAuthorized => EnableError::NotAuthorized,
     }
 }
 
@@ -434,6 +522,7 @@ pub fn enable_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::cell::{ Cell, RefCell };
     use std::time::Duration;
 
@@ -1008,5 +1097,235 @@ mod tests {
         let name = helper.file_name().unwrap().to_string_lossy().to_string();
         assert_eq!(name, HELPER_FILE_NAME);
         assert!(name.starts_with("secureguard-helper"));
+    }
+
+    // ---- pkexec: exit codes ----
+
+    #[test]
+    fn pkexec_exit_codes_mean_what_the_polkit_manual_says() {
+        assert_eq!(pkexec_exit_error(Some(126), None), LaunchError::Declined);
+        assert_eq!(pkexec_exit_error(Some(127), None), LaunchError::NotAuthorized);
+        // Any other status is the helper's own, or a launcher failure.
+        assert_eq!(pkexec_exit_error(Some(1), None), LaunchError::Failed(1));
+        assert_eq!(pkexec_exit_error(Some(0), None), LaunchError::Failed(0));
+        // Ended by a signal: no exit code, report 128 plus the signal as a shell does.
+        assert_eq!(pkexec_exit_error(None, Some(9)), LaunchError::Failed(137));
+        assert_eq!(pkexec_exit_error(None, None), LaunchError::Failed(0));
+    }
+
+    #[test]
+    fn pkexec_is_started_by_an_absolute_path_so_the_path_variable_cannot_replace_it() {
+        assert!(Path::new(PKEXEC_PATH).is_absolute());
+        assert_eq!(PKEXEC_PATH, "/usr/bin/pkexec");
+    }
+
+    #[test]
+    fn an_authorization_that_could_not_be_obtained_has_a_plain_message() {
+        let text = EnableError::NotAuthorized.message();
+        assert!(text.contains("approval"), "{text}");
+        assert!(text.contains("agent"), "{text}");
+        let result = enable_with(
+            || false,
+            || Ok(()),
+            || Ok(Launch::with_watch(Duration::from_secs(120), || Some(LaunchError::NotAuthorized))),
+            |_| {}
+        );
+        assert_eq!(result, Err(EnableError::NotAuthorized));
+    }
+
+    // ---- pkexec: a launcher program that is really run (fake scripts) ----
+
+    #[cfg(unix)]
+    mod fake_pkexec {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{ Path, PathBuf };
+        use std::time::Instant;
+
+        /// A stand-in for pkexec: a shell script with `body` as its program.
+        fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        fn helper_path() -> PathBuf {
+            PathBuf::from("/opt/secureguard/secureguard-helper")
+        }
+
+        /// Looks at the watch every 20 ms until it reports something, for at most 5 s.
+        fn watch_until_it_reports(mut launch: Launch) -> Option<LaunchError> {
+            let give_up = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < give_up {
+                if let Some(error) = (launch.watch)() {
+                    return Some(error);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+
+        #[test]
+        fn a_launcher_that_is_not_installed_is_reported_as_missing() {
+            let result = launch_pkexec(Path::new("/no/such/dir/pkexec"), &helper_path());
+            assert_eq!(result.err(), Some(LaunchError::MissingLauncher));
+        }
+
+        #[test]
+        fn a_launcher_that_cannot_be_run_fails_with_the_system_error_code() {
+            let dir = tempfile::tempdir().unwrap();
+            let not_executable = dir.path().join("pkexec");
+            std::fs::write(&not_executable, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            let result = launch_pkexec(&not_executable, &helper_path());
+
+            assert_eq!(result.err(), Some(LaunchError::Failed(13)), "EACCES");
+        }
+
+        #[test]
+        fn the_launcher_gets_exactly_the_helper_path_and_no_other_argument() {
+            let dir = tempfile::tempdir().unwrap();
+            let seen = dir.path().join("seen");
+            let fake = script(
+                dir.path(),
+                "pkexec",
+                &format!("printf '%s\\n' \"$#\" \"$1\" > {}\nexit 126", seen.display())
+            );
+
+            let launch = launch_pkexec(&fake, &helper_path()).unwrap();
+            assert_eq!(watch_until_it_reports(launch), Some(LaunchError::Declined));
+
+            let lines: Vec<String> = std::fs::read_to_string(&seen).unwrap().lines().map(String::from).collect();
+            assert_eq!(lines, vec!["1".to_string(), helper_path().display().to_string()]);
+        }
+
+        #[test]
+        fn a_dismissed_prompt_is_seen_by_the_watch() {
+            let dir = tempfile::tempdir().unwrap();
+            let fake = script(dir.path(), "pkexec", "exit 126");
+            let launch = launch_pkexec(&fake, &helper_path()).unwrap();
+            assert_eq!(watch_until_it_reports(launch), Some(LaunchError::Declined));
+        }
+
+        #[test]
+        fn a_refused_authorization_is_seen_by_the_watch() {
+            let dir = tempfile::tempdir().unwrap();
+            let fake = script(dir.path(), "pkexec", "exit 127");
+            let launch = launch_pkexec(&fake, &helper_path()).unwrap();
+            assert_eq!(watch_until_it_reports(launch), Some(LaunchError::NotAuthorized));
+        }
+
+        #[test]
+        fn a_launcher_still_waiting_for_the_password_is_not_a_failure() {
+            let dir = tempfile::tempdir().unwrap();
+            let fake = script(dir.path(), "pkexec", "sleep 1\nexit 126");
+
+            let mut launch = launch_pkexec(&fake, &helper_path()).unwrap();
+
+            assert_eq!((launch.watch)(), None, "just started: still waiting, nothing to report");
+            assert_eq!(watch_until_it_reports(launch), Some(LaunchError::Declined));
+        }
+
+        #[test]
+        fn the_launch_waits_two_minutes_for_the_password() {
+            let dir = tempfile::tempdir().unwrap();
+            let fake = script(dir.path(), "pkexec", "exit 126");
+            let launch = launch_pkexec(&fake, &helper_path()).unwrap();
+            assert_eq!(launch.timeout, Duration::from_secs(120));
+            assert_eq!(launch.timeout, PKEXEC_WAIT_TIMEOUT);
+        }
+
+        #[test]
+        fn the_launcher_is_given_no_input() {
+            // `read` fails at once on an empty stdin and blocks on an open one.
+            let dir = tempfile::tempdir().unwrap();
+            let fake = script(dir.path(), "pkexec", "read line && exit 0\nexit 126");
+            let launch = launch_pkexec(&fake, &helper_path()).unwrap();
+            assert_eq!(watch_until_it_reports(launch), Some(LaunchError::Declined));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn the_launchers_input_and_output_are_the_null_device() {
+            let dir = tempfile::tempdir().unwrap();
+            let seen = dir.path().join("seen");
+            let fake = script(
+                dir.path(),
+                "pkexec",
+                &format!(
+                    "a=$(readlink /proc/$$/fd/0); b=$(readlink /proc/$$/fd/1); c=$(readlink /proc/$$/fd/2)\necho \"$a $b $c\" > {}\nexit 126",
+                    seen.display()
+                )
+            );
+
+            let launch = launch_pkexec(&fake, &helper_path()).unwrap();
+            assert_eq!(watch_until_it_reports(launch), Some(LaunchError::Declined));
+
+            assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "/dev/null /dev/null /dev/null");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_launcher_left_running_when_the_launch_is_dropped_is_reaped_not_left_as_a_zombie() {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_file = dir.path().join("pid");
+            let fake = script(dir.path(), "pkexec", &format!("echo $$ > {}\nsleep 1", pid_file.display()));
+
+            let launch = launch_pkexec(&fake, &helper_path()).unwrap();
+            // The helper came up: the flow is over and the launch is dropped while pkexec runs on.
+            drop(launch);
+
+            let give_up = Instant::now() + Duration::from_secs(5);
+            let pid = loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                    if !text.trim().is_empty() {
+                        break text.trim().to_string();
+                    }
+                }
+                assert!(Instant::now() < give_up, "the fake launcher never wrote its pid");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            // It exits after a second. A zombie keeps its /proc entry until its parent waits for it.
+            let gone = Instant::now() + Duration::from_secs(5);
+            while Path::new(&format!("/proc/{pid}")).exists() {
+                assert!(Instant::now() < gone, "process {pid} is still there: not reaped");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        #[test]
+        fn the_whole_flow_with_a_launcher_that_brings_the_helper_up() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("helper-is-up");
+            let fake = script(dir.path(), "pkexec", &format!("sleep 0.3\ntouch {}\nsleep 1", marker.display()));
+
+            let result = enable_with(
+                || marker.exists(),
+                || Ok(()),
+                || launch_pkexec(&fake, &helper_path()),
+                |_| std::thread::sleep(Duration::from_millis(50))
+            );
+
+            assert_eq!(result, Ok(Enabled::Started));
+        }
+
+        #[test]
+        fn the_whole_flow_with_a_dismissed_prompt_ends_at_once_with_cancelled() {
+            let dir = tempfile::tempdir().unwrap();
+            let fake = script(dir.path(), "pkexec", "exit 126");
+            let started = Instant::now();
+
+            let result = enable_with(
+                || false,
+                || Ok(()),
+                || launch_pkexec(&fake, &helper_path()),
+                |_| std::thread::sleep(Duration::from_millis(50))
+            );
+
+            assert_eq!(result, Err(EnableError::Declined));
+            assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        }
     }
 }
