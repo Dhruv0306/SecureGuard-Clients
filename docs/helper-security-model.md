@@ -44,6 +44,44 @@ and the helper were both elevated (confirmed by testing both ways).
   another program run by the same user. A stricter option is for the helper to check the
   caller's executable with `GetNamedPipeClientProcessId`; not done.
 
+## Who may connect (Linux and macOS)
+
+A Unix socket has no access list. On Linux the helper's name is an abstract socket, which has no
+file permissions at all, so any local user can connect (`interprocess` 2.4.7 documents this).
+The access control is therefore a check of the connecting process's user id.
+
+- **The helper checks the client.** Each accepted connection is asked for its peer credentials
+  (`SO_PEERCRED` on Linux). It is kept only if the effective user id is root or the one allowed
+  user; otherwise it is closed unread, with no reply, no reader thread and no change to the
+  hosts file. If the platform cannot report the user, the connection is refused.
+- **Which user.** `--allow-uid <n>` (or `--allow-uid=<n>`) wins; otherwise `PKEXEC_UID`, which
+  pkexec sets to the user who started it, so the app can run `pkexec <helper>` with no arguments
+  (pkexec does no validation of arguments). With neither, a Unix helper refuses to start (exit
+  status 2). Only plain decimal numbers are accepted; a repeated or unknown argument is an error.
+- **The app checks the helper.** Another local user could bind the abstract name before the
+  helper does and wait for requests. On Unix the app reads the user id behind the socket and
+  sends nothing, not even a quit, unless that user is root. A refused socket is reported as its
+  own error ("not owned by the expected user"), not as a helper that is not running.
+- **The install rule on Linux.** The helper file and its folder must be owned by root, and
+  neither may be writable by group or others. Root ownership is required even for mode 555,
+  because the owner can change the mode back. Links are resolved first, so a link in a root-owned
+  folder to a file in a writable folder is refused. An AppImage (the `APPIMAGE` variable is set)
+  is refused with "install the .deb". Debug builds skip the ownership rule but not the AppImage
+  refusal.
+- **What this does not cover.**
+  - `SO_PEERCRED` reports the credentials from when the socket was connected or began listening.
+    A setuid program, or a socket handed to another user, can be confused with its owner. The same
+    trust model as any local Unix socket.
+  - Abstract sockets belong to a network namespace, so an app in a sandbox with its own namespace
+    (Snap, Flatpak) cannot reach the helper. The `.deb` app is not sandboxed.
+  - An app run as root can write the helper and is allowed in, so the rule and the check say
+    little for it.
+  - Windows has no equivalent of the app's check of the helper; its pipe uses a first-instance
+    flag and an access list on the helper's side only.
+- **Not started yet.** Nothing in the app starts the helper on Linux in this change; the start
+  through `pkexec` is the next one. Until then the checks above protect a helper someone starts by
+  hand with `sudo secureguard-helper --allow-uid $(id -u)`.
+
 ## Quit, idle exit and silent clients
 
 - A `{"quit":true}` request makes the helper answer and exit. It never touches the hosts file.
@@ -59,8 +97,8 @@ and the helper were both elevated (confirmed by testing both ways).
   interactive user can send a quit and stop the helper. That is a denial of service only, with no
   effect on the hosts file. Holding 16 silent connections open does the same until they close.
   Either way blocking from the app stops until the helper is started again.
-- Nothing here changes who may connect. The Unix access check named under "Not covered" is still
-  open and is part of the Linux start-up work.
+- Nothing here changes who may connect on Windows. Who may connect on Linux and macOS is the next
+  section.
 
 ## What the helper accepts
 
@@ -115,9 +153,8 @@ does not re-validate.
 
 ## Not covered
 
-- **Linux and macOS.** The same socket name is used, but access control for it is not
-  set. On Linux a namespaced local socket is, as far as I know, an abstract socket with
-  no file permissions. This needs checking and a fix before the helper is shipped there.
+- **macOS.** Out of the release. The Unix checks apply to it, but the app has no way to start
+  the helper there.
 - **Firewall and network state.** Out of scope for the helper.
 
 ## Manual checks on Windows

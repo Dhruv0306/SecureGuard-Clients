@@ -29,8 +29,16 @@ pub const WAIT_STEP: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     NotFound,
+    /// Windows: the current user could write the helper file.
     FileWritableByUser,
+    /// Windows: the current user could create files next to the helper.
     FolderWritableByUser,
+    /// Unix: the helper or its folder is not owned by root.
+    NotRootOwned,
+    /// Unix: group or others could write the helper or its folder.
+    WritableByOthers,
+    /// Running from an AppImage, which cannot hold a root-owned helper.
+    AppImage,
 }
 
 impl Refusal {
@@ -41,6 +49,12 @@ impl Refusal {
                 "The privileged helper was not found next to SecureGuard. Reinstall SecureGuard.",
             Refusal::FileWritableByUser | Refusal::FolderWritableByUser =>
                 "Site blocking needs SecureGuard installed for all users, because an ordinary program could change this copy. Reinstall SecureGuard for all users.",
+            Refusal::NotRootOwned =>
+                "Site blocking needs SecureGuard installed from the .deb package, because only an administrator should be able to change the helper. Reinstall SecureGuard from the .deb package.",
+            Refusal::WritableByOthers =>
+                "Site blocking needs the helper to be changeable only by an administrator, and it is not. Reinstall SecureGuard from the .deb package.",
+            Refusal::AppImage =>
+                "Site blocking is not available in the AppImage. Install the SecureGuard .deb package instead.",
         }
     }
 }
@@ -85,17 +99,109 @@ pub fn can_create_in(dir: &Path) -> bool {
     }
 }
 
-/// Looks at the real file system. With `enforce_writable` false (a developer
-/// build, where `target/debug` is writable by design) only the existence of the
-/// helper is checked. The write probes run only when the file exists, so a
+/// The Windows rule on the real file system: a missing helper, a helper file
+/// the current user can open for writing, or a folder the current user can
+/// create files in. The write probes run only when the file exists, so a
 /// missing helper never causes a file to be created.
-pub fn check_helper_location(helper: &Path, enforce_writable: bool) -> Result<(), Refusal> {
+pub fn check_writable_location(helper: &Path) -> Result<(), Refusal> {
     let exists = helper.is_file();
-    if !enforce_writable {
-        return if exists { Ok(()) } else { Err(Refusal::NotFound) };
-    }
     let folder = helper.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     check_location(exists, exists && can_write_file(helper), exists && can_create_in(folder))
+}
+
+/// Owner and permission bits of a file or folder, as `stat` reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerMode {
+    pub uid: u32,
+    pub mode: u32,
+}
+
+/// The Unix rule, from the helper's and its folder's owner and mode: both owned
+/// by root, and neither writable by group or others. Owned by root is required
+/// even when the mode forbids writing, because the owner can change the mode
+/// back. `None` for the file means it does not exist. File type bits in `mode`
+/// are ignored.
+pub fn check_unix_location(file: Option<OwnerMode>, folder: OwnerMode) -> Result<(), Refusal> {
+    let Some(file) = file else {
+        return Err(Refusal::NotFound);
+    };
+    if file.uid != 0 || folder.uid != 0 {
+        return Err(Refusal::NotRootOwned);
+    }
+    const GROUP_OR_OTHER_WRITE: u32 = 0o022;
+    if (file.mode | folder.mode) & GROUP_OR_OTHER_WRITE != 0 {
+        return Err(Refusal::WritableByOthers);
+    }
+    Ok(())
+}
+
+/// The Unix rule on the real file system. Symlinks are resolved first, so a
+/// link in a root-owned folder to a file elsewhere is judged by that file and
+/// the folder that file is in.
+#[cfg(unix)]
+fn check_unix_location_on_disk(helper: &Path) -> Result<(), Refusal> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(real) = helper.canonicalize() else {
+        return Err(Refusal::NotFound);
+    };
+    let Ok(file) = std::fs::metadata(&real) else {
+        return Err(Refusal::NotFound);
+    };
+    if !file.is_file() {
+        return Err(Refusal::NotFound);
+    }
+    let Some(folder_path) = real.parent() else {
+        return Err(Refusal::NotFound);
+    };
+    let Ok(folder) = std::fs::metadata(folder_path) else {
+        return Err(Refusal::NotFound);
+    };
+    check_unix_location(
+        Some(OwnerMode { uid: file.uid(), mode: file.mode() }),
+        OwnerMode { uid: folder.uid(), mode: folder.mode() }
+    )
+}
+
+/// Looks at the real file system with this platform's rule. With
+/// `enforce_safe_install` false (a developer build, where `target/debug` is
+/// owned by the developer by design) only the existence of the helper is
+/// checked.
+pub fn check_helper_location(helper: &Path, enforce_safe_install: bool) -> Result<(), Refusal> {
+    if !enforce_safe_install {
+        return if helper.is_file() { Ok(()) } else { Err(Refusal::NotFound) };
+    }
+    #[cfg(unix)]
+    {
+        check_unix_location_on_disk(helper)
+    }
+    #[cfg(not(unix))]
+    {
+        check_writable_location(helper)
+    }
+}
+
+/// `Some(AppImage)` when the app runs from an AppImage (the `APPIMAGE`
+/// variable is set and not empty): its files are unpacked for the user, so the
+/// helper cannot be root-owned.
+pub fn appimage_refusal(appimage_variable: Option<&str>) -> Option<Refusal> {
+    match appimage_variable {
+        Some(value) if !value.is_empty() => Some(Refusal::AppImage),
+        _ => None,
+    }
+}
+
+/// Whether the helper may be started from this install: not from an AppImage
+/// (even in a developer build, where it could never work), then the platform's
+/// location rule.
+pub fn check_install(
+    helper: &Path,
+    enforce_safe_install: bool,
+    appimage_variable: Option<&str>
+) -> Result<(), Refusal> {
+    if let Some(refusal) = appimage_refusal(appimage_variable) {
+        return Err(refusal);
+    }
+    check_helper_location(helper, enforce_safe_install)
 }
 
 /// Where the helper is expected: in the same folder as the app's executable.
@@ -163,8 +269,32 @@ pub fn wait_until(
 pub enum LaunchError {
     /// The user said no to the approval prompt.
     Declined,
-    /// Windows could not start it; the number is the Windows error code.
+    /// The system could not start it; the number is the error code (a Windows
+    /// error code, or the launcher's exit status).
     Failed(u32),
+    /// The program that asks for approval (`pkexec` on Linux) is not installed.
+    MissingLauncher,
+}
+
+/// A started launcher: how long to wait for the helper to answer, and a watch
+/// that is asked each time the wait looks and says whether the launcher failed
+/// in the meantime. Windows asks for approval before it returns, so it waits
+/// 10 seconds with a watch that never fails. On Linux the prompt is still open
+/// while the wait runs, so it waits longer and the watch reports the launcher
+/// exiting.
+pub struct Launch {
+    pub timeout: Duration,
+    pub watch: Box<dyn FnMut() -> Option<LaunchError>>,
+}
+
+impl Launch {
+    pub fn standard() -> Self {
+        Self::with_watch(WAIT_TIMEOUT, || None)
+    }
+
+    pub fn with_watch(timeout: Duration, watch: impl FnMut() -> Option<LaunchError> + 'static) -> Self {
+        Self { timeout, watch: Box::new(watch) }
+    }
 }
 
 /// UTF-16 units with the terminating zero the Windows calls expect.
@@ -228,7 +358,9 @@ pub enum EnableError {
     Refused(Refusal),
     Declined,
     LaunchFailed(u32),
-    TimedOut,
+    MissingLauncher,
+    /// The helper was started but did not answer within this long.
+    TimedOut(Duration),
 }
 
 impl EnableError {
@@ -238,38 +370,64 @@ impl EnableError {
             EnableError::Declined =>
                 "Approval was cancelled, so site blocking was not turned on.".to_string(),
             EnableError::LaunchFailed(code) =>
-                format!("Windows could not start the privileged helper (error {code})."),
-            EnableError::TimedOut =>
+                format!("The privileged helper could not be started (error {code})."),
+            EnableError::MissingLauncher =>
+                "Starting the privileged helper needs pkexec (polkit), which was not found. Install polkit, or start the helper by hand.".to_string(),
+            EnableError::TimedOut(waited) =>
                 format!(
                     "The privileged helper was started but did not answer within {} seconds.",
-                    WAIT_TIMEOUT.as_secs()
+                    waited.as_secs()
                 ),
         }
     }
 }
 
+fn launch_error(error: LaunchError) -> EnableError {
+    match error {
+        LaunchError::Declined => EnableError::Declined,
+        LaunchError::Failed(code) => EnableError::LaunchFailed(code),
+        LaunchError::MissingLauncher => EnableError::MissingLauncher,
+    }
+}
+
 /// The whole "Enable site blocking" flow with the outside world passed in:
 /// does the helper answer, is the location safe, start it (the approval
-/// prompt), and sleep. Nothing is started unless the location is safe, and
-/// nothing is waited for if the user declined.
+/// prompt), and sleep. Nothing is started unless the location is safe. While
+/// waiting for the helper, a failure reported by the launcher's watch ends the
+/// wait at once, but a helper that answers in the same look wins.
 pub fn enable_with(
     mut is_running: impl FnMut() -> bool,
     location: impl FnOnce() -> Result<(), Refusal>,
-    launch: impl FnOnce() -> Result<(), LaunchError>,
+    launch: impl FnOnce() -> Result<Launch, LaunchError>,
     sleep: impl FnMut(Duration)
 ) -> Result<Enabled, EnableError> {
     if is_running() {
         return Ok(Enabled::AlreadyRunning);
     }
     location().map_err(EnableError::Refused)?;
-    launch().map_err(|e| match e {
-        LaunchError::Declined => EnableError::Declined,
-        LaunchError::Failed(code) => EnableError::LaunchFailed(code),
-    })?;
-    if wait_until(&mut is_running, WAIT_TIMEOUT, WAIT_STEP, sleep) {
-        Ok(Enabled::Started)
-    } else {
-        Err(EnableError::TimedOut)
+    let Launch { timeout, mut watch } = launch().map_err(launch_error)?;
+
+    let mut failure = None;
+    let answered = wait_until(
+        || {
+            if is_running() {
+                return true;
+            }
+            if let Some(error) = watch() {
+                failure = Some(error);
+                return true; // stop waiting; the failure is reported below
+            }
+            false
+        },
+        timeout,
+        WAIT_STEP,
+        sleep
+    );
+
+    match (failure, answered) {
+        (Some(error), _) => Err(launch_error(error)),
+        (None, true) => Ok(Enabled::Started),
+        (None, false) => Err(EnableError::TimedOut(timeout)),
     }
 }
 
@@ -304,12 +462,93 @@ mod tests {
 
     #[test]
     fn every_refusal_says_what_to_do() {
-        for refusal in [Refusal::NotFound, Refusal::FileWritableByUser, Refusal::FolderWritableByUser] {
+        for refusal in [
+            Refusal::NotFound,
+            Refusal::FileWritableByUser,
+            Refusal::FolderWritableByUser,
+            Refusal::NotRootOwned,
+            Refusal::WritableByOthers,
+            Refusal::AppImage,
+        ] {
             let text = refusal.message();
             assert!(text.ends_with('.'), "{text}");
-            assert!(text.to_lowercase().contains("reinstall"), "{text}");
+            assert!(text.to_lowercase().contains("install"), "{text}");
         }
         assert!(Refusal::FolderWritableByUser.message().contains("all users"));
+        assert!(Refusal::AppImage.message().contains(".deb"));
+        assert!(Refusal::NotRootOwned.message().contains(".deb"));
+    }
+
+    // ---- check_unix_location ----
+
+    fn root(mode: u32) -> OwnerMode { OwnerMode { uid: 0, mode } }
+    fn user(mode: u32) -> OwnerMode { OwnerMode { uid: 1000, mode } }
+
+    #[test]
+    fn a_root_owned_helper_in_a_root_owned_folder_nobody_else_can_write_is_accepted() {
+        assert_eq!(check_unix_location(Some(root(0o755)), root(0o755)), Ok(()));
+        assert_eq!(check_unix_location(Some(root(0o555)), root(0o555)), Ok(()));
+        // The mode from a real stat has the file type in its high bits.
+        assert_eq!(check_unix_location(Some(root(0o100755)), root(0o040755)), Ok(()));
+    }
+
+    #[test]
+    fn a_missing_helper_is_refused_before_anything_else_on_unix_too() {
+        assert_eq!(check_unix_location(None, user(0o777)), Err(Refusal::NotFound));
+    }
+
+    #[test]
+    fn a_helper_or_folder_owned_by_anyone_but_root_is_refused() {
+        assert_eq!(check_unix_location(Some(user(0o755)), root(0o755)), Err(Refusal::NotRootOwned));
+        assert_eq!(check_unix_location(Some(root(0o755)), user(0o755)), Err(Refusal::NotRootOwned));
+        // Mode 555 does not help: the owner can change the mode back.
+        assert_eq!(check_unix_location(Some(user(0o555)), user(0o555)), Err(Refusal::NotRootOwned));
+    }
+
+    #[test]
+    fn a_helper_or_folder_that_group_or_others_can_write_is_refused() {
+        for mode in [0o775, 0o757, 0o777, 0o666, 0o100775, 0o100757] {
+            assert_eq!(
+                check_unix_location(Some(root(mode)), root(0o755)),
+                Err(Refusal::WritableByOthers),
+                "file mode {mode:o}"
+            );
+        }
+        for mode in [0o775, 0o757, 0o777, 0o041777, 0o040775] {
+            assert_eq!(
+                check_unix_location(Some(root(0o755)), root(mode)),
+                Err(Refusal::WritableByOthers),
+                "folder mode {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_is_reported_before_writability() {
+        assert_eq!(check_unix_location(Some(user(0o777)), root(0o755)), Err(Refusal::NotRootOwned));
+    }
+
+    // ---- AppImage and the whole install check ----
+
+    #[test]
+    fn an_appimage_is_recognized_by_its_environment_variable() {
+        assert_eq!(appimage_refusal(None), None);
+        assert_eq!(appimage_refusal(Some("")), None);
+        assert_eq!(appimage_refusal(Some("/tmp/SecureGuard.AppImage")), Some(Refusal::AppImage));
+    }
+
+    #[test]
+    fn an_appimage_is_refused_even_in_a_developer_build_and_even_if_the_file_is_missing() {
+        let missing = std::path::Path::new("no-such-dir").join(HELPER_FILE_NAME);
+        assert_eq!(check_install(&missing, false, Some("/x.AppImage")), Err(Refusal::AppImage));
+        assert_eq!(check_install(&missing, true, Some("/x.AppImage")), Err(Refusal::AppImage));
+    }
+
+    #[test]
+    fn without_an_appimage_the_install_check_is_the_location_check() {
+        let missing = std::path::Path::new("no-such-dir").join(HELPER_FILE_NAME);
+        assert_eq!(check_install(&missing, false, None), Err(Refusal::NotFound));
+        assert_eq!(check_install(&missing, true, Some("")), Err(Refusal::NotFound));
     }
 
     // ---- helper_status ----
@@ -415,7 +654,7 @@ mod tests {
         let result = enable_with(
             || true,
             never_called::<Result<(), Refusal>>(),
-            never_called::<Result<(), LaunchError>>(),
+            never_called::<Result<Launch, LaunchError>>(),
             |_| panic!("must not sleep")
         );
         assert_eq!(result, Ok(Enabled::AlreadyRunning));
@@ -426,7 +665,7 @@ mod tests {
         let result = enable_with(
             || false,
             || Err(Refusal::FolderWritableByUser),
-            never_called::<Result<(), LaunchError>>(),
+            never_called::<Result<Launch, LaunchError>>(),
             |_| panic!("must not sleep")
         );
         assert_eq!(result, Err(EnableError::Refused(Refusal::FolderWritableByUser)));
@@ -444,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_start_carries_the_windows_error_code() {
+    fn a_failed_start_carries_the_error_code() {
         let result = enable_with(|| false, || Ok(()), || Err(LaunchError::Failed(5)), |_| {});
         assert_eq!(result, Err(EnableError::LaunchFailed(5)));
         assert!(EnableError::LaunchFailed(5).message().contains('5'));
@@ -462,7 +701,7 @@ mod tests {
             || Ok(()),
             || {
                 launched.set(true);
-                Ok(())
+                Ok(Launch::standard())
             },
             |_| {}
         );
@@ -472,12 +711,94 @@ mod tests {
     #[test]
     fn a_started_helper_that_never_answers_times_out_after_the_limit() {
         let slept = RefCell::new(Duration::ZERO);
-        let result = enable_with(|| false, || Ok(()), || Ok(()), |d| {
+        let result = enable_with(|| false, || Ok(()), || Ok(Launch::standard()), |d| {
             *slept.borrow_mut() += d;
         });
-        assert_eq!(result, Err(EnableError::TimedOut));
+        assert_eq!(result, Err(EnableError::TimedOut(WAIT_TIMEOUT)));
         assert_eq!(*slept.borrow(), WAIT_TIMEOUT);
-        assert!(EnableError::TimedOut.message().contains("10 seconds"));
+        assert!(EnableError::TimedOut(WAIT_TIMEOUT).message().contains("10 seconds"));
+    }
+
+    // ---- a launcher that sets its own wait and can fail early ----
+
+    #[test]
+    fn the_standard_launch_waits_ten_seconds_and_never_fails_early() {
+        let mut launch = Launch::standard();
+        assert_eq!(launch.timeout, WAIT_TIMEOUT);
+        assert_eq!((launch.watch)(), None);
+    }
+
+    #[test]
+    fn the_launcher_sets_how_long_to_wait() {
+        let slept = RefCell::new(Duration::ZERO);
+        let result = enable_with(
+            || false,
+            || Ok(()),
+            || Ok(Launch::with_watch(Duration::from_secs(120), || None)),
+            |d| {
+                *slept.borrow_mut() += d;
+            }
+        );
+        assert_eq!(result, Err(EnableError::TimedOut(Duration::from_secs(120))));
+        assert_eq!(*slept.borrow(), Duration::from_secs(120));
+        assert!(EnableError::TimedOut(Duration::from_secs(120)).message().contains("120 seconds"));
+    }
+
+    #[test]
+    fn a_launcher_that_reports_a_decline_ends_the_wait_at_once() {
+        let slept = RefCell::new(Duration::ZERO);
+        let looks = Cell::new(0);
+        let result = enable_with(
+            || false,
+            || Ok(()),
+            || {
+                Ok(
+                    Launch::with_watch(Duration::from_secs(120), move || {
+                        looks.set(looks.get() + 1);
+                        if looks.get() >= 3 { Some(LaunchError::Declined) } else { None }
+                    })
+                )
+            },
+            |d| {
+                *slept.borrow_mut() += d;
+            }
+        );
+        assert_eq!(result, Err(EnableError::Declined));
+        assert_eq!(*slept.borrow(), WAIT_STEP * 2, "two sleeps between three looks, then it stops");
+    }
+
+    #[test]
+    fn a_launcher_that_exited_with_an_error_carries_its_code() {
+        let result = enable_with(
+            || false,
+            || Ok(()),
+            || Ok(Launch::with_watch(Duration::from_secs(120), || Some(LaunchError::Failed(127)))),
+            |_| panic!("must not sleep after a failure")
+        );
+        assert_eq!(result, Err(EnableError::LaunchFailed(127)));
+    }
+
+    #[test]
+    fn a_helper_that_comes_up_wins_over_a_failure_reported_at_the_same_moment() {
+        let polls = Cell::new(0);
+        let result = enable_with(
+            || {
+                polls.set(polls.get() + 1);
+                polls.get() >= 2
+            },
+            || Ok(()),
+            || Ok(Launch::with_watch(Duration::from_secs(120), || Some(LaunchError::Failed(1)))),
+            |_| {}
+        );
+        assert_eq!(result, Ok(Enabled::Started));
+    }
+
+    #[test]
+    fn a_missing_launcher_is_its_own_error_with_a_plain_message() {
+        let result = enable_with(|| false, || Ok(()), || Err(LaunchError::MissingLauncher), |_| {});
+        assert_eq!(result, Err(EnableError::MissingLauncher));
+        let text = EnableError::MissingLauncher.message();
+        assert!(text.contains("pkexec"), "{text}");
     }
 
     #[test]
@@ -543,17 +864,133 @@ mod tests {
     }
 
     #[test]
-    fn check_helper_location_reads_the_real_file_system() {
+    fn the_write_probes_read_the_real_file_system() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("secureguard-helper");
-        assert_eq!(check_helper_location(&missing, true), Err(Refusal::NotFound));
-        assert_eq!(check_helper_location(&missing, false), Err(Refusal::NotFound));
+        assert_eq!(check_writable_location(&missing), Err(Refusal::NotFound));
 
         std::fs::write(&missing, b"x").unwrap();
         // The test owns this folder, so an ordinary user could replace the file.
-        assert_eq!(check_helper_location(&missing, true), Err(Refusal::FileWritableByUser));
-        // A developer build skips the write checks but still needs the file.
-        assert_eq!(check_helper_location(&missing, false), Ok(()));
+        assert_eq!(check_writable_location(&missing), Err(Refusal::FileWritableByUser));
+    }
+
+    #[test]
+    fn a_developer_build_skips_the_checks_but_still_needs_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("secureguard-helper");
+        assert_eq!(check_helper_location(&helper, false), Err(Refusal::NotFound));
+
+        std::fs::write(&helper, b"x").unwrap();
+        // A place the rule refuses on every platform and for every user.
+        #[cfg(unix)]
+        {
+            set_mode(&helper, 0o777);
+            set_mode(dir.path(), 0o777);
+            assert!(check_helper_location(&helper, true).is_err());
+        }
+        assert_eq!(check_helper_location(&helper, false), Ok(()));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn on_windows_the_platform_rule_is_the_write_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("secureguard-helper.exe");
+        std::fs::write(&helper, b"x").unwrap();
+        assert_eq!(check_helper_location(&helper, true), Err(Refusal::FileWritableByUser));
+    }
+
+    /// Whether this test process owns what it creates as root would, which
+    /// decides what the real file system tests can say.
+    #[cfg(unix)]
+    fn running_as_root(dir: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir).unwrap().uid() == 0
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_the_platform_rule_reads_the_real_owner_and_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("bin");
+        std::fs::create_dir(&folder).unwrap();
+        let helper = folder.join("secureguard-helper");
+        std::fs::write(&helper, b"x").unwrap();
+        set_mode(&helper, 0o755);
+        set_mode(&folder, 0o755);
+
+        if !running_as_root(dir.path()) {
+            // Everything this process creates belongs to a normal user.
+            assert_eq!(check_helper_location(&helper, true), Err(Refusal::NotRootOwned));
+            return;
+        }
+        assert_eq!(check_helper_location(&helper, true), Ok(()));
+
+        set_mode(&helper, 0o775);
+        assert_eq!(check_helper_location(&helper, true), Err(Refusal::WritableByOthers));
+        set_mode(&helper, 0o755);
+
+        set_mode(&folder, 0o777);
+        assert_eq!(check_helper_location(&helper, true), Err(Refusal::WritableByOthers));
+        set_mode(&folder, 0o755);
+
+        std::os::unix::fs::chown(&helper, Some(65534), None).unwrap();
+        assert_eq!(check_helper_location(&helper, true), Err(Refusal::NotRootOwned));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_file_someone_else_owns_is_judged_by_the_file_it_points_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("secureguard-helper");
+        std::fs::write(&target, b"x").unwrap();
+        set_mode(&target, 0o755);
+        set_mode(dir.path(), 0o755);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        if running_as_root(dir.path()) {
+            std::os::unix::fs::chown(&target, Some(65534), None).unwrap();
+        }
+        assert_eq!(check_helper_location(&link, true), Err(Refusal::NotRootOwned));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_judged_by_the_folder_of_the_file_it_points_to() {
+        let dir = tempfile::tempdir().unwrap();
+        if !running_as_root(dir.path()) {
+            return; // everything made here is user-owned, so folders cannot be told apart
+        }
+        let safe = dir.path().join("safe");
+        let open = dir.path().join("open");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::create_dir(&open).unwrap();
+        set_mode(&safe, 0o755);
+        set_mode(&open, 0o777); // anyone could replace the file inside
+        let target = open.join("secureguard-helper");
+        std::fs::write(&target, b"x").unwrap();
+        set_mode(&target, 0o755);
+        let link = safe.join("secureguard-helper");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(check_helper_location(&link, true), Err(Refusal::WritableByOthers));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_a_missing_helper_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            check_helper_location(&dir.path().join("secureguard-helper"), true),
+            Err(Refusal::NotFound)
+        );
     }
 
     #[test]

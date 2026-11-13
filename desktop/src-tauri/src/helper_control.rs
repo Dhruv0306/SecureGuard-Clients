@@ -4,15 +4,17 @@
 //! path and the platform as arguments so tests can use fakes; `current_*` use
 //! the real ones.
 
-use crate::helper_client;
+use crate::helper_client::{ self, ServerTrust };
 use secureguard_core::helper_launch::{
-    check_helper_location,
+    check_install,
     enable_with,
     helper_path_beside,
     helper_status,
     Enabled,
     HelperStatus,
+    Launch,
     LaunchError,
+    Refusal,
     HELPER_FILE_NAME,
 };
 use secureguard_core::helper_protocol::HELPER_SOCKET_NAME;
@@ -27,6 +29,11 @@ const QUIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Shown where the app has no way to start the helper yet.
 pub const NOT_AVAILABLE_HERE: &str =
     "Starting the privileged helper from the app is not available on this platform yet.";
+
+/// The install rule for this platform, with the `APPIMAGE` variable read here.
+fn install_check(helper: &Path, enforce_safe_install: bool) -> Result<(), Refusal> {
+    check_install(helper, enforce_safe_install, std::env::var("APPIMAGE").ok().as_deref())
+}
 
 /// Whether the helper answers and, if not, whether the app may start it.
 /// `enforce_writable` is false in developer builds. `can_start` is false on a
@@ -45,7 +52,7 @@ fn status_at(
             reason: Some(NOT_AVAILABLE_HERE.to_string()),
         };
     }
-    helper_status(running, || check_helper_location(helper, enforce_writable))
+    helper_status(running, || install_check(helper, enforce_writable))
 }
 
 /// The enable flow against a socket and a helper path, with `launch` and
@@ -56,12 +63,12 @@ fn enable_using(
     helper: &Path,
     enforce_writable: bool,
     started: &AtomicBool,
-    launch: impl FnOnce(&Path) -> Result<(), LaunchError>,
+    launch: impl FnOnce(&Path) -> Result<Launch, LaunchError>,
     sleep: impl FnMut(Duration)
 ) -> Result<HelperStatus, String> {
     let outcome = enable_with(
         || helper_client::helper_reachable_at(socket_name),
-        || check_helper_location(helper, enforce_writable),
+        || install_check(helper, enforce_writable),
         || launch(helper),
         sleep
     );
@@ -77,9 +84,14 @@ fn enable_using(
 
 /// Asks a helper this app started to quit, then clears the mark. Waits at most
 /// `timeout`. Does nothing for a helper the app did not start.
-fn quit_if_started(started: &AtomicBool, socket_name: &str, timeout: Duration) {
+fn quit_if_started(
+    started: &AtomicBool,
+    socket_name: &str,
+    trust: ServerTrust,
+    timeout: Duration
+) {
     if started.swap(false, Ordering::SeqCst) {
-        if let Err(e) = helper_client::quit_helper_within(socket_name, timeout) {
+        if let Err(e) = helper_client::quit_helper_within(socket_name, trust, timeout) {
             eprintln!("could not ask the privileged helper to quit: {e}");
         }
     }
@@ -113,16 +125,16 @@ pub fn enable_current(started: &AtomicBool) -> Result<HelperStatus, String> {
 
 /// Called when the app exits.
 pub fn quit_started_helper(started: &AtomicBool) {
-    quit_if_started(started, HELPER_SOCKET_NAME, QUIT_TIMEOUT);
+    quit_if_started(started, HELPER_SOCKET_NAME, ServerTrust::for_platform(), QUIT_TIMEOUT);
 }
 
 #[cfg(windows)]
-fn platform_launch(helper: &Path) -> Result<(), LaunchError> {
-    secureguard_core::helper_launch::launch_elevated(helper)
+fn platform_launch(helper: &Path) -> Result<Launch, LaunchError> {
+    secureguard_core::helper_launch::launch_elevated(helper).map(|()| Launch::standard())
 }
 
 #[cfg(not(windows))]
-fn platform_launch(_helper: &Path) -> Result<(), LaunchError> {
+fn platform_launch(_helper: &Path) -> Result<Launch, LaunchError> {
     // enable_current returns before this on a platform with no launcher.
     Err(LaunchError::Failed(0))
 }
@@ -131,7 +143,6 @@ fn platform_launch(_helper: &Path) -> Result<(), LaunchError> {
 mod tests {
     use super::*;
     use crate::helper_client::tests::{ fake_helper, unique_name };
-    use secureguard_core::helper_launch::{ LaunchError, Refusal };
     use std::cell::Cell;
     use std::sync::atomic::{ AtomicBool, Ordering };
     use std::time::Duration;
@@ -143,7 +154,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let helper = dir.path().join("secureguard-helper");
         std::fs::write(&helper, b"x").unwrap();
+        // Anyone can write it, so it is an unsafe place whoever runs the test
+        // (as root the owner would otherwise be fine on Unix).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o777)).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
         (dir, helper)
+    }
+
+    /// The refusal this platform gives for the unsafe place above.
+    fn refusal_for(helper: &std::path::Path) -> Refusal {
+        secureguard_core::helper_launch::check_helper_location(helper, true).unwrap_err()
     }
 
     fn no_sleep(_: Duration) {}
@@ -170,7 +194,7 @@ mod tests {
         let (_dir, helper) = helper_in_a_user_folder();
         let status = status_at(&unique_name("st-unsafe"), &helper, true, true);
         assert!(!status.supported && !status.running);
-        assert_eq!(status.reason.as_deref(), Some(Refusal::FileWritableByUser.message()));
+        assert_eq!(status.reason.as_deref(), Some(refusal_for(&helper).message()));
     }
 
     #[test]
@@ -223,7 +247,7 @@ mod tests {
             no_sleep
         );
 
-        assert_eq!(result, Err(Refusal::FileWritableByUser.message().to_string()));
+        assert_eq!(result, Err(refusal_for(&helper).message().to_string()));
         assert!(!started.load(Ordering::SeqCst));
     }
 
@@ -243,7 +267,7 @@ mod tests {
                 assert_eq!(path, helper.as_path());
                 launched.set(launched.get() + 1);
                 let _seen = fake_helper(&name, ""); // "the helper comes up"
-                Ok(())
+                Ok(Launch::standard())
             },
             no_sleep
         );
@@ -276,7 +300,7 @@ mod tests {
         let (_dir, helper) = helper_in_a_user_folder();
         let started = AtomicBool::new(false);
 
-        let result = enable_using(&unique_name("en-slow"), &helper, false, &started, |_| Ok(()), no_sleep);
+        let result = enable_using(&unique_name("en-slow"), &helper, false, &started, |_| Ok(Launch::standard()), no_sleep);
 
         assert!(result.unwrap_err().contains("10 seconds"));
         assert!(!started.load(Ordering::SeqCst));
@@ -289,7 +313,7 @@ mod tests {
         let name = unique_name("qx-none");
         let seen = fake_helper(&name, "{\"success\":true,\"error\":null}\n");
 
-        quit_if_started(&AtomicBool::new(false), &name, Duration::from_secs(1));
+        quit_if_started(&AtomicBool::new(false), &name, ServerTrust::Anyone, Duration::from_secs(1));
 
         assert!(seen.lock().unwrap().is_empty(), "no quit may be sent");
     }
@@ -300,8 +324,8 @@ mod tests {
         let seen = fake_helper(&name, "{\"success\":true,\"error\":null}\n");
         let started = AtomicBool::new(true);
 
-        quit_if_started(&started, &name, Duration::from_secs(1));
-        quit_if_started(&started, &name, Duration::from_secs(1));
+        quit_if_started(&started, &name, ServerTrust::Anyone, Duration::from_secs(1));
+        quit_if_started(&started, &name, ServerTrust::Anyone, Duration::from_secs(1));
 
         assert_eq!(*seen.lock().unwrap(), vec!["{\"quit\":true}".to_string()]);
         assert!(!started.load(Ordering::SeqCst));
@@ -313,14 +337,14 @@ mod tests {
         let _seen = fake_helper(&name, "");
 
         let began = std::time::Instant::now();
-        quit_if_started(&AtomicBool::new(true), &name, Duration::from_millis(300));
+        quit_if_started(&AtomicBool::new(true), &name, ServerTrust::Anyone, Duration::from_millis(300));
 
         assert!(began.elapsed() < Duration::from_secs(3), "took {:?}", began.elapsed());
     }
 
     #[test]
     fn a_helper_that_is_already_gone_is_not_an_error_on_exit() {
-        quit_if_started(&AtomicBool::new(true), &unique_name("qx-gone"), Duration::from_secs(1));
+        quit_if_started(&AtomicBool::new(true), &unique_name("qx-gone"), ServerTrust::Anyone, Duration::from_secs(1));
     }
 
     #[cfg(not(windows))]
