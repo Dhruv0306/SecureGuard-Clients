@@ -12,7 +12,11 @@ project uses [Semantic Versioning](https://semver.org/).
   started for (`--allow-uid`, or `PKEXEC_UID` which pkexec sets), and a helper started with
   neither refuses to start. The app sends nothing to a helper socket that root does not own. On
   Linux the helper must be owned by root in a folder only root can write, and an AppImage is
-  refused ("install the .deb"). Nothing in the app starts the helper on Linux yet.
+  refused ("install the .deb").
+- Desktop (Linux): "Enable site blocking" starts the privileged helper through polkit (`pkexec`)
+  and waits up to 120 seconds for the password dialog and the helper. A dismissed dialog is
+  reported as cancelled, and a missing `pkexec` or an approval that could not be obtained gets a
+  plain message. A helper the app started is asked to quit when the app closes, as on Windows.
 - Helper: a quit request (`{"quit":true}`) makes the helper answer and exit, and the helper now
   exits by itself after 30 minutes without a request. Neither changes who may connect. A client
   that connects and sends nothing no longer blocks the helper, and a request line is limited

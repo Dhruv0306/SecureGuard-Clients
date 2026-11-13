@@ -1,6 +1,6 @@
 # Shipping the helper: site blocking that works from the download
 
-Date: 01/11/2026. Status: PR 1 (release packaging) is built and was proved by a dry run on 05/11/2026. PR 2 (helper lifecycle) is built, see "Helper changes (PR 2)". PR 3 (Windows "Enable site blocking") is built, see "Built in PR 3". PR 4a (Unix access control, the Linux install rule, launch plumbing) is built, see "Built in PR 4a". PR 4b (the `pkexec` start) and the release itself are still to do.
+Date: 01/11/2026. Status: PR 1 (release packaging) is built and was proved by a dry run on 05/11/2026. PR 2 (helper lifecycle) is built, see "Helper changes (PR 2)". PR 3 (Windows "Enable site blocking") is built, see "Built in PR 3". PR 4a (Unix access control, the Linux install rule, launch plumbing) is built, see "Built in PR 4a". PR 4b (the `pkexec` start on Linux) is built, see "Built in PR 4b". The release itself is still to do.
 
 Item 2 of the next-steps order (release v0.2.0), widened after a real test: Dhruv downloaded a
 build, site blocking did not work, and it worked once the helper was run separately. Decisions
@@ -208,6 +208,19 @@ in PR 2 would use it (the desktop crate rejects unused code):
   as `check_writable_location`.
 - Tested in the Linux sandbox as root (another user is a child process running as `nobody`) and
   again as `nobody`, which is what CI sees. The Linux start through `pkexec` is PR 4b.
+
+### Built in PR 4b (the `pkexec` start on Linux)
+
+- `core::helper_launch`: `launch_pkexec(program, helper)` (Unix only) starts `pkexec` with the
+  helper's path as its only argument and null stdio, and returns a `Launch` with a 120 second wait
+  and a watch on the launcher exiting. `pkexec_exit_error` maps exit 126 to `Declined` and 127 to
+  the new `NotAuthorized`; a missing program is `MissingLauncher`. The launcher is reaped in the
+  background when the launch is dropped. `PKEXEC_PATH` is `/usr/bin/pkexec`.
+- `desktop`: Linux uses it as its `platform_launch`; macOS still reports that starting the helper
+  is not available.
+- Tested in the Linux sandbox with fake `pkexec` scripts (exit 126, 127, still waiting, the exact
+  arguments, null stdio, no zombie), as root and as `nobody`. The real polkit dialog needs an
+  Ubuntu desktop (see "Manual checks on Ubuntu" in the security model).
 
 ### The release itself (after PR 4)
 

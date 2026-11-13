@@ -78,9 +78,9 @@ The access control is therefore a check of the connecting process's user id.
     little for it.
   - Windows has no equivalent of the app's check of the helper; its pipe uses a first-instance
     flag and an access list on the helper's side only.
-- **Not started yet.** Nothing in the app starts the helper on Linux in this change; the start
-  through `pkexec` is the next one. Until then the checks above protect a helper someone starts by
-  hand with `sudo secureguard-helper --allow-uid $(id -u)`.
+- **Started from the app (Linux).** See "Starting the helper from the app (Linux)" below. Until
+  then, and for a helper someone starts by hand, the checks above apply the same:
+  `sudo secureguard-helper --allow-uid $(id -u)`.
 
 ## Quit, idle exit and silent clients
 
@@ -88,7 +88,7 @@ The access control is therefore a check of the connecting process's user id.
   The helper also exits by itself after 30 minutes without a request. Any request that is read
   restarts the limit, including a rejected one. On Windows the app starts the helper on request
   (see "Starting the helper from the app") and sends it a quit when the app closes, but only a
-  helper it started itself. Linux start-up is still to come.
+  helper it started itself, on Linux as well.
 - A client that connects and sends nothing is read on its own short-lived thread, so it blocks
   neither a quit nor the idle exit, and it does not count as activity. At most 16 connections are
   read at once; one over that is closed. A request line over 2 MB is rejected without reading
@@ -151,6 +151,34 @@ does not re-validate.
   started by hand, or already running when the app opened, is left running. The quit waits at
   most 2 seconds, so a helper that does not answer never holds up closing the app.
 
+## Starting the helper from the app (Linux)
+
+- "Enable site blocking" runs `/usr/bin/pkexec <helper path>`. The path of `pkexec` is absolute, so
+  a directory on the user's `PATH` cannot stand in for it, and the helper's path is its only
+  argument (pkexec validates no arguments). polkit shows its approval dialog; nothing starts
+  without the user's approval. The default polkit action asks for an administrator and names the
+  program in the dialog. There is no custom policy file yet, so the dialog text is the generic one.
+- **Who the helper serves.** pkexec sets `PKEXEC_UID` to the user who ran it, so the helper serves
+  exactly that user and root (see "Who may connect"). The helper runs as root with a minimal
+  environment, in root's home directory, and its output is discarded.
+- **What the app sees.** `pkexec` runs as long as the helper does. Exit 126 means the dialog was
+  dismissed ("cancelled"); 127 means approval could not be obtained (the account may not approve
+  it, or no authentication agent is running); a missing `/usr/bin/pkexec` is reported as such. A
+  launcher that exits ends the wait at once. Otherwise the app waits up to 120 seconds for the
+  helper to answer, because the password dialog is still open during the wait.
+- **After the wait.** If the 120 seconds pass with the dialog still open, the app reports that
+  the helper did not answer and does not close the dialog. If the user approves later, the helper
+  starts, but the app did not record that it started it, so it is not asked to quit when the app
+  closes; it leaves by itself after 30 minutes without a request. Cancelling the pending request
+  when the wait ends (for example by ending the `pkexec` process, which still runs as the user
+  until the password is accepted) has not been tried and is left for the Ubuntu desktop test.
+- **Quit on exit** works as on Windows, for a helper this app started. The launcher process is
+  waited for in the background so it does not stay a zombie.
+- **Install rule.** Release builds require the root-owned helper and folder described above, and
+  refuse an AppImage. A developer build runs the helper from `target/debug`, which is owned by the
+  developer, so the rule is skipped; the helper is then started as root from a folder the developer
+  owns, which is a developer-only setup.
+
 ## Not covered
 
 - **macOS.** Out of the release. The Unix checks apply to it, but the app has no way to start
@@ -187,3 +215,27 @@ normal window (`cargo tauri dev`).
    message and no button.
 7. Start the helper by hand in an Administrator PowerShell, open the app (it shows site blocking
    is on), then close the app. The helper keeps running.
+
+## Manual checks on Ubuntu (Linux desktop)
+
+In `cargo tauri dev` (a debug build: the install rule is skipped), with no helper running:
+
+1. The Blocked domains section says site blocking is off and shows "Enable site blocking".
+2. Click it. The polkit dialog appears. Enter the password. The section says site blocking is on.
+   `ps -o user=,args= -C secureguard-helper` shows the helper running as `root`.
+3. Block `scg-smoke-test.example`. `grep scg-smoke-test /etc/hosts` shows the line.
+4. Close the app. `pgrep secureguard-helper` finds nothing.
+5. Click Enable and cancel the dialog. The page says approval was cancelled, no helper runs, and the
+   button is still there.
+6. Start the helper by hand (`sudo ./target/debug/secureguard-helper --allow-uid $(id -u)`), open
+   the app (it shows site blocking is on), close the app. The helper keeps running.
+7. With the helper running, as another user, connect to the socket: `sudo -u nobody python3 -c
+   'import socket;s=socket.socket(socket.AF_UNIX);s.connect("\0secureguard-helper");s.sendall(b"{\"quit\":true}\n");print(s.recv(200))'`
+   prints `b''` and the helper keeps running.
+
+In the installed `.deb` (release dry run), a release build:
+
+8. The same flow works from the application menu, with the install rule enforced.
+9. A release build run from a folder the user owns (for example `target/release`) shows the
+   ".deb package" message and no button.
+10. The AppImage shows "Site blocking is not available in the AppImage" and no button.
