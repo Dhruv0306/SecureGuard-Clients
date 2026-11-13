@@ -106,11 +106,11 @@ fn current_helper_path() -> PathBuf {
 // A developer build runs from `target/debug`, which the user can write by
 // design, so only a release build enforces the write checks.
 pub fn current_status() -> HelperStatus {
-    status_at(HELPER_SOCKET_NAME, &current_helper_path(), !cfg!(debug_assertions), cfg!(windows))
+    status_at(HELPER_SOCKET_NAME, &current_helper_path(), !cfg!(debug_assertions), HAS_LAUNCHER)
 }
 
 pub fn enable_current(started: &AtomicBool) -> Result<HelperStatus, String> {
-    if !cfg!(windows) {
+    if !HAS_LAUNCHER {
         return Err(NOT_AVAILABLE_HERE.to_string());
     }
     enable_using(
@@ -128,12 +128,24 @@ pub fn quit_started_helper(started: &AtomicBool) {
     quit_if_started(started, HELPER_SOCKET_NAME, ServerTrust::for_platform(), QUIT_TIMEOUT);
 }
 
+/// Whether this platform has a way to ask for approval and start the helper:
+/// the Windows approval prompt, or polkit's `pkexec` on Linux. macOS has none.
+const HAS_LAUNCHER: bool = cfg!(any(windows, target_os = "linux"));
+
 #[cfg(windows)]
 fn platform_launch(helper: &Path) -> Result<Launch, LaunchError> {
     secureguard_core::helper_launch::launch_elevated(helper).map(|()| Launch::standard())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn platform_launch(helper: &Path) -> Result<Launch, LaunchError> {
+    secureguard_core::helper_launch::launch_pkexec(
+        Path::new(secureguard_core::helper_launch::PKEXEC_PATH),
+        helper
+    )
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn platform_launch(_helper: &Path) -> Result<Launch, LaunchError> {
     // enable_current returns before this on a platform with no launcher.
     Err(LaunchError::Failed(0))
@@ -347,7 +359,7 @@ mod tests {
         quit_if_started(&AtomicBool::new(true), &unique_name("qx-gone"), ServerTrust::Anyone, Duration::from_secs(1));
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     #[test]
     fn enabling_on_a_platform_without_a_launcher_says_so() {
         assert_eq!(enable_current(&AtomicBool::new(false)), Err(NOT_AVAILABLE_HERE.to_string()));
