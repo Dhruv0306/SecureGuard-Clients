@@ -522,7 +522,6 @@ pub fn enable_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use std::cell::{ Cell, RefCell };
     use std::time::Duration;
 
@@ -1115,7 +1114,9 @@ mod tests {
 
     #[test]
     fn pkexec_is_started_by_an_absolute_path_so_the_path_variable_cannot_replace_it() {
-        assert!(Path::new(PKEXEC_PATH).is_absolute());
+        // As text, because "absolute" means a drive letter on Windows and this
+        // path is for Linux: it must start at the root and name the file.
+        assert!(PKEXEC_PATH.starts_with('/'));
         assert_eq!(PKEXEC_PATH, "/usr/bin/pkexec");
     }
 
