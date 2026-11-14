@@ -178,6 +178,14 @@ does not re-validate.
   refuse an AppImage. A developer build runs the helper from `target/debug`, which is owned by the
   developer, so the rule is skipped; the helper is then started as root from a folder the developer
   owns, which is a developer-only setup.
+- **Observed on a real desktop** (Ubuntu 26.04 in a virtual machine, a debug build, 13/11/2026):
+  Enable shows polkit's dialog; after the password the helper runs as `root` with `PKEXEC_UID` set
+  to the user's id; blocking writes the line to `/etc/hosts` and unblocking removes it; closing the
+  app ends a helper the app started; cancelling the dialog gives "Approval was cancelled", which
+  also shows that a dismissed dialog exits `pkexec` with 126; a helper started by hand keeps
+  running after the app closes. GNOME's dialog asks again after a wrong password, with no limit on
+  tries, so only cancelling ends it. Exit 127 (`NotAuthorized`) has not been observed on a real
+  system; the message for it covers "not allowed" and "no agent".
 
 ## Not covered
 
@@ -224,7 +232,8 @@ In `cargo tauri dev` (a debug build: the install rule is skipped), with no helpe
 2. Click it. The polkit dialog appears. Enter the password. The section says site blocking is on.
    `ps -o user=,args= -C secureguard-helper` shows the helper running as `root`.
 3. Block `scg-smoke-test.example`. `grep scg-smoke-test /etc/hosts` shows the line.
-4. Close the app. `pgrep secureguard-helper` finds nothing.
+4. Close the app. `ps -C secureguard-helper -o pid=` prints nothing. (`pgrep secureguard-helper` does
+   not work here: without `-f` it cannot match a name longer than 15 characters.)
 5. Click Enable and cancel the dialog. The page says approval was cancelled, no helper runs, and the
    button is still there.
 6. Start the helper by hand (`sudo ./target/debug/secureguard-helper --allow-uid $(id -u)`), open
