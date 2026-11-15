@@ -184,7 +184,9 @@ does not re-validate.
   app ends a helper the app started; cancelling the dialog gives "Approval was cancelled", which
   also shows that a dismissed dialog exits `pkexec` with 126; a helper started by hand keeps
   running after the app closes. GNOME's dialog asks again after a wrong password, with no limit on
-  tries, so only cancelling ends it. Exit 127 (`NotAuthorized`) has not been observed on a real
+  tries, so only cancelling ends it. Another user (`nobody`) connecting to the socket of a running
+  helper got a connection reset and no reply, the helper logged the refusal and kept running, and the
+  allowed user then got the success reply. Exit 127 (`NotAuthorized`) has not been observed on a real
   system; the message for it covers "not allowed" and "no agent".
 
 ## Not covered
@@ -240,7 +242,10 @@ In `cargo tauri dev` (a debug build: the install rule is skipped), with no helpe
    the app (it shows site blocking is on), close the app. The helper keeps running.
 7. With the helper running, as another user, connect to the socket: `sudo -u nobody python3 -c
    'import socket;s=socket.socket(socket.AF_UNIX);s.connect("\0secureguard-helper");s.sendall(b"{\"quit\":true}\n");print(s.recv(200))'`
-   prints `b''` and the helper keeps running.
+   gets no reply: Python reports `ConnectionResetError` (or prints `b''`), because the helper closes
+   the connection with the request unread, which Linux reports as a reset. The helper prints
+   "refused a connection from a user that is not allowed" and keeps running. The same line run as
+   yourself prints the success reply and the helper exits.
 
 In the installed `.deb` (release dry run), a release build:
 
