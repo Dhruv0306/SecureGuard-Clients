@@ -55,6 +55,26 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
+  frontend:
+    # The desktop page logic (scan-view.js and the files that follow it) is plain
+    # JavaScript tested with node:test. No other job runs these tests. The glob is
+    # deliberate: on Node 22 a directory argument is not searched, so
+    # "node --test desktop/tests/" fails with MODULE_NOT_FOUND.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Show Node version
+        run: node --version
+
+      - name: Test
+        run: node --test "desktop/tests/**/*.test.js"
+
   msrv:
     # Guards the rust-version declared in core, helper and desktop. The floor is
     # set by the YARA-X and wasmtime versions in Cargo.lock (both 1.93), so a
