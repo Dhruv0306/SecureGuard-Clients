@@ -343,6 +343,20 @@ fn resolve_root(root: &Path) -> PathBuf {
     absolute
 }
 
+/// `roots` as the scanner will walk them: each in the spelling [`resolve_root`]
+/// gives, in the order first seen, with a folder that comes up under two names
+/// listed once. A place list built from this matches the paths a scan reports.
+pub fn resolve_unique_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let resolved = resolve_root(root);
+        if !unique.iter().any(|seen| same_path(seen, &resolved)) {
+            unique.push(resolved);
+        }
+    }
+    unique
+}
+
 #[cfg(windows)]
 fn windows_long_path(path: &Path) -> Option<PathBuf> {
     use std::os::windows::ffi::{ OsStrExt, OsStringExt };
@@ -2032,6 +2046,40 @@ mod tests {
     fn a_root_that_does_not_exist_keeps_its_absolute_path() {
         let missing = Path::new("definitely-not-a-real-folder/inside");
         assert_eq!(resolve_root(missing), std::path::absolute(missing).unwrap());
+    }
+
+    #[test]
+    fn a_folder_given_twice_is_listed_once_and_the_first_order_is_kept() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let list = resolve_unique_roots(&[a.clone(), b.clone(), a.join("."), b.join("")]);
+
+        assert_eq!(list, vec![resolve_root(&a), resolve_root(&b)]);
+    }
+
+    #[test]
+    fn a_relative_root_is_listed_as_an_absolute_path() {
+        let list = resolve_unique_roots(&[PathBuf::from("definitely-not-a-real-folder")]);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].is_absolute());
+    }
+
+    #[test]
+    fn no_roots_give_an_empty_list() {
+        assert!(resolve_unique_roots(&[]).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_real_temp_folder_is_listed_once_under_its_two_spellings() {
+        // Same case as the scan test below: TEMP may be an 8.3 short path.
+        let dir = tempdir().unwrap();
+        let long = resolve_root(dir.path());
+        assert_eq!(resolve_unique_roots(&[dir.path().to_path_buf(), long.clone()]), vec![long]);
     }
 
     #[cfg(windows)]

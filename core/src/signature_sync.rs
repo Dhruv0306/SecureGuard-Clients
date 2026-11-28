@@ -270,7 +270,8 @@ pub fn sync_signatures(feed_urls: &[&str], conn: &Connection) -> rusqlite::Resul
     Ok(result)
 }
 
-fn total_signatures(conn: &Connection) -> rusqlite::Result<usize> {
+/// How many signatures the local cache holds.
+pub fn total_signatures(conn: &Connection) -> rusqlite::Result<usize> {
     conn.query_row("SELECT COUNT(*) FROM signature_cache", [], |row| row.get::<_, i64>(0)).map(
         |count| count as usize
     )
@@ -752,6 +753,19 @@ mod tests {
 
         assert_eq!(result.feed_errors.len(), 1);
         assert_eq!(storage::last_feed_attempt(&conn, "f").unwrap(), Some(1000));
+    }
+
+    #[test]
+    fn the_signature_count_is_zero_for_an_empty_cache_and_counts_what_is_stored() {
+        let conn = storage::open_in_memory().unwrap();
+        assert_eq!(total_signatures(&conn).unwrap(), 0);
+        for c in ["a", "b"] {
+            conn.execute(
+                "INSERT INTO signature_cache (sha256, source, added_at) VALUES (?1, 'seed', 0)",
+                params![c.repeat(64)]
+            ).unwrap();
+        }
+        assert_eq!(total_signatures(&conn).unwrap(), 2);
     }
 
     #[test]
