@@ -1366,6 +1366,35 @@ mod tests {
     }
 
     #[test]
+    fn custom_follows_the_subfolder_choice_and_quick_always_looks_inside() {
+        let (state, dir) = test_state();
+        let top = dir.path().join("top");
+        std::fs::create_dir_all(top.join("inner")).unwrap();
+        std::fs::write(top.join("a.txt"), b"a").unwrap();
+        std::fs::write(top.join("inner").join("b.txt"), b"b").unwrap();
+        let paths = strings(&[&top]);
+
+        let scanned = |preset, recursive| {
+            do_scan_selected(&state, paths.clone(), preset, recursive, &mut |_| {}).unwrap().scanned
+        };
+        assert_eq!(scanned(ScanPreset::Custom, false), 1);
+        assert_eq!(scanned(ScanPreset::Custom, true), 2);
+        assert_eq!(scanned(ScanPreset::Quick, false), 2);
+    }
+
+    #[test]
+    fn a_folder_given_twice_is_scanned_once() {
+        let (state, dir) = test_state();
+        let target = folder_with_one_bad_and_one_clean_file(&dir);
+
+        let report = do_scan_selected(
+            &state, strings(&[&target, &target.join(".")]), ScanPreset::Custom, true, &mut |_| {}
+        ).unwrap();
+
+        assert_eq!(report.scanned, 2);
+    }
+
+    #[test]
     fn a_selected_scan_is_refused_while_one_is_running() {
         let (state, dir) = test_state();
         let target = folder_with_one_bad_and_one_clean_file(&dir);
@@ -1375,5 +1404,13 @@ mod tests {
             &state, strings(&[&target]), ScanPreset::Custom, true, &mut |_| {}
         ).unwrap_err();
         assert!(error.contains("already running"), "{error}");
+    }
+
+    #[test]
+    fn the_page_names_the_preset_in_lower_case_and_full_is_not_one() {
+        assert_eq!(serde_json::from_str::<ScanPreset>("\"quick\"").unwrap(), ScanPreset::Quick);
+        assert_eq!(serde_json::from_str::<ScanPreset>("\"custom\"").unwrap(), ScanPreset::Custom);
+        assert!(serde_json::from_str::<ScanPreset>("\"full\"").is_err());
+        assert!(serde_json::from_str::<ScanPreset>("\"Quick\"").is_err());
     }
 }
