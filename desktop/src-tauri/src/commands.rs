@@ -200,6 +200,22 @@ pub fn do_scan_full(
     )
 }
 
+/// One folder a scan covers, as the Scan screen lists it. `path` is in the
+/// spelling the scanner reports, so a finding can be matched to its place by
+/// path; `label` is the short name shown to the person.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanPlace {
+    pub path: String,
+    pub label: String,
+}
+
+/// The places a Quick scan checks and the places a Full scan checks.
+#[derive(Debug, Serialize)]
+pub struct ScanPlaces {
+    pub quick: Vec<ScanPlace>,
+    pub full: Vec<ScanPlace>,
+}
+
 /// Lower case on Windows, forward slashes, no trailing slash: enough to compare
 /// two spellings of one folder that the scanner has already resolved.
 fn normalized(path: &Path) -> String {
@@ -233,6 +249,30 @@ fn place_label(path: &Path, temp_dir: &Path, shared_data: Option<&Path>) -> Stri
         };
     }
     name.to_string()
+}
+
+/// Each root in the scanner's own spelling, once, with its label.
+fn places_from(roots: &[PathBuf], temp_dir: &Path, shared_data: Option<&Path>) -> Vec<ScanPlace> {
+    dir_scan
+        ::resolve_unique_roots(roots)
+        .into_iter()
+        .map(|root| ScanPlace {
+            label: place_label(&root, temp_dir, shared_data),
+            path: root.to_string_lossy().into_owned(),
+        })
+        .collect()
+}
+
+pub fn do_scan_places() -> ScanPlaces {
+    let temp = dir_scan
+        ::resolve_unique_roots(&[std::env::temp_dir()])
+        .pop()
+        .unwrap_or_else(std::env::temp_dir);
+    let shared = if cfg!(windows) { std::env::var_os("PROGRAMDATA").map(PathBuf::from) } else { None };
+    ScanPlaces {
+        quick: places_from(&dir_scan::quick_scan_roots(), &temp, shared.as_deref()),
+        full: places_from(&dir_scan::full_scan_roots(), &temp, shared.as_deref()),
+    }
 }
 
 /// True while a scan is running: the window must not just close, because the
@@ -428,6 +468,12 @@ pub async fn scan_quick_cmd(app: AppHandle) -> Result<ScanReport, String> {
 #[tauri::command]
 pub async fn scan_full_cmd(app: AppHandle) -> Result<ScanReport, String> {
     run_scan(app, "full scan", do_scan_full).await
+}
+
+/// The folders Quick and Full scans cover, for the Scan screen's list.
+#[tauri::command]
+pub async fn scan_places_cmd(app: AppHandle) -> Result<ScanPlaces, String> {
+    run_blocking(app, "scan places", |_state| Ok(do_scan_places())).await
 }
 
 /// Asks the running scan to stop. True if a scan was running. Only an atomic
@@ -1172,5 +1218,63 @@ mod tests {
         assert_eq!(place_label(lookalike, temp, Some(shared)), "Startup", "only a folder starting with the same letters");
         assert_eq!(place_label(Path::new("/home/meera/.config/autostart"), temp, None), "Startup");
         assert_eq!(place_label(Path::new("/home/meera/Library/LaunchAgents"), temp, None), "Startup");
+    }
+
+    #[test]
+    fn a_folder_given_under_two_spellings_is_one_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("Downloads");
+        let b = dir.path().join("Documents");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let places = places_from(&[a.clone(), a.join("."), b.clone()], Path::new("/nowhere"), None);
+
+        let labels: Vec<&str> = places.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["Downloads", "Documents"]);
+        assert_eq!(places[0].path, dir_scan::resolve_unique_roots(&[a])[0].to_string_lossy());
+    }
+
+    #[test]
+    fn the_temp_folder_and_a_shared_startup_folder_get_their_names_in_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        let shared = dir.path().join("shared");
+        let startup = shared.join("Startup");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&startup).unwrap();
+        let temp = dir_scan::resolve_unique_roots(&[scratch.clone()]).remove(0);
+        let shared_resolved = dir_scan::resolve_unique_roots(&[shared]).remove(0);
+
+        let places = places_from(&[scratch, startup], &temp, Some(&shared_resolved));
+
+        let labels: Vec<&str> = places.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["Temp files", "Startup (all users)"]);
+    }
+
+    #[test]
+    fn the_places_on_this_machine_have_no_repeats_and_full_includes_quick() {
+        let places = do_scan_places();
+        for list in [&places.quick, &places.full] {
+            let mut paths: Vec<&String> = list.iter().map(|p| &p.path).collect();
+            paths.sort();
+            paths.dedup();
+            assert_eq!(paths.len(), list.len(), "a folder is listed twice");
+        }
+        for place in &places.quick {
+            assert!(places.full.contains(place), "{} is in Quick but not in Full", place.path);
+        }
+    }
+
+    #[test]
+    fn a_place_is_sent_to_the_page_with_path_and_label() {
+        let place = ScanPlace { path: "/home/meera/Downloads".into(), label: "Downloads".into() };
+        assert_eq!(
+            serde_json::to_value(&place).unwrap(),
+            serde_json::json!({ "path": "/home/meera/Downloads", "label": "Downloads" })
+        );
+        let both = ScanPlaces { quick: vec![place.clone()], full: vec![] };
+        let value = serde_json::to_value(&both).unwrap();
+        assert!(value["quick"].is_array() && value["full"].is_array());
     }
 }

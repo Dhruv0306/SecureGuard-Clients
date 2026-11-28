@@ -56,6 +56,7 @@ fn main() {
                 commands::scan_folder_cmd,
                 commands::scan_quick_cmd,
                 commands::scan_full_cmd,
+                commands::scan_places_cmd,
                 commands::cancel_scan_cmd,
                 commands::exit_app_cmd,
                 commands::recent_scans_cmd,
