@@ -493,6 +493,20 @@ pub async fn scan_folder_cmd(
     }).await
 }
 
+/// A scan of the folders the person chose: some of the Quick places, or their
+/// own folders. Progress goes to the window as for the other scans.
+#[tauri::command]
+pub async fn scan_selected_cmd(
+    app: AppHandle,
+    paths: Vec<String>,
+    preset: ScanPreset,
+    recursive: bool
+) -> Result<ScanReport, String> {
+    run_scan(app, "selected scan", move |state, on_progress| {
+        do_scan_selected(state, paths, preset, recursive, on_progress)
+    }).await
+}
+
 #[tauri::command]
 pub async fn scan_quick_cmd(app: AppHandle) -> Result<ScanReport, String> {
     run_scan(app, "quick scan", do_scan_quick).await

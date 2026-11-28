@@ -54,6 +54,7 @@ fn main() {
             tauri::generate_handler![
                 commands::scan_file_cmd,
                 commands::scan_folder_cmd,
+                commands::scan_selected_cmd,
                 commands::scan_quick_cmd,
                 commands::scan_full_cmd,
                 commands::scan_places_cmd,
