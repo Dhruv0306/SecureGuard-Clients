@@ -200,6 +200,41 @@ pub fn do_scan_full(
     )
 }
 
+/// Lower case on Windows, forward slashes, no trailing slash: enough to compare
+/// two spellings of one folder that the scanner has already resolved.
+fn normalized(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.trim_end_matches('/');
+    if cfg!(windows) { text.to_lowercase() } else { text.to_string() }
+}
+
+fn is_under(path: &Path, folder: &Path) -> bool {
+    let (path, folder) = (normalized(path), normalized(folder));
+    path == folder || path.starts_with(&format!("{folder}/"))
+}
+
+/// The short name for a place: "Temp files" for the temp folder, "Startup" (or
+/// "Startup (all users)" under the shared program data folder) for a startup
+/// folder, the drive for a drive root, otherwise the folder's own name.
+fn place_label(path: &Path, temp_dir: &Path, shared_data: Option<&Path>) -> String {
+    if normalized(path) == normalized(temp_dir) {
+        return "Temp files".to_string();
+    }
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    let name = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
+    if ["startup", "autostart", "launchagents"].contains(&name.to_lowercase().as_str()) {
+        return match shared_data {
+            Some(shared) if is_under(path, shared) => "Startup (all users)".to_string(),
+            _ => "Startup".to_string(),
+        };
+    }
+    name.to_string()
+}
+
 /// True while a scan is running: the window must not just close, because the
 /// scan and its results would be lost without the user agreeing to that.
 pub fn close_is_blocked(state: &AppState) -> bool {
@@ -1095,5 +1130,47 @@ mod tests {
         let error = do_sync_env(&state, None, 10_000).unwrap_err();
 
         assert!(error.contains("settings.json"), "{error}");
+    }
+
+    // --- scan places ---
+
+    #[test]
+    fn a_place_is_labelled_by_its_folder_name() {
+        let temp = Path::new("/var/tmp");
+        assert_eq!(place_label(Path::new("/home/meera/Downloads"), temp, None), "Downloads");
+        assert_eq!(place_label(Path::new("/home/meera/Documents/"), temp, None), "Documents");
+        assert_eq!(place_label(Path::new(r"C:\Users\Meera\Desktop"), temp, None), "Desktop");
+    }
+
+    #[test]
+    fn the_temp_folder_is_called_temp_files_whatever_its_name() {
+        let temp = Path::new("/var/scratch");
+        assert_eq!(place_label(Path::new("/var/scratch"), temp, None), "Temp files");
+        assert_eq!(place_label(Path::new("/var/scratch/"), temp, None), "Temp files");
+        // Another folder that happens to be called Temp is not the temp folder.
+        assert_eq!(place_label(Path::new("/home/meera/AppData/Temp"), temp, None), "Temp");
+    }
+
+    #[test]
+    fn a_drive_root_is_labelled_by_the_drive() {
+        let temp = Path::new("/var/tmp");
+        assert_eq!(place_label(Path::new(r"C:\"), temp, None), "C:");
+        assert_eq!(place_label(Path::new("D:/"), temp, None), "D:");
+        assert_eq!(place_label(Path::new("/"), temp, None), "/");
+    }
+
+    #[test]
+    fn startup_folders_are_told_apart_by_where_they_live() {
+        let temp = Path::new("/var/tmp");
+        let shared = Path::new(r"C:\ProgramData");
+        let own = Path::new(r"C:\Users\Meera\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup");
+        let all = Path::new(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp");
+        assert_eq!(place_label(own, temp, Some(shared)), "Startup");
+        assert_eq!(place_label(all, temp, Some(shared)), "Startup (all users)");
+        assert_eq!(place_label(all, temp, None), "Startup", "no shared folder known, so no second name");
+        let lookalike = Path::new(r"C:\ProgramDataOld\Microsoft\Windows\Start Menu\Programs\Startup");
+        assert_eq!(place_label(lookalike, temp, Some(shared)), "Startup", "only a folder starting with the same letters");
+        assert_eq!(place_label(Path::new("/home/meera/.config/autostart"), temp, None), "Startup");
+        assert_eq!(place_label(Path::new("/home/meera/Library/LaunchAgents"), temp, None), "Startup");
     }
 }
