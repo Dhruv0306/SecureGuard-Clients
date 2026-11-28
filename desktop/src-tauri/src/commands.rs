@@ -22,7 +22,7 @@ use crate::scan_control::ScanControl;
 use secureguard_core::yara_scan::RuleSet;
 use secureguard_core::DEFAULT_RULES;
 use crate::settings::{ self, KeySource };
-use serde::Serialize;
+use serde::{ Deserialize, Serialize };
 use std::path::{ Path, PathBuf };
 use std::sync::atomic::AtomicBool;
 use std::sync::{ Arc, Mutex };
@@ -198,6 +198,39 @@ pub fn do_scan_full(
         "No folders were found to scan.",
         on_progress
     )
+}
+
+/// What a chosen set of folders is scanned as. The preset only picks the scan
+/// options; the folders come from the caller. A full scan has its own command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanPreset {
+    /// The Quick options, whichever of the Quick places the person left checked.
+    Quick,
+    /// Folders the person chose, with their own choice of subfolders.
+    Custom,
+}
+
+/// Scans the folders the person chose, as one run. Every path must be an
+/// existing folder, or nothing is scanned. The same folder under two names is
+/// scanned once (the scan resolves each root). `recursive` applies to Custom
+/// only: Quick always looks in subfolders, as the Quick scan does.
+pub fn do_scan_selected(
+    state: &AppState,
+    paths: Vec<String>,
+    preset: ScanPreset,
+    recursive: bool,
+    on_progress: &mut dyn FnMut(&Progress)
+) -> Result<ScanReport, String> {
+    let roots: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    if let Some(bad) = roots.iter().position(|root| !root.is_dir()) {
+        return Err(format!("Not a folder: {}", paths[bad]));
+    }
+    let opts = match preset {
+        ScanPreset::Quick => ScanOptions::quick(),
+        ScanPreset::Custom => ScanOptions::directory(recursive),
+    };
+    do_scan_listed(state, roots, opts, "Choose at least one folder to scan.", on_progress)
 }
 
 /// One folder a scan covers, as the Scan screen lists it. `path` is in the
@@ -1276,5 +1309,71 @@ mod tests {
         let both = ScanPlaces { quick: vec![place.clone()], full: vec![] };
         let value = serde_json::to_value(&both).unwrap();
         assert!(value["quick"].is_array() && value["full"].is_array());
+    }
+
+    // --- scan of chosen folders ---
+
+    fn two_folders_with_a_bad_file(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let first = folder_with_one_bad_and_one_clean_file(dir);
+        let second = dir.path().join("other");
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("c.txt"), b"fine too").unwrap();
+        (first, second)
+    }
+
+    fn strings(paths: &[&Path]) -> Vec<String> {
+        paths.iter().map(|p| p.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn chosen_folders_are_scanned_as_one_run_and_the_findings_recorded() {
+        let (state, dir) = test_state();
+        let (first, second) = two_folders_with_a_bad_file(&dir);
+
+        let report = do_scan_selected(
+            &state, strings(&[&first, &second]), ScanPreset::Custom, true, &mut |_| {}
+        ).unwrap();
+
+        assert_eq!(report.scanned, 3, "two files in the first folder, one in the second");
+        assert_eq!(report.malicious, 1);
+        assert!(!state.scan.is_running());
+        assert_eq!(do_recent_scans(&state, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn nothing_chosen_is_an_error_and_starts_no_scan() {
+        let (state, _dir) = test_state();
+        let error = do_scan_selected(&state, Vec::new(), ScanPreset::Quick, true, &mut |_| {}).unwrap_err();
+        assert_eq!(error, "Choose at least one folder to scan.");
+        assert!(!state.scan.is_running());
+    }
+
+    #[test]
+    fn one_path_that_is_not_a_folder_stops_the_whole_scan() {
+        let (state, dir) = test_state();
+        let (first, _second) = two_folders_with_a_bad_file(&dir);
+        let missing = dir.path().join("nope");
+        let file = first.join("ok.txt");
+
+        for bad in [&missing, &file] {
+            let error = do_scan_selected(
+                &state, strings(&[&first, bad]), ScanPreset::Custom, true, &mut |_| {}
+            ).unwrap_err();
+            assert_eq!(error, format!("Not a folder: {}", bad.to_string_lossy()));
+        }
+        assert!(!state.scan.is_running());
+        assert!(do_recent_scans(&state, 10).unwrap().is_empty(), "no folder was scanned");
+    }
+
+    #[test]
+    fn a_selected_scan_is_refused_while_one_is_running() {
+        let (state, dir) = test_state();
+        let target = folder_with_one_bad_and_one_clean_file(&dir);
+        let _running = state.scan.start().unwrap();
+
+        let error = do_scan_selected(
+            &state, strings(&[&target]), ScanPreset::Custom, true, &mut |_| {}
+        ).unwrap_err();
+        assert!(error.contains("already running"), "{error}");
     }
 }
