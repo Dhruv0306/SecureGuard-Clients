@@ -314,6 +314,28 @@ pub fn close_is_blocked(state: &AppState) -> bool {
     state.scan.is_running()
 }
 
+/// What the Scan screen's idle line needs to know about the signatures.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct SignatureStatus {
+    /// How many signatures are stored.
+    pub total: u64,
+    /// When the default feed was last asked, in seconds since 1970, or `None`
+    /// if it never was. It is the time of the attempt, which is stored before
+    /// the fetch, so it can be earlier than the last sync that worked.
+    pub last_checked_at: Option<i64>,
+}
+
+pub fn do_signature_status(state: &AppState) -> Result<SignatureStatus, String> {
+    let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
+    let total = signature_sync
+        ::total_signatures(&conn)
+        .map_err(|e| format!("failed to count signatures: {e}"))?;
+    let last_checked_at = storage
+        ::last_feed_attempt(&conn, signature_sync::FEED_MALWAREBAZAAR)
+        .map_err(|e| format!("failed to read the last sync time: {e}"))?;
+    Ok(SignatureStatus { total: total as u64, last_checked_at })
+}
+
 pub fn do_recent_scans(state: &AppState, limit: i64) -> Result<Vec<ScanResult>, String> {
     let conn = state.conn.lock().map_err(|_| "database lock poisoned".to_string())?;
     storage::recent_scans(&conn, limit).map_err(|e| format!("failed to load history: {e}"))
@@ -461,6 +483,12 @@ async fn run_blocking<T, F>(app: AppHandle, label: &'static str, work: F) -> Res
         })
         .await
         .map_err(|e| format!("{label} task failed: {e}"))?
+}
+
+/// How many signatures are stored and when they were last checked.
+#[tauri::command]
+pub async fn signature_status_cmd(app: AppHandle) -> Result<SignatureStatus, String> {
+    run_blocking(app, "signature status", do_signature_status).await
 }
 
 #[tauri::command]
@@ -1426,5 +1454,55 @@ mod tests {
         assert_eq!(serde_json::from_str::<ScanPreset>("\"custom\"").unwrap(), ScanPreset::Custom);
         assert!(serde_json::from_str::<ScanPreset>("\"full\"").is_err());
         assert!(serde_json::from_str::<ScanPreset>("\"Quick\"").is_err());
+    }
+
+    // --- signature status ---
+
+    fn add_signatures(state: &AppState, how_many: usize) {
+        let conn = state.conn.lock().unwrap();
+        for n in 0..how_many {
+            let hash = format!("{n:0>64}");
+            conn.execute(
+                "INSERT INTO signature_cache (sha256, source, added_at) VALUES (?1, 'seed', 0)",
+                [&hash]
+            ).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_new_database_has_no_signatures_and_was_never_checked() {
+        let (state, _dir) = test_state();
+        assert_eq!(
+            do_signature_status(&state).unwrap(),
+            SignatureStatus { total: 0, last_checked_at: None }
+        );
+    }
+
+    #[test]
+    fn the_status_counts_the_signatures_and_gives_the_last_attempt_of_the_default_feed() {
+        let (state, _dir) = test_state();
+        add_signatures(&state, 3);
+        {
+            let conn = state.conn.lock().unwrap();
+            storage::record_feed_attempt(&conn, signature_sync::FEED_MALWAREBAZAAR, 1_700_000_000).unwrap();
+            storage::record_feed_attempt(&conn, "some-other-feed", 1_800_000_000).unwrap();
+        }
+        assert_eq!(
+            do_signature_status(&state).unwrap(),
+            SignatureStatus { total: 3, last_checked_at: Some(1_700_000_000) }
+        );
+    }
+
+    #[test]
+    fn the_status_is_sent_to_the_page_with_total_and_last_checked_at() {
+        let sent = |status: SignatureStatus| serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            sent(SignatureStatus { total: 48731, last_checked_at: Some(1_700_000_000) }),
+            serde_json::json!({ "total": 48731, "last_checked_at": 1_700_000_000 })
+        );
+        assert_eq!(
+            sent(SignatureStatus { total: 0, last_checked_at: None }),
+            serde_json::json!({ "total": 0, "last_checked_at": null })
+        );
     }
 }

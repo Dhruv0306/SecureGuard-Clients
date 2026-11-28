@@ -62,6 +62,7 @@ fn main() {
                 commands::exit_app_cmd,
                 commands::recent_scans_cmd,
                 commands::sync_signatures_cmd,
+                commands::signature_status_cmd,
                 commands::auth_key_status_cmd,
                 commands::save_auth_key_cmd,
                 commands::clear_auth_key_cmd,
