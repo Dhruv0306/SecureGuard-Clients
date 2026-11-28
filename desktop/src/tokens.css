@@ -1,0 +1,70 @@
+/* Design tokens for the redesign (plan v2, contrast checked 24/11/2026).
+   Colours are OKLCH. Browsers without OKLCH get the hex values below, which
+   desktop/tests/tokens.test.js keeps within 1/255 of the OKLCH ones.
+   Hanken Grotesk is SIL OFL 1.1, see fonts/OFL.txt. */
+
+@font-face {
+    font-family: "Hanken Grotesk";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("fonts/hanken-grotesk-400.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "Hanken Grotesk";
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url("fonts/hanken-grotesk-500.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "Hanken Grotesk";
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url("fonts/hanken-grotesk-600.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "Hanken Grotesk";
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url("fonts/hanken-grotesk-700.woff2") format("woff2");
+}
+
+:root {
+    --bg: oklch(0.984 0.004 340);
+    --side: oklch(0.966 0.007 340);
+    --ink: oklch(0.25 0.012 340);
+    --muted: oklch(0.51 0.012 340);
+    --accent: oklch(0.5 0.16 345);
+    --accent-ink: oklch(0.99 0.004 340);
+    --tint: oklch(0.95 0.025 345);
+    --line: oklch(0.905 0.008 340);
+    --bad: oklch(0.5 0.17 25);
+    --bad-bg: oklch(0.968 0.015 25);
+    --sus: oklch(0.47 0.1 72);
+    --sus-bg: oklch(0.962 0.028 85);
+    --ok: oklch(0.45 0.1 152);
+}
+
+@supports not (color: oklch(0 0 0)) {
+    :root {
+        --bg: #fcf9fb;
+        --side: #f7f2f5;
+        --ink: #261f23;
+        --muted: #6b6368;
+        --accent: #9e3378;
+        --accent-ink: #fefbfd;
+        --tint: #fce8f2;
+        --line: #e3dee1;
+        --bad: #b02a2d;
+        --bad-bg: #fff1ef;
+        --sus: #7d5002;
+        --sus-bg: #fbf2de;
+        --ok: #1f6538;
+    }
+}
